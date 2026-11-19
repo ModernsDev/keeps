@@ -1,0 +1,40 @@
+name: CodeQL Swift
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (swift)
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          languages: swift
+          build-mode: manual
+      - name: Build macOS, iOS Simulator and ColorTools for Swift extraction
+        run: |
+          (
+            swift build --package-path macos --arch arm64 --scratch-path .build/codeql-macos
+            swift build --package-path macos/ColorTools --arch arm64 --scratch-path .build/codeql-color
+          ) &
+          macos_build=$!
+          xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/codeql-ios \
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO \
+            SWIFT_ENABLE_COMPILE_CACHE=NO SWIFT_USE_INTEGRATED_DRIVER=NO build
+          wait "$macos_build"
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          category: /language:swift
