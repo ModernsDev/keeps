@@ -98,7 +98,14 @@ final class LibraryStore: ObservableObject {
     @Published var isAIEditingBlocking = false
     @Published var isAISettingsBusy = false
     var isDirectoryOperationBlocking: Bool { isDirectoryTrashBlocking || isMovingDirectory || photoMove != nil || rejectedTrash != nil || isPreparingRejectedTrash }
-    var isOperationBlocking: Bool { isCullingActive || isDirectoryOperationBlocking || isAIEditingBlocking || isAISettingsBusy }
+    struct BatchTagProgress {
+        let title: String
+        let total: Int
+        var completed = 0
+    }
+
+    @Published private(set) var batchTagProgress: BatchTagProgress?
+    var isOperationBlocking: Bool { isCullingActive || isDirectoryOperationBlocking || isAIEditingBlocking || isAISettingsBusy || batchTagProgress != nil }
     @Published private(set) var hiddenDirectoryPaths: Set<String> = []
     @Published private(set) var isUpdatingHiddenDirectory = false
     @Published var hiddenDirectoryFilterEnabled = true {
@@ -776,18 +783,18 @@ final class LibraryStore: ObservableObject {
     }
 
     func updateSelected(_ patch: KeepsAssetPatch) {
-        mutateSelected { client, id in try await client.updateAsset(id: id, patch: patch) }
+        mutatePhotos(selectedIDs) { client, id in try await client.updateAsset(id: id, patch: patch) }
     }
 
-    func mutateSelected(_ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
-        mutatePhotos(selectedIDs, mutation)
+    func tagSelected(title: String, _ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
+        mutatePhotos(selectedIDs, tagTitle: title, mutation)
     }
 
     func restorePhotos(_ ids: Set<UUID>) {
         mutatePhotos(ids, restoring: true) { client, id in try await client.restoreAsset(id: id) }
     }
 
-    private func mutatePhotos(_ ids: Set<UUID>, restoring: Bool = false, _ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
+    private func mutatePhotos(_ ids: Set<UUID>, restoring: Bool = false, tagTitle: String? = nil, _ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
         guard !isOperationBlocking, !isSelectingAll, let client, !isMutating, !ids.isEmpty else { return }
         loadTask?.cancel()
         loadGeneration += 1
@@ -795,10 +802,12 @@ final class LibraryStore: ObservableObject {
         isCheckingRevision = false
         let generation = loadGeneration
         isMutating = true
+        if let tagTitle, ids.count > 1 {
+            batchTagProgress = BatchTagProgress(title: tagTitle, total: ids.count)
+        }
         assetCache.removeAll()
         lastError = nil
         Task {
-            defer { isMutating = false; assetCache.removeAll() }
             var completed = 0
             do {
                 for id in ids {
@@ -815,17 +824,23 @@ final class LibraryStore: ObservableObject {
                         }
                     }
                     completed += 1
+                    if batchTagProgress != nil { batchTagProgress?.completed = completed }
                 }
-                isMutating = false
-                if generation == loadGeneration { refresh(force: true); if restoring { refreshNavigation() } }
             } catch {
                 if generation == loadGeneration {
-                    if restoring && completed > 0 {
-                        refreshCounts(client: client, showHidden: effectiveQuery.showHidden, force: true)
-                        refreshNavigation()
-                    }
                     lastError = "已完成 \(completed)/\(ids.count) 项。\n" + Self.describe(error)
                 }
+            }
+            assetCache.removeAll()
+            if batchTagProgress != nil { batchTagProgress = nil }
+            isMutating = false
+            guard generation == loadGeneration else { return }
+            if completed == ids.count {
+                refresh(force: true)
+                if restoring { refreshNavigation() }
+            } else if restoring && completed > 0 {
+                refreshCounts(client: client, showHidden: effectiveQuery.showHidden, force: true)
+                refreshNavigation()
             }
         }
     }

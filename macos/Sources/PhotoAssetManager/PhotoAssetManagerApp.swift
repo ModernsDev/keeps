@@ -98,7 +98,7 @@ struct PhotoAssetManagerApp: App {
             }
             .environmentObject(library)
             .onReceive(batch.editor.$isBusy, perform: synchronizeEditorActivity)
-            .disabled(library.isCullingActive || library.isDirectoryOperationBlocking || batch.isRunning)
+            .disabled(library.isCullingActive || library.isDirectoryOperationBlocking || library.batchTagProgress != nil || batch.isRunning)
             .overlay {
                 if library.isDirectoryOperationBlocking || batch.isRunning {
                     Text(batch.isRunning ? "正在进行 AI 调色，请在调色工作台查看进度。" : "正在整理照片或文件夹，请在主窗口查看进度。")
@@ -112,8 +112,11 @@ struct PhotoAssetManagerApp: App {
         let busy = editorBusy && !batch.editor.batchActive
         guard library.isAISettingsBusy != busy else { return }
         library.isAISettingsBusy = busy
-        if busy { library.pauseLibraryForDirectoryOperation() }
-        else if !library.isOperationBlocking { library.refresh(force: true) }
+        if busy {
+            if library.batchTagProgress == nil { library.pauseLibraryForDirectoryOperation() }
+        } else if !library.isOperationBlocking {
+            library.refresh(force: true)
+        }
     }
 }
 
