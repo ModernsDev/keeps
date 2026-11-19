@@ -1,0 +1,46 @@
+name: Release NAS SPK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  package:
+    if: github.repository == 'ModernsDev/keeps' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 deploy/spk/release.py check "$GITHUB_SHA"
+      - name: Build amd64 SPK
+        run: |
+          image="keeps-server:$GITHUB_SHA"
+          payload="$RUNNER_TEMP/keeps-native-payload"
+          output="$RUNNER_TEMP/keeps-release"
+          mkdir "$output"
+          docker build --platform linux/amd64 -f server/Dockerfile -t "$image" .
+          python3 deploy/spk/export_runtime.py --image "$image" --output "$payload"
+          printf '%s\n' "$GITHUB_SHA" | tee "$payload/source-revision" > "$output/source-revision"
+          python3 deploy/spk/pack.py --payload "$payload" --output "$output/KeepsNativeProbe.spk"
+          (cd "$output" && sha256sum KeepsNativeProbe.spk > SHA256SUMS)
+      - name: Check origin/main again before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 deploy/spk/release.py check "$GITHUB_SHA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: keeps-nas-spk-${{ github.sha }}
+          path: ${{ runner.temp }}/keeps-release/
+          if-no-files-found: error
