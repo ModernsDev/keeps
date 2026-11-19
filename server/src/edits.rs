@@ -437,15 +437,23 @@ fn persist_instructions(s: &AppState, lib: &str, id: &str, request: &str, xml: &
         uuid::Uuid::parse_str(request)?
     );
     let path = s.previews.edit_instructions_path(&key)?;
+    match path.canonicalize() {
+        Ok(existing) => {
+            if !existing.starts_with(s.previews.keeps_root()) {
+                return Err(error(422, "edit instructions path outside storage root"));
+            }
+            ensure!(existing == path, "edit instructions path changed");
+            ensure!(
+                std::fs::read_to_string(existing)? == xml,
+                "edit XMP request identity conflict"
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let directory = path.parent().context("edit instructions parent missing")?;
     std::fs::create_dir_all(directory)?;
-    if path.exists() {
-        ensure!(
-            std::fs::read_to_string(&path)? == xml,
-            "edit XMP request identity conflict"
-        );
-        return Ok(());
-    }
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
     file.write_all(xml.as_bytes())?;
     file.as_file().sync_all()?;
