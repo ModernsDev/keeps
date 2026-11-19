@@ -36,13 +36,19 @@ public final class KeepsClient: Sendable {
     public func asset(id: UUID) async throws -> KeepsAsset {
         try await request("GET", library + ["assets", id.uuidString])
     }
-    public func duplicateLocations() async throws -> [KeepsDuplicateLocation] {
+    public func duplicateLocations(trashed: Bool = false) async throws -> [KeepsDuplicateLocation] {
         struct Response: Decodable { let items: [KeepsDuplicateLocation] }
-        let response: Response = try await request("GET", library + ["assets", "duplicate-locations"])
+        let query = [URLQueryItem(name: "trashed", value: String(trashed))]
+        let response: Response = try await request("GET", library + ["assets", "duplicate-locations"], query: query)
         return response.items
     }
-    public func choosePhotoLocation(assetID: UUID, path: String) async throws {
-        let _: [String: String] = try await request("POST", library + ["assets", assetID.uuidString, "location"], body: JSONEncoder().encode(["path": path]))
+    public func choosePhotoLocation(assetID: UUID, path: String, trashed: Bool = false) async throws {
+        struct Choice: Encodable {
+            let path: String
+            let trashed: Bool
+        }
+        let body = try JSONEncoder().encode(Choice(path: path, trashed: trashed))
+        let _: [String: String] = try await request("POST", library + ["assets", assetID.uuidString, "location"], body: body)
     }
     public func versions(assetID: UUID) async throws -> [KeepsAssetVersion] {
         try await versionDetails(assetID: assetID).items

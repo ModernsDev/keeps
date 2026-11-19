@@ -394,18 +394,18 @@ fn hidden_filter(
 }
 
 impl Store {
-    pub(crate) fn duplicate_locations(&self, lib: &str) -> Result<Value> {
+    pub(crate) fn duplicate_locations(&self, lib: &str, trashed: bool) -> Result<Value> {
         let mut connection = self.read()?;
         let db = connection.transaction()?;
         let mut statement = db.prepare("SELECT a.id,a.filename,p.path FROM (
             SELECT asset_id FROM catalog_paths WHERE library_id=?1 GROUP BY asset_id HAVING count(*)>1
-        ) multiple JOIN catalog_assets a ON a.library_id=?1 AND a.id=multiple.asset_id AND a.trashed=0
+        ) multiple JOIN catalog_assets a ON a.library_id=?1 AND a.id=multiple.asset_id AND a.trashed=?2
         JOIN catalog_paths p ON p.library_id=?1 AND p.asset_id=a.id ORDER BY a.id,p.path")?;
         let mut candidates = std::collections::BTreeMap::<
             String,
             (String, std::collections::BTreeMap<String, Vec<String>>),
         >::new();
-        for row in statement.query_map([lib], |r| {
+        for row in statement.query_map(params![lib, trashed], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -449,10 +449,16 @@ impl Store {
         Ok(json!({"items":items}))
     }
 
-    pub(crate) fn choose_photo_location(&self, lib: &str, id: &str, path: &str) -> Result<()> {
+    pub(crate) fn choose_photo_location(
+        &self,
+        lib: &str,
+        id: &str,
+        path: &str,
+        trashed: bool,
+    ) -> Result<()> {
         let mut db = self.lock()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let selectable: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=? AND p.asset_id=? AND p.path=? AND a.trashed=0)", params![lib,id,path], |r| r.get(0))?;
+        let selectable: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=? AND p.asset_id=? AND p.path=? AND a.trashed=?)", params![lib,id,path,trashed], |r| r.get(0))?;
         ensure!(selectable, invalid("照片位置已变化，请刷新重复照片列表"));
         ensure!(
             std::fs::symlink_metadata(path)

@@ -75,7 +75,7 @@ struct IOSRootView: View {
         .tint(.white)
         .sheet(isPresented: $showingDuplicateLocations) {
             if let configuration = library.configuration {
-                IOSDuplicateLocationsSheet(client: KeepsClient(configuration: configuration)) {
+                IOSDuplicateLocationsSheet(client: KeepsClient(configuration: configuration), trashed: library.showingTrash) {
                     await library.synchronize()
                 }
             }
@@ -766,6 +766,7 @@ struct IOSTrashSettingsView: View {
 
 private struct IOSDuplicateLocationsSheet: View {
     let client: KeepsClient
+    let trashed: Bool
     let onChange: () async -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var items: [KeepsDuplicateLocation] = []
@@ -800,7 +801,7 @@ private struct IOSDuplicateLocationsSheet: View {
                     }
                 }
             }
-            .navigationTitle("重复照片")
+            .navigationTitle(trashed ? "回收站中的重复照片" : "重复照片")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.disabled(working) }
             }
@@ -814,10 +815,10 @@ private struct IOSDuplicateLocationsSheet: View {
         defer { working = false }
         do {
             if let (id, path) = choice {
-                try await client.choosePhotoLocation(assetID: id, path: path)
+                try await client.choosePhotoLocation(assetID: id, path: path, trashed: trashed)
                 await onChange()
             }
-            items = try await client.duplicateLocations()
+            items = try await client.duplicateLocations(trashed: trashed)
             error = nil
         } catch { self.error = error.localizedDescription }
     }
