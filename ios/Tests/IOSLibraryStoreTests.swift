@@ -412,19 +412,18 @@ struct IOSLibraryStoreTests {
         let fixture = ReplicaFixture()
         fixture.building = true
         let store = await fixture.store()
-        var jobPersisted = false
+        let (checkpoints, checkpoint) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let sync = Task {
+            defer { checkpoint.finish() }
             await store.synchronize(includeThumbnails: false) { stage, _, _ in
-                if stage == .catalog { jobPersisted = true }
+                if stage == .catalog { checkpoint.yield(()) }
             }
         }
-        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-        while !jobPersisted, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
+        var iterator = checkpoints.makeAsyncIterator()
+        let jobPersisted = await iterator.next() != nil
         sync.cancel()
         await sync.value
-        try #require(jobPersisted)
+        try #require(jobPersisted, "NAS build was not persisted: \(fixture.requests), \(String(describing: store.syncError))")
         #expect(!store.hasLocalCatalog)
         fixture.building = false
         let reopened = await fixture.store()
