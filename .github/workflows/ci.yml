@@ -76,13 +76,28 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             server/target
-          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ github.job }}-${{ github.sha }}
+          key: rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ hashFiles('server/Cargo.toml', 'server/src/**', 'server/tests/**') }}
           restore-keys: |
-            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
+            rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
       - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
       - run: cargo +stable clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
       - name: Install video metadata test dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        timeout-minutes: 2
+        env:
+          FFMPEG_VERSION: 8.1.3-2
+          FFMPEG_SHA256: 1df84d04c4322902dba81c290508cdf3d89524d210b9fe03154bea6c4e3bfbb6
+        run: |
+          archive="$RUNNER_TEMP/ffmpeg.tar.xz"
+          bin_dir="$RUNNER_TEMP/ffmpeg-bin"
+          curl --fail --silent --show-error --location --retry 2 --max-time 45 --retry-max-time 75 \
+            --output "$archive" \
+            "https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v${FFMPEG_VERSION}/jellyfin-ffmpeg_${FFMPEG_VERSION}_portable_linux64-gpl.tar.xz"
+          printf '%s  %s\n' "$FFMPEG_SHA256" "$archive" | sha256sum --check -
+          mkdir -p "$bin_dir"
+          tar -xJf "$archive" -C "$bin_dir" ffmpeg ffprobe
+          test -x "$bin_dir/ffmpeg"
+          test -x "$bin_dir/ffprobe"
+          echo "$bin_dir" >> "$GITHUB_PATH"
       - run: cargo +stable test --manifest-path server/Cargo.toml --locked
 
   shared:
@@ -119,13 +134,29 @@ jobs:
           path: |
             macos/.build
             macos/ColorTools/.build
-            .build/xcode-macos-ci
           key: swift-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('macos/**/*.swift', 'macos/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'macos/**/*.pbxproj', 'macos/Version.xcconfig') }}
           restore-keys: |
             swift-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
       - run: swift test --package-path macos
       - run: swift test --package-path macos/ColorTools
       - run: bash macos/scripts/package_app.sh
+
+  macos_xcode:
+    name: macOS Xcode build
+    needs: scope
+    if: needs.scope.outputs.macos == 'true'
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/xcode-macos-ci
+          key: xcode-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('macos/**/*.swift', 'macos/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'macos/**/*.pbxproj', 'macos/Version.xcconfig') }}
+          restore-keys: |
+            xcode-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
       - name: Build macOS Xcode app
         run: xcodebuild -project macos/Keeps.xcodeproj -scheme Keeps -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath .build/xcode-macos-ci CODE_SIGNING_ALLOWED=NO build
 
@@ -141,13 +172,28 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: |
-            ios/.build
-            .build/xcode-ios-ci
-          key: swift-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('ios/**/*.swift', 'ios/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'ios/**/*.pbxproj', 'ios/Version.xcconfig') }}
+          path: ios/.build
+          key: swift-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('ios/**/*.swift', 'ios/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved') }}
           restore-keys: |
             swift-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
       - run: swift test --package-path ios
+
+  ios_xcode:
+    name: iOS Simulator build
+    needs: scope
+    if: needs.scope.outputs.ios == 'true'
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/xcode-ios-ci
+          key: xcode-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('ios/**/*.swift', 'ios/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'ios/**/*.pbxproj', 'ios/Version.xcconfig') }}
+          restore-keys: |
+            xcode-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
       - name: Build iOS Simulator
         run: xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/xcode-ios-ci CODE_SIGNING_ALLOWED=NO build
 
@@ -179,9 +225,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             server/target
-          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ github.job }}-${{ github.sha }}
+          key: rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ hashFiles('server/Cargo.toml', 'server/src/**') }}
           restore-keys: |
-            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
+            rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
       - name: Build server for schema integration tests
         run: cargo +stable build --manifest-path server/Cargo.toml --locked --bin keeps-server
       - run: python -m unittest discover -s scripts -p 'test_backfill_standard_names.py'
@@ -191,7 +237,7 @@ jobs:
   keeps-ci-gate:
     name: keeps-ci-gate
     if: ${{ always() }}
-    needs: [scope, checks, server, shared, macos, ios, python]
+    needs: [scope, checks, server, shared, macos, macos_xcode, ios, ios_xcode, python]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -211,8 +257,8 @@ jobs:
                   failures.append(f"{name}: expected success, got {result}")
 
           scope = jobs["scope"]["outputs"]
-          for name in ("server", "shared", "macos", "ios", "python"):
-              required = scope.get(name)
+          for name in ("server", "shared", "macos", "macos_xcode", "ios", "ios_xcode", "python"):
+              required = scope.get(name.removesuffix("_xcode"))
               if required not in {"true", "false"}:
                   failures.append(f"{name}: invalid scope {required!r}")
                   continue
