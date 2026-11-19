@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 22;
+const VERSION: i64 = 23;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -201,6 +201,10 @@ CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NUL
     if version < 22 {
         crate::cache_pipeline::migrate_operation_state(&tx)?;
     }
+    if version < 23 {
+        tx.execute_batch("INSERT OR IGNORE INTO catalog_revision_dirty SELECT library_id,'asset',asset_id FROM catalog_trash_entries;")?;
+        crate::revisions::flush(&tx)?;
+    }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
     Ok(())
@@ -302,6 +306,15 @@ fn decorate(db: &Connection, lib: &str, mut a: Value) -> Result<Value> {
         params![lib, id],
         |r| r.get::<_, Option<String>>(0)
     )?);
+    if a["trashed"] == true {
+        a["trashedAt"] = json!(
+            db.prepare_cached(
+                "SELECT trashed_at FROM catalog_trash_entries WHERE library_id=? AND asset_id=?"
+            )?
+            .query_row(params![lib, id], |r| r.get::<_, i64>(0))
+            .optional()?
+        );
+    }
     let mut paths = db.prepare_cached(ASSET_PATHS)?;
     a["paths"] = json!(
         paths
@@ -376,7 +389,23 @@ impl Store {
     pub fn query_assets(&self, lib: &str, q: &AssetQuery) -> Result<Value> {
         let sort = q.sort.as_deref().unwrap_or("capture_desc");
         let limit = q.limit.unwrap_or(100).clamp(1, 200);
+        let from = if sort == "trash_desc" {
+            "catalog_assets a LEFT JOIN catalog_trash_entries t ON t.library_id=a.library_id AND t.asset_id=a.id"
+        } else {
+            "catalog_assets a"
+        };
+        let sort_time = if sort == "trash_desc" {
+            "printf('%020lld',coalesce(t.trashed_at,0))"
+        } else {
+            "a.sort_time"
+        };
+        let cursor_prefix = match sort {
+            "trash_desc" => Some("td1."),
+            "capture_desc" => Some("cd1."),
+            _ => None,
+        };
         let order = match sort {
+            "trash_desc" => "sort_key DESC,a.id",
             "capture_desc" => "a.sort_time DESC,a.id",
             "capture_asc" => "a.sort_time ASC,a.id",
             "filename" => "a.filename COLLATE NOCASE,a.id",
@@ -386,8 +415,7 @@ impl Store {
         let mut boundary: Option<(String, String)> = None;
         let mut offset = 0_i64;
         if let Some(cursor) = &q.cursor {
-            if sort == "capture_desc" && cursor.starts_with("cd1.") {
-                let encoded = &cursor[4..];
+            if let Some(encoded) = cursor_prefix.and_then(|prefix| cursor.strip_prefix(prefix)) {
                 let bytes = URL_SAFE_NO_PAD
                     .decode(encoded)
                     .map_err(|_| invalid("invalid cursor"))?;
@@ -459,10 +487,12 @@ impl Store {
             |r| r.get(0),
         )?;
         if let Some((time, id)) = boundary {
-            filter.push_str(" AND (a.sort_time<? OR (a.sort_time=? AND a.id>?))");
+            filter.push_str(&format!(
+                " AND ({sort_time}<? OR ({sort_time}=? AND a.id>?))"
+            ));
             values.extend([time.clone().into(), time.into(), id.into()]);
         }
-        let mut statement=db.prepare(&format!("SELECT a.snapshot,a.sort_time,a.id FROM catalog_assets a WHERE {filter} ORDER BY {order} LIMIT ? OFFSET ?"))?;
+        let mut statement=db.prepare(&format!("SELECT a.snapshot,{sort_time} AS sort_key,a.id FROM {from} WHERE {filter} ORDER BY {order} LIMIT ? OFFSET ?"))?;
         values.push(((limit + 1) as i64).into());
         values.push(offset.into());
         let rows = statement
@@ -482,9 +512,9 @@ impl Store {
             last_key = Some((time, id));
         }
         let next_cursor = if has_more {
-            Some(if sort == "capture_desc" {
+            Some(if let Some(prefix) = cursor_prefix {
                 format!(
-                    "cd1.{}",
+                    "{prefix}{}",
                     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&last_key)?)
                 )
             } else {

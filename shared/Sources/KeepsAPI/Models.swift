@@ -67,6 +67,8 @@ public struct KeepsAsset: Codable, Identifiable, Equatable, Sendable {
     public var createdAt: String
     public var updatedAt: String
     public var trashed: Bool
+    public var trashedAt: Int64? = nil
+    public var deletionDate: Date? { trashedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) } }
     public var preview: KeepsPreview?
     public var browseThumbnail: KeepsPreview? = nil
     public var thumbnail: KeepsPreview? = nil
@@ -75,6 +77,31 @@ public struct KeepsAsset: Codable, Identifiable, Equatable, Sendable {
     public var paths: [String]? = nil
     public var gridPreview: KeepsPreview? { thumbnail ?? preview }
     public var isVideo: Bool { ["mov", "mp4", "m4v", "avi", "mkv", "mts", "m2ts"].contains(URL(fileURLWithPath: originalFilename).pathExtension.lowercased()) }
+}
+
+public enum KeepsTrashDay {
+    public static func groups(_ timestamps: [Int64?]) -> [(range: Range<Int>, title: String)] {
+        let calendar = Calendar.current
+        var groups: [(Range<Int>, String)] = []
+        var start = 0
+        var interval: DateInterval?
+        for (index, timestamp) in timestamps.enumerated() {
+            let date = timestamp.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+            if index > 0 {
+                if let date, let interval, date >= interval.start && date < interval.end { continue }
+                if date == nil && interval == nil { continue }
+                groups.append((start..<index, title(interval)))
+            }
+            start = index
+            interval = date.flatMap { calendar.dateInterval(of: .day, for: $0) }
+        }
+        if !timestamps.isEmpty { groups.append((start..<timestamps.count, title(interval))) }
+        return groups
+    }
+
+    private static func title(_ interval: DateInterval?) -> String {
+        interval?.start.formatted(date: .abbreviated, time: .omitted) ?? "删除日期未知"
+    }
 }
 
 public struct KeepsAssetPage: Codable, Sendable {

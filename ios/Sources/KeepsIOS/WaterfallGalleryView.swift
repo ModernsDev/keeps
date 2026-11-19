@@ -12,6 +12,7 @@ struct IOSWaterfallGallery: View {
     @Binding var visibleDates: String
     var style: KeepsGalleryStyle
     var preparationFinished: (String?) -> Void
+    var restore: (UUID) -> Void
     @State private var selected: KeepsAsset?
     @State private var information: KeepsAsset?
 
@@ -19,7 +20,7 @@ struct IOSWaterfallGallery: View {
         IOSPhotoCollectionView(library: library, selecting: $selecting, selectedIDs: $selectedIDs,
                                density: $density, visibleDates: $visibleDates,
                                style: style, preparationFinished: preparationFinished,
-                               open: { selected = $0 }, information: { information = $0 })
+                               open: { selected = $0 }, information: { information = $0 }, restore: restore)
         .fullScreenCover(item: $selected) { asset in IOSPhotoViewer(initialAsset: asset).environmentObject(library) }
         .sheet(item: $information) { asset in
             NavigationStack {
@@ -60,6 +61,7 @@ struct IOSPhotoViewer: View {
     }
 
     private var current: KeepsAsset { photos.first { $0.id == selection } ?? initialAsset }
+    private var galleryOrder: [KeepsAsset] { library.showingTrash ? library.assets : library.chronologicalAssets }
 
     private var previewBuffer: [KeepsAsset] {
         guard let index = photos.firstIndex(where: { $0.id == selection }) else { return [initialAsset] }
@@ -135,10 +137,10 @@ struct IOSPhotoViewer: View {
         }
         .preferredColorScheme(.dark)
         .statusBarHidden(!controlsVisible)
-        .onAppear { photos = library.assets.isEmpty ? [initialAsset] : library.chronologicalAssets }
+        .onAppear { photos = library.assets.isEmpty ? [initialAsset] : galleryOrder }
         .onChange(of: library.assets) { _, updated in
             if updated.contains(where: { $0.id == selection }) {
-                photos = updated.reversed()
+                photos = galleryOrder
             } else if !restoringSelection {
                 let retained = current
                 restoringSelection = true
@@ -150,9 +152,11 @@ struct IOSPhotoViewer: View {
             }
         }
         .task(id: selection) {
-            if photos.prefix(3).contains(where: { $0.id == selection }), library.canLoadMore {
+            let olderEdge = library.showingTrash ? photos.suffix(3) : photos.prefix(3)
+            let newerEdge = library.showingTrash ? photos.prefix(3) : photos.suffix(3)
+            if olderEdge.contains(where: { $0.id == selection }), library.canLoadMore {
                 await library.loadMore()
-            } else if photos.suffix(3).contains(where: { $0.id == selection }), library.canLoadNewer {
+            } else if newerEdge.contains(where: { $0.id == selection }), library.canLoadNewer {
                 await library.loadNewer()
             }
         }
@@ -253,6 +257,9 @@ struct IOSAssetDetail: View {
                     .frame(minHeight: 240, maxHeight: 420)
                 LabeledContent("文件名", value: asset.originalFilename)
                 if let time = asset.captureTime { LabeledContent("拍摄时间", value: time) }
+                if let date = asset.deletionDate {
+                    LabeledContent("删除时间", value: date.formatted(date: .abbreviated, time: .shortened))
+                }
                 if !asset.cameraModel.isEmpty { LabeledContent("相机", value: asset.cameraModel) }
                 if !asset.lensModel.isEmpty { LabeledContent("镜头", value: asset.lensModel) }
             }

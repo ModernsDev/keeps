@@ -288,18 +288,20 @@ struct ContentView: View {
                     }
             } else {
                 GeometryReader { geometry in
-                    let rows = JustifiedAssetGridLayout.rows(
-                        aspectRatios: library.assets.map { JustifiedAssetGridLayout.aspectRatio($0.gridPreview) },
-                        availableWidth: max(1, geometry.size.width - 2),
-                        targetHeight: thumbnailSize * 0.78
-                    )
+                    let rows = galleryRows(width: max(1, geometry.size.width - 2))
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 1) {
                                 ForEach(rows, id: \.indices.lowerBound) { row in
-                                    HStack(spacing: 1) {
-                                        ForEach(library.assets[row.indices]) { asset in
-                                            galleryTile(asset, height: row.height)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        if let day = row.day {
+                                            Text(day).font(.headline).accessibilityAddTraits(.isHeader)
+                                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                        }
+                                        HStack(spacing: 1) {
+                                            ForEach(library.assets[row.indices]) { asset in
+                                                galleryTile(asset, height: row.height)
+                                            }
                                         }
                                     }
                                     .id(row.indices.lowerBound)
@@ -361,6 +363,21 @@ struct ContentView: View {
         }
     }
 
+    private func galleryRows(width: CGFloat) -> [(indices: Range<Int>, height: CGFloat, day: String?)] {
+        let ratios = library.assets.map { JustifiedAssetGridLayout.aspectRatio($0.gridPreview) }
+        let groups: [(range: Range<Int>, title: String?)] = library.query.trashed
+            ? KeepsTrashDay.groups(library.assets.map(\.trashedAt)).map { ($0.range, $0.title) }
+            : [(ratios.indices, nil)]
+        return groups.flatMap { group in
+            JustifiedAssetGridLayout.rows(aspectRatios: Array(ratios[group.range]), availableWidth: width, targetHeight: thumbnailSize * 0.78)
+                .map { row in
+                    let start = group.range.lowerBound
+                    return ((row.indices.lowerBound + start)..<(row.indices.upperBound + start), row.height,
+                            row.indices.lowerBound == 0 ? group.title : nil)
+                }
+        }
+    }
+
     private func returnToGallery() {
         guard detailMode else { return }
         galleryReturnAssetID = library.selectedAsset?.id
@@ -399,6 +416,10 @@ struct ContentView: View {
             .help(asset.originalFilename)
             .contextMenu {
                 if asset.isVideo { Button("播放影片") { playVideo(asset) } }
+                if asset.trashed {
+                    Button("从回收站恢复", systemImage: "arrow.uturn.backward") { library.restorePhotos([asset.id]) }
+                        .disabled(library.isMutating || library.isSelectingAll)
+                }
                 rotationActions(for: asset)
                 Divider()
                 Button("选择此照片") { library.select(asset.id, extending: false) }
@@ -459,6 +480,10 @@ struct ContentView: View {
                 Divider().frame(height: 16)
             }
             if !library.selectedIDs.isEmpty {
+                if library.query.trashed {
+                    Button("恢复所选照片", systemImage: "arrow.uturn.backward") { library.restorePhotos(library.selectedIDs) }
+                        .disabled(library.isMutating || library.isSelectingAll)
+                }
                 HStack(spacing: 6) {
                     ForEach(1...5, id: \.self) { rating in
                         Button { library.updateSelected(KeepsAssetPatch(rating: library.selectedAsset?.rating == rating ? 0 : rating)) } label: {
@@ -582,11 +607,13 @@ struct ContentView: View {
                     Text("全部评分").tag(0)
                     ForEach(1...5, id: \.self) { Text("至少 \($0) 星").tag($0) }
                 }
-                Picker("排序", selection: $library.query.sort) {
-                    Text("拍摄时间倒序").tag("capture_desc")
-                    Text("拍摄时间正序").tag("capture_asc")
-                    Text("文件名").tag("filename")
-                    Text("评分倒序").tag("rating_desc")
+                if !library.query.trashed {
+                    Picker("排序", selection: $library.query.sort) {
+                        Text("拍摄时间倒序").tag("capture_desc")
+                        Text("拍摄时间正序").tag("capture_asc")
+                        Text("文件名").tag("filename")
+                        Text("评分倒序").tag("rating_desc")
+                    }
                 }
             }.labelsHidden()
             HStack {
@@ -639,6 +666,9 @@ struct AssetDetailView: View {
                 Text([asset.cameraMake, asset.cameraModel, asset.lensModel].filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption).textSelection(.enabled)
                 if let captureTime = asset.captureTime { Text(captureTime).font(.caption).foregroundStyle(.secondary) }
+                if let date = asset.deletionDate {
+                    Text("删除时间：\(date.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary)
+                }
                 PhotoRatingControls(rating: asset.rating, flag: asset.flagState) { rating in
                     library.updateSelected(KeepsAssetPatch(rating: rating))
                 } setFlag: { flag in
@@ -655,7 +685,7 @@ struct AssetDetailView: View {
                     }.id(asset.id.uuidString + configuration.baseURL.absoluteString + configuration.libraryID)
                     Divider()
                 }
-                if asset.trashed { Button("从回收站恢复") { library.restoreSelected() } }
+                if asset.trashed { Button("从回收站恢复") { library.restorePhotos([asset.id]) } }
             }.padding(18).disabled(library.isMutating)
                 .background(OverlayScrollerConfiguration())
         }

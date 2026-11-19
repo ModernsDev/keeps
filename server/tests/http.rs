@@ -69,6 +69,42 @@ fn seed(state: &AppState, root: &Path, name: &str) -> String {
 }
 
 #[tokio::test]
+async fn trash_pages_follow_deletion_time_and_keep_same_second_photos() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let a = seed(&state, dir.path(), "a.jpg");
+    let b = seed(&state, dir.path(), "b.jpg");
+    let old = seed(&state, dir.path(), "old.jpg");
+    let catalog =
+        rusqlite::Connection::open(dir.path().join("keeps/db/control_plane.sqlite")).unwrap();
+    for (id, time) in [(&a, 2_000_000), (&b, 2_000_000), (&old, 1_000_000)] {
+        state.store.set_trashed("photos", id, true).unwrap();
+        catalog.execute(
+            "UPDATE catalog_trash_entries SET trashed_at=? WHERE library_id='photos' AND asset_id=?",
+            rusqlite::params![time, id],
+        ).unwrap();
+    }
+    let app = router(state);
+    let query = "/libraries/photos/assets?trashed=true&sort=trash_desc&limit=1";
+    let mut cursor = String::new();
+    let mut ordered = vec![a, b];
+    ordered.sort();
+    ordered.push(old);
+    for (id, time) in ordered.iter().zip([2_000_000, 2_000_000, 1_000_000]) {
+        let (status, page) =
+            call(app.clone(), "GET", &format!("{query}{cursor}"), Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["items"][0]["id"], *id);
+        assert_eq!(page["items"][0]["trashedAt"], time);
+        cursor = page["nextCursor"]
+            .as_str()
+            .map(|value| format!("&cursor={value}"))
+            .unwrap_or_default();
+    }
+    assert!(cursor.is_empty());
+}
+
+#[tokio::test]
 async fn nas_catalog_commands_queries_authentication_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());

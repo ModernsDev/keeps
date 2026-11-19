@@ -236,7 +236,10 @@ struct IOSRootView: View {
                     }
                 } else {
                     IOSWaterfallGallery(selecting: $selecting, selectedIDs: $selectedIDs, density: $density, visibleDates: $visibleDates,
-                                        style: galleryStyle, preparationFinished: { _ in })
+                                        style: galleryStyle, preparationFinished: { _ in }, restore: { id in
+                                            guard library.showingTrash else { return }
+                                            Task { await changeSelection(trash: false, target: id) }
+                                        })
                         .id("\(library.configuration?.baseURL.absoluteString ?? "")|\(library.configuration?.libraryID ?? "")|\(preparationAttempt)|\(library.showingTrash)|\(library.showingPicked)|\(library.search)|\(library.directory ?? "")")
                         .allowsHitTesting(!changing)
                 }
@@ -344,6 +347,7 @@ struct IOSRootView: View {
                         Button { Task { await changeSelection(trash: false) } } label: {
                             Image(systemName: library.showingTrash ? "arrow.uturn.backward" : "heart")
                         }.accessibilityLabel(library.showingTrash ? "恢复所选照片" : "留用所选照片")
+                            .disabled(selectedIDs.isEmpty)
                         if !library.showingTrash {
                             Button { confirmTrash = true } label: { Image(systemName: "trash") }
                                 .accessibilityLabel("移入回收站").disabled(selectedIDs.isEmpty)
@@ -395,20 +399,24 @@ struct IOSRootView: View {
         Task { await library.refresh() }
     }
 
-    private func changeSelection(trash: Bool) async {
-        guard let configuration = library.configuration, !selectedIDs.isEmpty else { return }
+    private func changeSelection(trash: Bool, target: UUID? = nil) async {
+        let ids = target.map { Set([$0]) } ?? selectedIDs
+        let restoring = library.showingTrash
+        guard !changing, !library.trashCleanupBusy, let configuration = library.configuration, !ids.isEmpty,
+              target == nil || restoring else { return }
         changing = true
         defer { changing = false }
         let client = KeepsClient(configuration: configuration)
         do {
-            for id in Array(selectedIDs) {
+            for id in ids {
                 let asset: KeepsAsset
                 if trash { asset = try await client.trashAsset(id: id) }
-                else if library.showingTrash { asset = try await client.restoreAsset(id: id) }
+                else if restoring { asset = try await client.restoreAsset(id: id) }
                 else { asset = try await client.updateAsset(id: id, patch: KeepsAssetPatch(flagState: "picked")) }
+                guard library.configuration == configuration else { return }
                 await library.update(asset); selectedIDs.remove(id)
             }
-            resetSelection()
+            if target == nil { resetSelection() }
         } catch { library.lastError = String(reflecting: error) }
     }
 }

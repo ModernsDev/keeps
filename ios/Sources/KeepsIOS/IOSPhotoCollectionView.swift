@@ -13,6 +13,7 @@ struct IOSPhotoCollectionView: UIViewControllerRepresentable {
     var preparationFinished: (String?) -> Void
     var open: (KeepsAsset) -> Void
     var information: (KeepsAsset) -> Void
+    var restore: (UUID) -> Void
 
     func makeUIViewController(context: Context) -> PhotoCollectionController { PhotoCollectionController() }
 
@@ -27,6 +28,7 @@ struct IOSPhotoCollectionView: UIViewControllerRepresentable {
         controller.information = { id in
             Task { if let asset = await library.asset(id: id) { information(asset) } }
         }
+        controller.restore = library.showingTrash && !library.trashCleanupBusy ? restore : nil
         controller.select = { id in selecting = true; selectedIDs.insert(id) }
         controller.toggleSelection = { id in
             if !selectedIDs.insert(id).inserted { selectedIDs.remove(id) }
@@ -36,7 +38,7 @@ struct IOSPhotoCollectionView: UIViewControllerRepresentable {
         controller.changeVisibleIDs = { library.visibleIDs = $0 }
         controller.update(entries: library.timeline, revision: library.timelineRevision,
                           configuration: library.configuration, density: density, style: style,
-                          selecting: selecting, selected: selectedIDs)
+                          selecting: selecting, selected: selectedIDs, showingTrash: library.showingTrash)
     }
 
     static func dismantleUIViewController(_ controller: PhotoCollectionController, coordinator: ()) {
@@ -46,24 +48,127 @@ struct IOSPhotoCollectionView: UIViewControllerRepresentable {
 
 /// The layout owns positions for the entire library, but only creates attributes near the viewport.
 private final class TimelineCollectionLayout: UICollectionViewLayout {
-    var geometry = KeepsTimelineGeometry(aspectRatios: [], width: 0, density: .large, style: .square)
+    static let headerKind = "trash-day"
+    private static let headerHeight: CGFloat = 36
+
+    private struct Group {
+        var indices: Range<Int>
+        var y: CGFloat
+        var title: String?
+        var geometry: KeepsTimelineGeometry
+
+        var headerHeight: CGFloat { title == nil ? 0 : TimelineCollectionLayout.headerHeight }
+        var photosY: CGFloat { y + headerHeight }
+        var endY: CGFloat { photosY + geometry.contentSize.height }
+    }
+
+    private var groups: [Group] = []
+    private var width: CGFloat = 0
     var anchorOffset: CGPoint?
-    override var collectionViewContentSize: CGSize { geometry.contentSize }
+    override var collectionViewContentSize: CGSize { CGSize(width: width, height: groups.last?.endY ?? 0) }
+
+    func arrange(entries: [KeepsTimelineEntry], width: CGFloat, density: KeepsGalleryDensity, style: KeepsGalleryStyle, showingTrash: Bool) {
+        self.width = width
+        let days: [(range: Range<Int>, title: String?)] = showingTrash
+            ? KeepsTrashDay.groups(entries.map(\.trashedAt)).map { ($0.range, $0.title) }
+            : [(entries.indices, nil)]
+        var y: CGFloat = 0
+        groups = days.map { day in
+            let geometry = KeepsTimelineGeometry(
+                aspectRatios: entries[day.range].map { JustifiedAssetGridLayout.aspectRatio($0.gridPreview) },
+                width: width, density: density, style: style)
+            let group = Group(indices: day.range, y: y, title: day.title, geometry: geometry)
+            y = group.endY + 1
+            return group
+        }
+    }
+
     override func targetContentOffset(forProposedContentOffset proposedContentOffset: CGPoint) -> CGPoint {
         anchorOffset ?? proposedContentOffset
     }
+
+    func title(at index: Int) -> String? { group(at: index)?.title }
+
+    func frame(at index: Int) -> CGRect? {
+        guard let group = group(at: index) else { return nil }
+        return group.geometry.frame(at: index - group.indices.lowerBound)?.offsetBy(dx: 0, dy: group.photosY)
+    }
+
+    func indices(in rect: CGRect) -> [Int] {
+        groups(in: rect).flatMap { group in
+            group.geometry.indices(in: rect.offsetBy(dx: 0, dy: -group.photosY)).map { group.indices.lowerBound + $0 }
+        }
+    }
+
     override func layoutAttributesForItem(at indexPath: IndexPath) -> UICollectionViewLayoutAttributes? {
-        guard let frame = geometry.frame(at: indexPath.item) else { return nil }
+        guard let frame = frame(at: indexPath.item) else { return nil }
         let attributes = UICollectionViewLayoutAttributes(forCellWith: indexPath)
         attributes.frame = frame
         return attributes
     }
+
+    override func layoutAttributesForSupplementaryView(ofKind elementKind: String, at indexPath: IndexPath) -> UICollectionViewLayoutAttributes? {
+        guard elementKind == Self.headerKind, let group = group(at: indexPath.item), group.title != nil,
+              group.indices.lowerBound == indexPath.item else { return nil }
+        let attributes = UICollectionViewLayoutAttributes(forSupplementaryViewOfKind: elementKind, with: indexPath)
+        attributes.frame = CGRect(x: 0, y: group.y, width: width, height: group.headerHeight)
+        return attributes
+    }
+
     override func layoutAttributesForElements(in rect: CGRect) -> [UICollectionViewLayoutAttributes]? {
-        geometry.indices(in: rect).compactMap { index in
+        let cells = indices(in: rect).compactMap { index -> UICollectionViewLayoutAttributes? in
             guard let attributes = layoutAttributesForItem(at: IndexPath(item: index, section: 0)),
                   attributes.frame.intersects(rect) else { return nil }
             return attributes
         }
+        let headers = groups(in: rect).compactMap { group -> UICollectionViewLayoutAttributes? in
+            guard let attributes = layoutAttributesForSupplementaryView(ofKind: Self.headerKind,
+                        at: IndexPath(item: group.indices.lowerBound, section: 0)),
+                  attributes.frame.intersects(rect) else { return nil }
+            return attributes
+        }
+        return cells + headers
+    }
+
+    private func group(at index: Int) -> Group? {
+        let position = firstGroup { $0.indices.upperBound > index }
+        return position < groups.count && groups[position].indices.contains(index) ? groups[position] : nil
+    }
+
+    private func groups(in rect: CGRect) -> ArraySlice<Group> {
+        let start = firstGroup { $0.endY > rect.minY }
+        let end = firstGroup { $0.y >= rect.maxY }
+        return groups[start..<max(start, end)]
+    }
+
+    private func firstGroup(where predicate: (Group) -> Bool) -> Int {
+        var lower = 0
+        var upper = groups.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if predicate(groups[middle]) { upper = middle }
+            else { lower = middle + 1 }
+        }
+        return lower
+    }
+}
+
+private final class TrashDayHeader: UICollectionReusableView {
+    let label = UILabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        label.font = .preferredFont(forTextStyle: .headline)
+        label.textColor = .white
+        label.accessibilityTraits = .header
+        addSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        label.frame = bounds.insetBy(dx: 12, dy: 0)
     }
 }
 
@@ -71,6 +176,7 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
                                        UICollectionViewDataSource, UICollectionViewDataSourcePrefetching {
     var open: (UUID) -> Void = { _ in }
     var information: (UUID) -> Void = { _ in }
+    var restore: ((UUID) -> Void)?
     var select: (UUID) -> Void = { _ in }
     var toggleSelection: (UUID) -> Void = { _ in }
     var changeDensity: (KeepsGalleryDensity) -> Void = { _ in }
@@ -90,6 +196,7 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
     private var style = KeepsGalleryStyle.square
     private var appliedStyle: KeepsGalleryStyle?
     private var appliedWidth: CGFloat = 0
+    private var showingTrash = false
     private var selecting = false
     private var selected: Set<UUID> = []
     private var applying = false
@@ -121,6 +228,8 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
         collection.prefetchDataSource = self
         collection.accessibilityIdentifier = "photo-grid"
         collection.register(PhotoCollectionCell.self, forCellWithReuseIdentifier: "photo")
+        collection.register(TrashDayHeader.self, forSupplementaryViewOfKind: TimelineCollectionLayout.headerKind,
+                            withReuseIdentifier: TimelineCollectionLayout.headerKind)
         view.addSubview(collection)
         collection.addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:))))
         rail.accessibilityLabel = "按日期浏览照片"
@@ -154,7 +263,7 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
     }
 
     func update(entries: [KeepsTimelineEntry], revision: Int, configuration: KeepsConfiguration?,
-                density: KeepsGalleryDensity, style: KeepsGalleryStyle, selecting: Bool, selected: Set<UUID>) {
+                density: KeepsGalleryDensity, style: KeepsGalleryStyle, selecting: Bool, selected: Set<UUID>, showingTrash: Bool) {
         loadViewIfNeeded()
         let appearanceChanged = self.selecting != selecting || self.selected != selected || self.configuration != configuration
         self.configuration = configuration
@@ -162,6 +271,7 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
         self.style = style
         self.selecting = selecting
         self.selected = selected
+        self.showingTrash = showingTrash
         if pendingRevision != revision {
             pending = entries
             pendingRevision = revision
@@ -180,7 +290,7 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
         updateRail()
     }
 
-    private func entry(at index: Int) -> KeepsTimelineEntry { entries[entries.count - 1 - index] }
+    private func entry(at index: Int) -> KeepsTimelineEntry { entries[index] }
     private var bottomOffset: CGFloat { max(0, layout.collectionViewContentSize.height + collection.contentInset.bottom - collection.bounds.height) }
 
     private func applyPending() {
@@ -190,26 +300,24 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
         guard reflow || appliedRevision != pendingRevision else { return }
         let path = collection.indexPathsForVisibleItems.sorted().first
         let anchor = path.flatMap { path -> (UUID, CGFloat)? in
-            guard path.item < entries.count, let frame = layout.geometry.frame(at: path.item) else { return nil }
+            guard path.item < entries.count, let frame = layout.frame(at: path.item) else { return nil }
             return (entry(at: path.item).id, frame.minY - collection.contentOffset.y)
         }
         let initial = entries.isEmpty
         cancelPrefetches()
-        entries = pending
+        entries = showingTrash ? pending : Array(pending.reversed())
         appliedRevision = pendingRevision
         appliedWidth = collection.bounds.width
         appliedDensity = density
         appliedStyle = style
         applying = true
-        layout.geometry = KeepsTimelineGeometry(
-            aspectRatios: entries.reversed().map { JustifiedAssetGridLayout.aspectRatio($0.gridPreview) },
-            width: appliedWidth, density: density, style: style)
+        layout.arrange(entries: entries, width: appliedWidth, density: density, style: style, showingTrash: showingTrash)
         let target: CGFloat
         if let anchor, let index = entries.firstIndex(where: { $0.id == anchor.0 }),
-           let frame = layout.geometry.frame(at: entries.count - 1 - index) {
+           let frame = layout.frame(at: index) {
             target = max(0, min(bottomOffset, frame.minY - anchor.1))
         } else if initial {
-            target = bottomOffset
+            target = showingTrash ? 0 : bottomOffset
         } else {
             target = max(0, min(collection.contentOffset.y, bottomOffset))
         }
@@ -231,6 +339,11 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
         let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "photo", for: indexPath) as! PhotoCollectionCell
         configure(cell, at: indexPath)
         return cell
+    }
+    func collectionView(_ collectionView: UICollectionView, viewForSupplementaryElementOfKind kind: String, at indexPath: IndexPath) -> UICollectionReusableView {
+        let header = collectionView.dequeueReusableSupplementaryView(ofKind: kind, withReuseIdentifier: kind, for: indexPath) as! TrashDayHeader
+        header.label.text = layout.title(at: indexPath.item)
+        return header
     }
     func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
         if let cell = cell as? PhotoCollectionCell { configure(cell, at: indexPath) }
@@ -255,10 +368,10 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
         let visible = collection.indexPathsForVisibleItems.filter { $0.item < entries.count }.sorted()
         changeVisibleIDs(Set(visible.map { entry(at: $0.item).id }))
         guard let first = visible.first, let last = visible.last else { return }
-        let start = String(entry(at: first.item).date.prefix(10))
-        let end = String(entry(at: last.item).date.prefix(10))
+        let start = layout.title(at: first.item) ?? String(entry(at: first.item).date.prefix(10))
+        let end = layout.title(at: last.item) ?? String(entry(at: last.item).date.prefix(10))
         let next = start == end ? start : "\(start) – \(end)"
-        dateBubble.text = String(entry(at: first.item).date.prefix(7))
+        dateBubble.text = showingTrash ? start : String(entry(at: first.item).date.prefix(7))
         rail.accessibilityValue = next
         updateRail()
         guard dates != next else { return }
@@ -322,7 +435,7 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
         previousTime = now
         updateDates()
         // UIKit may omit cancellation callbacks after a large jump; keep only nearby requests.
-        let nearby = layout.geometry.indices(in: collection.bounds.insetBy(dx: 0, dy: -collection.bounds.height))
+        let nearby = layout.indices(in: collection.bounds.insetBy(dx: 0, dy: -collection.bounds.height))
         let retained = Set(nearby.map { entry(at: $0).id })
         for id in Array(prefetches.keys) where !retained.contains(id) { prefetches.removeValue(forKey: id)?.cancel() }
     }
@@ -398,11 +511,17 @@ final class PhotoCollectionController: UIViewController, UICollectionViewDelegat
                         point: CGPoint) -> UIContextMenuConfiguration? {
         let id = entry(at: indexPath.item).id
         return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
-            UIMenu(children: [
+            var actions: [UIMenuElement] = [
                 UIAction(title: "查看照片", image: UIImage(systemName: "photo")) { _ in self?.open(id) },
                 UIAction(title: "选择", image: UIImage(systemName: "checkmark.circle")) { _ in self?.select(id) },
                 UIAction(title: "信息与整理", image: UIImage(systemName: "info.circle")) { _ in self?.information(id) }
-            ])
+            ]
+            if self?.restore != nil {
+                actions.append(UIAction(title: "从回收站恢复", image: UIImage(systemName: "arrow.uturn.backward")) { _ in
+                    self?.restore?(id)
+                })
+            }
+            return UIMenu(children: actions)
         }
     }
     func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {

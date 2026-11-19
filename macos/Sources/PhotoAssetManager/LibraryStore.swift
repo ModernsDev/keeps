@@ -547,6 +547,7 @@ final class LibraryStore: ObservableObject {
     private var effectiveQuery: KeepsAssetQuery {
         var value = query
         value.cursor = nil
+        if value.trashed { value.sort = "trash_desc" }
         value.showHidden = !hiddenDirectoryFilterEnabled
         return value
     }
@@ -778,11 +779,16 @@ final class LibraryStore: ObservableObject {
         mutateSelected { client, id in try await client.updateAsset(id: id, patch: patch) }
     }
 
-    func restoreSelected() { mutateSelected(refreshDirectories: true) { client, id in try await client.restoreAsset(id: id) } }
+    func mutateSelected(_ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
+        mutatePhotos(selectedIDs, mutation)
+    }
 
-    func mutateSelected(refreshDirectories: Bool = false, _ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
-        guard !isOperationBlocking, !isSelectingAll, let client, !isMutating, !selectedIDs.isEmpty else { return }
-        let ids = selectedIDs
+    func restorePhotos(_ ids: Set<UUID>) {
+        mutatePhotos(ids, restoring: true) { client, id in try await client.restoreAsset(id: id) }
+    }
+
+    private func mutatePhotos(_ ids: Set<UUID>, restoring: Bool = false, _ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
+        guard !isOperationBlocking, !isSelectingAll, let client, !isMutating, !ids.isEmpty else { return }
         loadTask?.cancel()
         loadGeneration += 1
         isLoading = false
@@ -797,12 +803,30 @@ final class LibraryStore: ObservableObject {
             do {
                 for id in ids {
                     let updated = try await mutation(client, id)
-                    if generation == loadGeneration, let index = assets.firstIndex(where: { $0.id == id }) { assets[index] = updated }
+                    if generation == loadGeneration, let index = assets.firstIndex(where: { $0.id == id }) {
+                        if restoring && query.trashed {
+                            assets.remove(at: index)
+                            total -= 1
+                            selectedIDs.remove(id)
+                            if selectionAnchor == id { selectionAnchor = nil }
+                            if selectionFocus == id { selectionFocus = nil }
+                        } else {
+                            assets[index] = updated
+                        }
+                    }
                     completed += 1
                 }
                 isMutating = false
-                if generation == loadGeneration { refresh(force: true); if refreshDirectories { refreshNavigation() } }
-            } catch { if generation == loadGeneration { lastError = "已完成 \(completed)/\(ids.count) 项。\n" + Self.describe(error) } }
+                if generation == loadGeneration { refresh(force: true); if restoring { refreshNavigation() } }
+            } catch {
+                if generation == loadGeneration {
+                    if restoring && completed > 0 {
+                        refreshCounts(client: client, showHidden: effectiveQuery.showHidden, force: true)
+                        refreshNavigation()
+                    }
+                    lastError = "已完成 \(completed)/\(ids.count) 项。\n" + Self.describe(error)
+                }
+            }
         }
     }
 

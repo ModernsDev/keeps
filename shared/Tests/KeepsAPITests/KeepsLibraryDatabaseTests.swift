@@ -159,6 +159,31 @@ struct KeepsLibraryDatabaseTests {
         #expect(try db.timeline(query: .init()).first?.id == photos[0].id)
     }
 
+    @Test func trashTimelineAndPhotoWindowsUseDeletionDays() throws {
+        let root = root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root)
+        let calendar = Calendar.current
+        let day = calendar.startOfDay(for: Date())
+        let start = Int64(day.timeIntervalSince1970)
+        let photos = [start - 1, start + 2, start + 1, nil].enumerated().map { index, timestamp in
+            var photo = asset(index + 1)
+            photo.trashed = true
+            photo.trashedAt = timestamp
+            photo.captureTime = "2026-01-0\(4 - index)"
+            return photo
+        }
+        try db.ingest(photos)
+        var query = KeepsAssetQuery()
+        query.trashed = true
+        query.limit = 2
+        let timeline = try db.timeline(query: query)
+        #expect(timeline.map(\.id) == [photos[1], photos[2], photos[0], photos[3]].map(\.id))
+        #expect(KeepsTrashDay.groups(timeline.map(\.trashedAt)).map(\.range) == [0..<2, 2..<3, 3..<4])
+        #expect(try db.assets(query: query, olderThan: photos[2]).items == [photos[0], photos[3]])
+        #expect(try db.assets(query: query, newerThan: photos[0]).items == [photos[1], photos[2]])
+    }
+
     @Test func viewportAssetsPreserveOrderAcrossBatchesAndSkipMissingIDs() throws {
         let root = root()
         defer { try? FileManager.default.removeItem(at: root) }

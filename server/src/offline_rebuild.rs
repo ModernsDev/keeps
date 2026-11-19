@@ -539,7 +539,7 @@ impl Manager {
         } else {
             "?4 IS NULL"
         };
-        let mut statement=source.prepare(&format!("SELECT a.id,a.snapshot,coalesce(e.thumbnail,c.thumbnail),coalesce(e.standard,c.standard),coalesce(e.browse,CASE WHEN c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?3 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=c.browse_spec THEN c.browse_thumbnail END),a.negative_hash FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id LEFT JOIN media_cache c ON c.library_id=a.library_id AND c.asset_id=a.id AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?2 WHERE a.library_id=?1 AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id) AND {selection} ORDER BY a.id"))?;
+        let mut statement=source.prepare(&format!("SELECT a.id,a.snapshot,coalesce(e.thumbnail,c.thumbnail),coalesce(e.standard,c.standard),coalesce(e.browse,CASE WHEN c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?3 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=c.browse_spec THEN c.browse_thumbnail END),a.negative_hash,t.trashed_at FROM catalog_assets a LEFT JOIN catalog_trash_entries t ON t.library_id=a.library_id AND t.asset_id=a.id LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id LEFT JOIN media_cache c ON c.library_id=a.library_id AND c.asset_id=a.id AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?2 WHERE a.library_id=?1 AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id) AND {selection} ORDER BY a.id"))?;
         let rows = statement.query_map(
             params![
                 lib,
@@ -555,11 +555,12 @@ impl Manager {
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
                 ))
             },
         )?;
         for (index, row) in rows.enumerate() {
-            let (id, snapshot, thumbnail, standard, browse, negative) = row?;
+            let (id, snapshot, thumbnail, standard, browse, negative, trashed_at) = row?;
             let mut asset: Value = serde_json::from_str(&snapshot)?;
             let upper = Uuid::parse_str(&id)?.to_string().to_uppercase();
             let asset_paths = paths
@@ -568,6 +569,7 @@ impl Manager {
             asset["id"] = json!(upper);
             asset["paths"] = json!(asset_paths);
             asset["negativeContentHash"] = json!(negative);
+            asset["trashedAt"] = json!(trashed_at);
             asset["preview"] = Value::Null;
             asset["thumbnail"] = Value::Null;
             asset["browseThumbnail"] = Value::Null;
@@ -1338,7 +1340,23 @@ mod tests {
                 .unwrap(),
             true,
         )?;
-        app.store.set_trashed("photos", &second, true)?;
+        let deleted_at = app.store.set_trashed("photos", &second, true)?["trashedAt"]
+            .as_i64()
+            .unwrap();
+        let previous_revision = app.store.library_revision("photos")?["revision"]
+            .as_i64()
+            .unwrap();
+        {
+            let mut db = app.store.lock()?;
+            db.pragma_update(None, "user_version", 22)?;
+            crate::catalog::ensure_schema(&mut db, true)?;
+            let changed_revision = db.query_row(
+                "SELECT revision FROM catalog_sync_assets WHERE library_id='photos' AND asset_id=?",
+                [&second],
+                |r| r.get::<_, i64>(0),
+            )?;
+            assert!(changed_revision > previous_revision);
+        }
         let image = root.path().join("image.heic");
         use base64::Engine;
         let png=base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6SAAAAABJRU5ErkJggg==")?;
@@ -1436,6 +1454,14 @@ mod tests {
             db.query_row("SELECT count(*) FROM assets WHERE trashed=1", [], |r| r
                 .get::<_, i64>(0))?,
             1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT json_extract(snapshot,'$.trashedAt') FROM assets WHERE trashed=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            deleted_at
         );
         assert_eq!(
             db.query_row("SELECT count(*) FROM hidden", [], |r| r.get::<_, i64>(0))?,

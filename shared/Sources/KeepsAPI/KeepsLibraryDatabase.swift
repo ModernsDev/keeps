@@ -6,6 +6,7 @@ import Darwin
 public struct KeepsTimelineEntry: Identifiable, Equatable, Sendable {
     public var id: UUID
     public var date: String
+    public var trashedAt: Int64?
     public var flagState: String
     public var filename: String
     public var browseThumbnail: KeepsPreview?
@@ -15,9 +16,10 @@ public struct KeepsTimelineEntry: Identifiable, Equatable, Sendable {
     public var gridPreview: KeepsPreview? { thumbnail ?? preview }
     public var isVideo: Bool { ["mov", "mp4", "m4v", "avi", "mkv", "mts", "m2ts"].contains(URL(fileURLWithPath: filename).pathExtension.lowercased()) }
 
-    public init(id: UUID, date: String, thumbnail: KeepsPreview?, preview: KeepsPreview?, flagState: String, filename: String, browseThumbnail: KeepsPreview? = nil, standard: KeepsPreview? = nil) {
+    public init(id: UUID, date: String, thumbnail: KeepsPreview?, preview: KeepsPreview?, flagState: String, filename: String, browseThumbnail: KeepsPreview? = nil, standard: KeepsPreview? = nil, trashedAt: Int64? = nil) {
         self.id = id
         self.date = date
+        self.trashedAt = trashedAt
         self.flagState = flagState
         self.filename = filename
         self.browseThumbnail = browseThumbnail
@@ -443,12 +445,15 @@ public final class KeepsLibraryDatabase {
         try strings("SELECT snapshot FROM navigation WHERE path=?", [path ?? ""]).first.map { try decoder.decode(KeepsNavigation.self, from: Data($0.utf8)) }
     }
 
+    private static let trashSortTime = "printf('%020lld',coalesce(json_extract(snapshot,'$.trashedAt'),0))"
+
     /// All positions are available before scrolling; cursor and page size do not constrain the index.
     public func timeline(query: KeepsAssetQuery) throws -> [KeepsTimelineEntry] {
         Self.connections.lock.lock()
         defer { Self.connections.lock.unlock() }
         let (filter, bindings) = try assetFilter(query)
-        let sql = "SELECT id,sort_time,json_extract(snapshot,'$.thumbnail'),json_extract(snapshot,'$.preview'),flag,filename,json_extract(snapshot,'$.browseThumbnail'),json_extract(snapshot,'$.standard') FROM assets a WHERE \(filter) ORDER BY sort_time DESC,id ASC"
+        let sortTime = query.trashed ? Self.trashSortTime : "sort_time"
+        let sql = "SELECT id,sort_time,json_extract(snapshot,'$.thumbnail'),json_extract(snapshot,'$.preview'),flag,filename,json_extract(snapshot,'$.browseThumbnail'),json_extract(snapshot,'$.standard'),json_extract(snapshot,'$.trashedAt') FROM assets a WHERE \(filter) ORDER BY \(sortTime) DESC,id ASC"
         let statement = try statement(sql, bindings)
         defer { sqlite3_finalize(statement) }
         var entries: [KeepsTimelineEntry] = []
@@ -464,7 +469,8 @@ public final class KeepsLibraryDatabase {
                                               thumbnail: try descriptor(2), preview: try descriptor(3),
                                               flagState: String(cString: sqlite3_column_text(statement, 4)),
                                               filename: String(cString: sqlite3_column_text(statement, 5)),
-                                              browseThumbnail: try descriptor(6), standard: try descriptor(7)))
+                                              browseThumbnail: try descriptor(6), standard: try descriptor(7),
+                                              trashedAt: sqlite3_column_type(statement, 8) == SQLITE_NULL ? nil : sqlite3_column_int64(statement, 8)))
             result = sqlite3_step(statement)
         }
         guard result == SQLITE_DONE else { throw failure(sql) }
@@ -535,33 +541,38 @@ public final class KeepsLibraryDatabase {
             guard query.limit > 0 else { throw DatabaseError(message: "Invalid local catalog limit") }
             guard let offset = Int(query.cursor ?? "0"), offset >= 0 else { throw DatabaseError(message: "Invalid local catalog cursor") }
             var (filter, bindings) = try assetFilter(query)
+            let sortTime = query.trashed ? Self.trashSortTime : "sort_time"
+            func timeKey(_ asset: KeepsAsset) -> String {
+                if query.trashed { return String(format: "%020lld", asset.trashedAt ?? 0) }
+                return asset.captureTime ?? asset.createdAt
+            }
             let total = try knownTotal ?? Int(strings("SELECT count(*) FROM assets a WHERE \(filter)", bindings).first!)!
             // The explicit time bound lets SQLite seek assets_sort with bound parameters.
             if let boundary {
-                filter += " AND sort_time<=? AND (sort_time<? OR (sort_time=? AND id>?))"
-                let time = boundary.captureTime ?? boundary.createdAt
+                filter += " AND \(sortTime)<=? AND (\(sortTime)<? OR (\(sortTime)=? AND id>?))"
+                let time = timeKey(boundary)
                 bindings += [time, time, time, boundary.id.uuidString]
             }
             if let newer {
-                filter += " AND sort_time>=? AND (sort_time>? OR (sort_time=? AND id<?))"
-                let time = newer.captureTime ?? newer.createdAt
+                filter += " AND \(sortTime)>=? AND (\(sortTime)>? OR (\(sortTime)=? AND id<?))"
+                let time = timeKey(newer)
                 bindings += [time, time, time, newer.id.uuidString]
             }
             if let first {
-                filter += " AND sort_time<=? AND (sort_time<? OR (sort_time=? AND id>=?))"
-                let time = first.captureTime ?? first.createdAt
+                filter += " AND \(sortTime)<=? AND (\(sortTime)<? OR (\(sortTime)=? AND id>=?))"
+                let time = timeKey(first)
                 bindings += [time, time, time, first.id.uuidString]
             }
             var limit = query.limit
             if let asset {
                 // 新记录加入时保留已浏览范围，避免固定条数窗口挤掉上方旧行。
-                let time = asset.captureTime ?? asset.createdAt
-                let count = Int(try strings("SELECT count(*) FROM assets a WHERE \(filter) AND (sort_time>? OR (sort_time=? AND id<=?))",
+                let time = timeKey(asset)
+                let count = Int(try strings("SELECT count(*) FROM assets a WHERE \(filter) AND (\(sortTime)>? OR (\(sortTime)=? AND id<=?))",
                     bindings + [time, time, asset.id.uuidString]).first!)!
                 limit = max(limit, count - offset)
             }
             if let maximumLimit { limit = min(limit, maximumLimit) }
-            let order = newer == nil ? "sort_time DESC,id ASC" : "sort_time ASC,id DESC"
+            let order = newer == nil ? "\(sortTime) DESC,id ASC" : "\(sortTime) ASC,id DESC"
             let rows = try strings("SELECT snapshot FROM assets a WHERE \(filter) ORDER BY \(order) LIMIT ? OFFSET ?", bindings + [String(limit + 1), String(offset)])
             let hasMore = rows.count > limit
             var items = try rows.prefix(limit).map { try decoder.decode(KeepsAsset.self, from: Data($0.utf8)) }
