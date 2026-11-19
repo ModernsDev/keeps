@@ -455,16 +455,21 @@ struct IOSLibraryStoreTests {
     @Test func connectionSwitchDuringDownloadCannotPublishOldCatalog() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        ReplicaProtocol.delayDownload(host: fixture.configuration.baseURL.host!)
-        let sync = Task { await store.synchronize() }
-        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-        while !fixture.requests.contains(where: { $0.hasSuffix("/download") }), ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
+        let (downloads, download) = AsyncStream<@Sendable () -> Void>.makeStream()
+        ReplicaProtocol.interceptDownload(host: fixture.configuration.baseURL.host!) { deliver in
+            _ = download.yield(deliver)
         }
-        #expect(fixture.requests.contains(where: { $0.hasSuffix("/download") }))
+        let sync = Task {
+            defer { download.finish() }
+            await store.synchronize()
+        }
+        var iterator = downloads.makeAsyncIterator()
+        let pendingDelivery = await iterator.next()
+        let deliver = try #require(pendingDelivery, "Download did not start: \(fixture.requests), \(String(describing: store.syncError))")
         var other = fixture.configuration
         other.accessCredential = "switched"
         store.configure(other)
+        deliver()
         await store.waitForLocalLoad()
         await sync.value
         #expect(store.configuration == other)
@@ -734,24 +739,35 @@ private struct ReplicaResponse: Sendable {
 }
 
 private final class ReplicaProtocol: URLProtocol, @unchecked Sendable {
+    typealias DownloadDelivery = @Sendable (@escaping @Sendable () -> Void) -> Void
     private static let lock = NSLock()
     nonisolated(unsafe) private static var handlers: [String: (URLRequest) -> ReplicaResponse] = [:]
     static func register(host: String, handler: @escaping (URLRequest) -> ReplicaResponse) { lock.withLock { handlers[host] = handler } }
-    static func remove(host: String) { _ = lock.withLock { handlers.removeValue(forKey: host) } }
-    nonisolated(unsafe) private static var delayedHosts: Set<String> = []
+    static func remove(host: String) {
+        lock.withLock {
+            handlers.removeValue(forKey: host)
+            downloads.removeValue(forKey: host)
+        }
+    }
+    nonisolated(unsafe) private static var downloads: [String: DownloadDelivery] = [:]
     private let deliveryLock = NSLock()
     private var stopped = false
-    static func delayDownload(host: String) { _ = lock.withLock { delayedHosts.insert(host) } }
+    static func interceptDownload(host: String, delivery: @escaping DownloadDelivery) {
+        lock.withLock { downloads[host] = delivery }
+    }
+    static func delayDownload(host: String) {
+        interceptDownload(host: host) { deliver in
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.2, execute: deliver)
+        }
+    }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let handler = Self.lock.withLock { Self.handlers[request.url!.host!]! }
         let response = handler(request)
-        let delay = Self.lock.withLock {
-            request.url!.path.hasSuffix("download") == true && Self.delayedHosts.remove(request.url!.host!) != nil
-        }
-        if delay {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { [self] in deliver(response) }
+        if request.url!.path.hasSuffix("download"),
+           let delivery = Self.lock.withLock({ Self.downloads.removeValue(forKey: request.url!.host!) }) {
+            delivery { [self] in deliver(response) }
         } else { deliver(response) }
     }
     private func deliver(_ response: ReplicaResponse) {
