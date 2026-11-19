@@ -210,14 +210,26 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Identify iOS compilation cache inputs
+        id: compilation-cache
+        run: |
+          xcode="$(xcodebuild -version)"
+          sdk="$(xcrun --sdk iphonesimulator --show-sdk-build-version)"
+          toolchain="$(printf '%s\n' "$xcode" "$sdk" | shasum -a 256 | cut -d ' ' -f 1)"
+          inputs="$(git ls-files --stage -z -- ios shared ':(exclude)ios/Tests' ':(exclude)shared/Tests' | shasum -a 256 | cut -d ' ' -f 1)"
+          printf 'toolchain=%s\ninputs=%s\n' "$toolchain" "$inputs" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: .build/xcode-ios-ci
-          key: xcode-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('ios/**/*.swift', 'ios/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'ios/**/*.pbxproj', 'ios/Version.xcconfig') }}
+          path: .build/xcode-ios-cas
+          key: xcode-ios-cas-${{ runner.os }}-${{ runner.arch }}-${{ steps.compilation-cache.outputs.toolchain }}-${{ steps.compilation-cache.outputs.inputs }}
           restore-keys: |
-            xcode-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
+            xcode-ios-cas-${{ runner.os }}-${{ runner.arch }}-${{ steps.compilation-cache.outputs.toolchain }}-
       - name: Build iOS Simulator
-        run: xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/xcode-ios-ci CODE_SIGNING_ALLOWED=NO build
+        run: >-
+          xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath .build/xcode-ios-ci CODE_SIGNING_ALLOWED=NO
+          COMPILATION_CACHE_ENABLE_CACHING=YES COMPILATION_CACHE_ENABLE_DIAGNOSTIC_REMARKS=YES
+          "COMPILATION_CACHE_CAS_PATH=$GITHUB_WORKSPACE/.build/xcode-ios-cas" build
 
   python:
     name: Control plane and migration tools
