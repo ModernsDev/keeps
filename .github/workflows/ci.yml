@@ -119,13 +119,29 @@ jobs:
           path: |
             macos/.build
             macos/ColorTools/.build
-            .build/xcode-macos-ci
           key: swift-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('macos/**/*.swift', 'macos/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'macos/**/*.pbxproj', 'macos/Version.xcconfig') }}
           restore-keys: |
             swift-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
       - run: swift test --package-path macos
       - run: swift test --package-path macos/ColorTools
       - run: bash macos/scripts/package_app.sh
+
+  macos_xcode:
+    name: macOS Xcode build
+    needs: scope
+    if: needs.scope.outputs.macos == 'true'
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/xcode-macos-ci
+          key: xcode-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('macos/**/*.swift', 'macos/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'macos/**/*.pbxproj', 'macos/Version.xcconfig') }}
+          restore-keys: |
+            xcode-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
       - name: Build macOS Xcode app
         run: xcodebuild -project macos/Keeps.xcodeproj -scheme Keeps -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath .build/xcode-macos-ci CODE_SIGNING_ALLOWED=NO build
 
@@ -191,7 +207,7 @@ jobs:
   keeps-ci-gate:
     name: keeps-ci-gate
     if: ${{ always() }}
-    needs: [scope, checks, server, shared, macos, ios, python]
+    needs: [scope, checks, server, shared, macos, macos_xcode, ios, python]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -211,8 +227,8 @@ jobs:
                   failures.append(f"{name}: expected success, got {result}")
 
           scope = jobs["scope"]["outputs"]
-          for name in ("server", "shared", "macos", "ios", "python"):
-              required = scope.get(name)
+          for name in ("server", "shared", "macos", "macos_xcode", "ios", "python"):
+              required = scope.get("macos" if name == "macos_xcode" else name)
               if required not in {"true", "false"}:
                   failures.append(f"{name}: invalid scope {required!r}")
                   continue
