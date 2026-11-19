@@ -2,16 +2,23 @@
 
 Keeps 在 NAS 原生运行，这是唯一受支持的 NAS 服务部署方式。Docker 不用于部署 NAS 服务；仓库中的 Docker 流程只构建 SPK 运行时、运行隔离测试或执行明确安排的一次性 Linux worker。旧 NAS Docker Compose 方案已退役，不得重新启用。当前支持 DS1520+ 的 geminilake 架构及 DSM 7；尚未取得 Synology 官方套件审核。
 
-## 构建与安装
+## 正式发布与安装
+
+正式 NAS 只安装 **当前 `origin/main`** 的 GitHub Actions SPK。发布变更通过 Draft PR 提交，由 `hechuan9` 批准最终提交、CI 通过后合并。套件升级时在 PR 中递增 `package/INFO` 内的套件版本号。合并后等待该 main 提交的 CI 通过，再手动打包：
 
 ```sh
-docker build -f server/Dockerfile -t keeps-server:spk .
-python3 deploy/spk/export_runtime.py --image keeps-server:spk --output /tmp/keeps-native-payload
-python3 deploy/spk/pack.py --payload /tmp/keeps-native-payload --output /tmp/KeepsNativeProbe.spk
-python3 -m unittest discover -s deploy/spk -p 'test_*.py'
+gh workflow run release-nas.yml --repo ModernsDev/keeps --ref main
 ```
 
-在 NAS 管理员终端使用 `synopkg install <绝对路径.spk>` 安装，`synopkg start KeepsNativeProbe` / `synopkg stop KeepsNativeProbe` 启停。状态使用 `sudo synopkg status KeepsNativeProbe` 查询；普通 SSH 账号无法正确查询套件用户服务，可能误报停止。套件以 DSM 创建的专用账号运行，不绑 CPU 核心，使用 `Nice=10` 和 best-effort I/O 优先级 7，空闲时可使用可用 CPU，争用时让出资源。没有整个套件的 2 GiB 硬内存上限，媒体子进程另有地址空间和超时限制；编码并发仍受后台任务配置约束。
+等待 **Release NAS SPK** 成功，在上传安装前下载并校验当前 main 的产物：
+
+```sh
+python3 deploy/spk/release.py fetch .build/keeps-nas-release
+```
+
+下载器固定从 `ModernsDev/keeps` 获取同一提交的成功发布产物，核对来源和 SHA-256。`source-revision` 记录 Git 提交，并随 SPK 保存。main 更新后需为新提交重新打包、下载。仓库的 `export_runtime.py` 和 `pack.py` 可继续用于隔离开发测试。
+
+把下载目录上传到 NAS。备份完成、安装前，在发布端重新运行 `python3 deploy/spk/release.py check "$(cat .build/keeps-nas-release/source-revision)"`，并在 NAS 下载目录运行 `sha256sum -c SHA256SUMS`，再按下方升级流程执行 `synopkg install <绝对路径.spk>`。使用 `synopkg start KeepsNativeProbe` / `synopkg stop KeepsNativeProbe` 启停，使用 `sudo synopkg status KeepsNativeProbe` 查询状态。套件以 DSM 专用账号运行，使用 `Nice=10` 和 best-effort I/O 优先级 7。媒体子进程的资源上限由服务配置控制。
 
 运行时使用私有动态加载器，不全局设置 `LD_LIBRARY_PATH`。导出器针对 Debian trixie、Perl 5.40、ImageMagick 7 的布局；随包保留依赖版权资料。
 
