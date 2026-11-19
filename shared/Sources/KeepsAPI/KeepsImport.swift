@@ -7,7 +7,7 @@ public struct KeepsImportManifest: Codable, Sendable {
     public var deduplicate: Bool
     public var workerID: String?
     public var preserveStructure: Bool
-    public init(id: UUID, targetPath: String, files: [KeepsImportFile], deduplicate: Bool = false, preserveStructure: Bool = false, workerID: String? = nil) {
+    public init(id: UUID, targetPath: String, files: [KeepsImportFile], deduplicate: Bool = true, preserveStructure: Bool = false, workerID: String? = nil) {
         self.workerID = workerID
         self.id = id
         self.targetPath = targetPath
@@ -44,6 +44,7 @@ public struct KeepsImportBatch: Decodable, Sendable {
         public var sha256: String?
         public var uploaded: Bool
         public var skipped: Bool?
+        public var duplicatePath: String?
         public var matched: Bool?
     }
 }
@@ -56,6 +57,8 @@ public struct KeepsImportFinish: Decodable, Sendable {
     public var indexedFiles: Int?
     public var thumbnailTotal: Int?
     public var thumbnailCompleted: Int?
+    public var skippedFiles: Int?
+    public var duplicatePaths: [String]?
     public var completedFiles: Int
     public var totalFiles: Int
     public var job: KeepsJob?

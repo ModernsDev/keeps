@@ -43,6 +43,7 @@ pub(crate) fn catalog(
 ) -> Result<()> {
     for (table, column) in [
         ("catalog_paths", "path"),
+        ("catalog_location_choices", "path"),
         ("catalog_version_paths", "path"),
         ("catalog_hidden_directories", "path"),
         ("catalog_deprecated_files", "path"),

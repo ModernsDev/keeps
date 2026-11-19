@@ -3,6 +3,19 @@ import Testing
 @testable import PhotoAssetManager
 
 struct ImportSourceTests {
+    @Test func readsPermanentIDFromAnXMPSidecar() throws {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("xmp")
+        defer { try? FileManager.default.removeItem(at: path) }
+        let id = UUID()
+        let xml = """
+        <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+          <rdf:Description><xmp:Identifier><rdf:Bag><rdf:li>https://keeps.photos/photo/\(id.uuidString)</rdf:li></rdf:Bag></xmp:Identifier></rdf:Description>
+        </rdf:RDF>
+        """
+        try Data(xml.utf8).write(to: path)
+        #expect(try ImportSource.sidecarPhotoID(path) == id)
+    }
+
     @Test func recursivelyFindsPhotosAndAssociatedSidecarsWithoutChangingSources() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
