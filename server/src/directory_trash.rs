@@ -128,48 +128,48 @@ pub(crate) fn recycle_version_file(share: &SharedFolder, source: &Path) -> Resul
 
     let target = recycle_target(share, source)?;
     let parent = target.parent().context("missing recycle parent")?;
-    let sibling_names =
-        |path: &Path| -> Result<std::collections::BTreeMap<PathBuf, (u64, u64, u64, i64, i64)>> {
-            if !path.try_exists()? {
-                return Ok(std::collections::BTreeMap::new());
-            }
-            ensure!(
-                path.canonicalize()? == path,
-                error(409, "回收站目录不是规范路径")
-            );
-            let stem = target
-                .file_stem()
-                .context("missing recycle filename")?
-                .to_string_lossy();
-            fs::read_dir(path)?
-                .filter_map(|entry| match entry {
-                    Err(e) => Some(Err(e.into())),
-                    Ok(entry) => {
-                        let candidate = entry.path();
-                        let same_name = candidate == target
-                            || (candidate.extension() == target.extension()
-                                && candidate.file_stem().is_some_and(|name| {
-                                    name.to_string_lossy()
-                                        .strip_prefix(stem.as_ref())
-                                        .is_some_and(|tail| tail.starts_with('_'))
-                                }));
-                        same_name.then(|| {
-                            let info = fs::symlink_metadata(&candidate)?;
-                            Ok((
-                                candidate,
-                                (
-                                    info.dev(),
-                                    info.ino(),
-                                    info.len(),
-                                    info.mtime(),
-                                    info.mtime_nsec(),
-                                ),
-                            ))
-                        })
-                    }
-                })
-                .collect()
-        };
+    type RecycleEntries = std::collections::BTreeMap<PathBuf, (u64, u64, u64, i64, i64)>;
+    let sibling_names = |path: &Path| -> Result<RecycleEntries> {
+        if !path.try_exists()? {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        ensure!(
+            path.canonicalize()? == path,
+            error(409, "回收站目录不是规范路径")
+        );
+        let stem = target
+            .file_stem()
+            .context("missing recycle filename")?
+            .to_string_lossy();
+        fs::read_dir(path)?
+            .filter_map(|entry| match entry {
+                Err(e) => Some(Err(e.into())),
+                Ok(entry) => {
+                    let candidate = entry.path();
+                    let same_name = candidate == target
+                        || (candidate.extension() == target.extension()
+                            && candidate.file_stem().is_some_and(|name| {
+                                name.to_string_lossy()
+                                    .strip_prefix(stem.as_ref())
+                                    .is_some_and(|tail| tail.starts_with('_'))
+                            }));
+                    same_name.then(|| {
+                        let info = fs::symlink_metadata(&candidate)?;
+                        Ok((
+                            candidate,
+                            (
+                                info.dev(),
+                                info.ino(),
+                                info.len(),
+                                info.mtime(),
+                                info.mtime_nsec(),
+                            ),
+                        ))
+                    })
+                }
+            })
+            .collect()
+    };
     let before = sibling_names(parent)?;
     let source_info = fs::symlink_metadata(source)?;
     let source_id = (source_info.dev(), source_info.ino());
