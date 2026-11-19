@@ -99,7 +99,7 @@ final class ImportStore: ObservableObject {
     }
 
     func report(_ error: Error) {
-        let file = manifest?.files.first { $0.id == activeFileID }?.relativePath
+        let file = (error as NSError).userInfo[NSFilePathErrorKey] as? String ?? manifest?.files.first { $0.id == activeFileID }?.relativePath
         errorMessage = (file.map { "文件：\($0)\n" } ?? "") + String(reflecting: error) + "\n" + error.localizedDescription
     }
 
@@ -185,7 +185,7 @@ final class ImportStore: ObservableObject {
     private func inventory(source: URL, targetPath: String) async throws {
         let deduplicate = deduplicate
         let preserveStructure = preserveStructure
-        message = "正在递归查找 RAW、JPEG、HEIF 和关联 XMP…"
+        message = "正在递归查找照片、视频和关联 XMP…"
         let scan = Task.detached(priority: .userInitiated) { try ImportSource.scan(source) }
         let files = try await withTaskCancellationHandler {
             try await scan.value
@@ -193,7 +193,7 @@ final class ImportStore: ObservableObject {
             scan.cancel()
         }
         guard !files.isEmpty else {
-            throw NSError(domain: "KeepsImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "来源文件夹中没有 RAW、JPEG 或 HEIF 照片。"])
+            throw NSError(domain: "KeepsImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "来源文件夹中没有支持的照片或视频。"])
         }
         sources = files
         fileCount = files.count
@@ -284,10 +284,21 @@ final class ImportStore: ObservableObject {
         try validateSource(source)
         message = "上传 \(file.relativePath) → \(file.fileName)"
         activeFileID = file.id
-        try await client.uploadImportFile(batchID: batchID, fileID: file.id, source: source.url) { [weak self] bytes in
-            Task { @MainActor [weak self] in
-                guard let self, self.activeFileID == file.id else { return }
-                self.sentBytes = completeBytes + min(bytes, file.size)
+        let hashing = Task.detached(priority: .utility) { try ImportSource.hash(source.url).1 }
+        let hash = try await withTaskCancellationHandler { try await hashing.value } onCancel: { hashing.cancel() }
+        try validateSource(source)
+        for attempt in 0..<2 {
+            do {
+                try await client.uploadImportFile(batchID: batchID, fileID: file.id, source: source.url, sha256: hash) { [weak self] bytes in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.activeFileID == file.id else { return }
+                        self.sentBytes = completeBytes + min(bytes, file.size)
+                    }
+                }
+                break
+            } catch KeepsAPIError.http(let status, let body) where attempt == 0 && status == 422 && body.contains("SHA256") {
+                try validateSource(source)
+                message = "校验未通过，正在重新上传 \(file.relativePath)…"
             }
         }
         activeFileID = nil
@@ -415,6 +426,15 @@ final class ImportStore: ObservableObject {
                 } catch KeepsAPIError.http(let status, _) where status == 409 {
                     try completeMediaTask(task)
                     return
+                } catch {
+                    let failure = error as NSError
+                    if failure.domain == "KeepsImportRenderer" || (failure.domain == "KeepsImport" && [4, 5].contains(failure.code)) {
+                        if try await repairMedia(task) {
+                            try completeMediaTask(task)
+                            return
+                        }
+                    }
+                    throw error
                 }
             }
         }
@@ -423,8 +443,35 @@ final class ImportStore: ObservableObject {
                 do { try await client.failWorker(taskID: task.taskID, error: String(reflecting: error) + "\n" + error.localizedDescription); try completeMediaTask(task) }
                 catch let failure { report(NSError(domain: "KeepsImport", code: 7, userInfo: [NSLocalizedDescriptionKey: String(reflecting: error) + "\n任务失败通知：" + String(reflecting: failure)])) }
             }
-            throw error
+            if error is CancellationError { throw error }
+            throw NSError(domain: "KeepsImportMedia", code: 1, userInfo: [
+                NSFilePathErrorKey: task.filename,
+                NSLocalizedDescriptionKey: String(reflecting: error) + "\n" + error.localizedDescription,
+                NSUnderlyingErrorKey: error,
+            ])
         }
+    }
+
+    private func repairMedia(_ task: KeepsWorkerTask) async throws -> Bool {
+        guard let manifest else { throw KeepsAPIError.invalidResponse }
+        let target = try await client.importRepairSource(batchID: manifest.id, taskID: task.taskID)
+        guard manifest.files.contains(where: { $0.id == target.fileID && $0.relativePath == target.relativePath && $0.size == target.size }),
+              let original = sources.first(where: { $0.sourcePath == target.relativePath }) else { throw KeepsAPIError.invalidResponse }
+        try validateSource(original)
+        message = "正在核对来源并修复 \(target.relativePath)…"
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("KeepsRepair-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let copy = root.appendingPathComponent(original.url.lastPathComponent)
+        let verification = Task.detached(priority: .utility) {
+            try ImportRenderer.repairCopy(source: original.url, size: target.size, nasHash: target.sha256, copy: copy, task: task)
+        }
+        guard let hash = try await withTaskCancellationHandler(operation: { try await verification.value }, onCancel: { verification.cancel() }) else { return false }
+        try validateSource(original)
+        try Task.checkCancellation()
+        try await client.repairImportFile(batchID: manifest.id, fileID: target.fileID, source: copy, sha256: hash, replacedSHA256: target.sha256)
+        message = "已提交 \(target.relativePath) 的修复，NAS 将回收损坏副本并重新索引。"
+        return true
     }
 
     private func finish(id: UUID) async throws {
@@ -441,6 +488,8 @@ final class ImportStore: ObservableObject {
                     guard status.job != nil || status.skippedFiles == fileCount else { throw KeepsAPIError.invalidResponse }
                     job = status.job
                     isComplete = true
+                case "repairing":
+                    message = "NAS 正在从已校验的来源副本恢复照片…"
                 case "indexing":
                     message = "正在提取元数据：\(indexedFiles) / \(indexTotal)"
                 case "thumbnails":

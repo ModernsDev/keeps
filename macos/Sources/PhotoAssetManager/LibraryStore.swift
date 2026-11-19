@@ -247,6 +247,16 @@ final class LibraryStore: ObservableObject {
 
     var selectedAsset: KeepsAsset? { return assets.first { selectedIDs.contains($0.id) } }
 
+    var cullingDirectory: String? {
+        guard !query.trashed else { return nil }
+        if let directory = query.directory { return directory }
+        guard let asset = selectedAsset, !asset.isVideo,
+              let path = asset.paths?.first(where: {
+                  !hiddenDirectoryFilterEnabled || !isDirectoryHidden($0)
+              }) else { return nil }
+        return (path as NSString).deletingLastPathComponent
+    }
+
     var locationTitle: String {
         if let path = query.directory {
             let root = directories.filter { path == $0.path || path.hasPrefix($0.path + "/") }.max { $0.path.count < $1.path.count }

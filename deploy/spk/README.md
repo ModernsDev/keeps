@@ -24,7 +24,7 @@ python3 -m unittest discover -s deploy/spk -p 'test_*.py'
 - `access-token`：随机访问令牌，不提交 Git。
 - `server-overrides`：启动脚本白名单内的逐行 `KEY=value`，不执行 shell 文本。
 
-正式资料库为 `local-library`，局域网地址 `http://192.168.0.50:2283`，原片 `/volume2/photo`，状态 `/volume2/@appdata/KeepsNativeProbe/production-state`。新安装的原型默认使用独立测试共享目录、`spk-probe` 和 2285，不能将其当作正式配置。
+正式资料库为 `local-library`，客户端入口及 `server-url` 使用 `https://keeps.hechuannas.synology.me`；局域网直连地址为 `http://192.168.0.50:2283`，原片 `/volume2/photo`，状态 `/volume2/@appdata/KeepsNativeProbe/production-state`。`server-url` 决定在线图片及手机离线数据库中的签名下载地址，不能配置为仅局域网可达的地址。修改后需要重启服务，并刷新手机图库副本中的旧链接；仅修改手机 API 地址不会改写已保存的图片链接。新安装的原型默认使用独立测试共享目录、`spk-probe` 和 2285，不能将其当作正式配置。
 
 日常本地编码开启（`KEEPS_LOCAL_CACHE_ENCODING_ENABLED=1`），远端派发关闭（`KEEPS_REMOTE_WORKER_ENABLED=0`）。Linux 仅用于显式安排的[一次性批量处理](../linux-worker/README.md)。
 

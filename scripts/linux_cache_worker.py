@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded remote cache worker; NAS remains the sole state/file publisher."""
 import concurrent.futures
+import argparse
 import contextlib
 import http.server
 import hashlib
@@ -31,6 +32,34 @@ def tree_bytes(root):
         except FileNotFoundError:
             pass
     return total
+
+
+def verify_renderer(root):
+    # Exercise the installed binary and codecs: a version label cannot detect stale images.
+    with tempfile.TemporaryDirectory(prefix="renderer-check-", dir=root) as temp:
+        directory = Path(temp)
+        env = dict(os.environ, TMPDIR=temp, OMP_NUM_THREADS="1", MAGICK_THREAD_LIMIT="1")
+
+        def run(*command):
+            return subprocess.run(command, env=env, check=True, timeout=180, stdout=subprocess.PIPE).stdout
+
+        source = directory / "source.heic"
+        run("convert", "-size", "1024x512", "gradient:red-blue", "-depth", "16", "PNG48:" + str(directory / "source.png"))
+        run("heif-enc", "-b", "10", "-q", "95", "-p", "x265:pools=1", "-p", "x265:frame-threads=1", "-o", str(source), str(directory / "source.png"))
+        metadata = json.loads(run("exiftool", "-j", "-BitDepthLuma", "-BitDepthChroma", str(source)))[0]
+        if metadata.get("BitDepthLuma") != 10 or metadata.get("BitDepthChroma") != 10:
+            raise RuntimeError("HEIF renderer self-check failed: fixture is not 10-bit HEIF")
+        run("heif-convert", "--quiet", str(source), str(directory / "reference.png"))
+        run("keeps-render", str(source), temp, "false", "512", "50")
+        run("heif-convert", "--quiet", str(directory / "thumbnail.heic"), str(directory / "actual.png"))
+        reference = run("convert", str(directory / "reference.png"), "-resize", "512x512>", "-depth", "8", "rgb:-")
+        actual = run("convert", str(directory / "actual.png"), "-depth", "8", "rgb:-")
+        if len(reference) != 512 * 256 * 3 or len(actual) != len(reference):
+            raise RuntimeError("HEIF renderer self-check failed: unexpected thumbnail dimensions")
+        error = sum(abs(a - b) for a, b in zip(actual, reference)) / len(reference)
+        if error > 12:
+            raise RuntimeError(f"HEIF renderer self-check failed: 10-bit RGB mean error {error:.2f} exceeds 12; rebuild the worker image")
+        LOG.info("HEIF renderer self-check passed: 10-bit RGB mean error %.2f", error)
 
 
 class Worker:
@@ -236,11 +265,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise RuntimeError("worker API redirects are not permitted")
 
 
-def main():
+def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check-renderer-only", action="store_true", help="validate the installed renderer without contacting NAS")
+    args = parser.parse_args(argv)
+    if args.check_renderer_only:
+        root = Path(os.environ.get("KEEPS_WORKER_TMP", "/work"))
+        root.mkdir(parents=True, exist_ok=True)
+        verify_renderer(root)
+        return
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: STOP.set())
     worker = Worker()
+    verify_renderer(worker.root)
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker.concurrency) as pool:
         list(pool.map(worker.run_one, range(worker.concurrency)))
 

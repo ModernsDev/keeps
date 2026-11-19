@@ -7,6 +7,18 @@ import KeepsAPI
 @testable import PhotoAssetManager
 
 @MainActor struct PhotoSelectionTests {
+    @Test func cullingUsesSelectedPhotoDirectoryOutsideDirectoryView() async throws {
+        let store = try await loadedStore()
+        #expect(store.cullingDirectory == nil)
+        store.select(store.assets[0].id)
+        #expect(store.query.directory == nil)
+        #expect(store.cullingDirectory == "/photos/selected")
+        store.query.directory = "/photos"
+        #expect(store.cullingDirectory == "/photos")
+        store.query.trashed = true
+        #expect(store.cullingDirectory == nil)
+    }
+
     @Test func rangeSelectionKeepsAnchorAndKeyboardFocus() async throws {
         let store = try await loadedStore()
         let ids = store.assets.map(\.id)

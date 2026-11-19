@@ -155,7 +155,7 @@ struct AICullingResult: Codable {
         session = updated
     }
 
-    func startDirectory(client: KeepsClient, path: String, recursive: Bool, instruction: String, showHidden: Bool = false) {
+    func startDirectory(client: KeepsClient, path: String, recursive: Bool, instruction: String, showHidden: Bool = false, startingAt: UUID? = nil) {
         guard !busy, !loadFailed, session == nil else { return }
         let preferenceSnapshot = preferences
         paused = false
@@ -187,6 +187,12 @@ struct AICullingResult: Codable {
             guard !assets.isEmpty else { throw AIEditingFailure("这个目录中没有可筛选的照片。") }
             guard Set(assets.map(\.id)).count == assets.count else {
                 throw AIEditingFailure("目录清单包含重复照片，请刷新资料库后重新开始。")
+            }
+            if let startingAt {
+                guard let index = assets.firstIndex(where: { $0.id == startingAt }) else {
+                    throw AIEditingFailure("选中的照片不在当前目录的筛片清单中，请重新选择照片。")
+                }
+                assets = Array(assets[index...])
             }
             self.session = Session(assets: assets, instruction: instruction,
                 sourcePath: path, recursive: recursive, preferences: preferenceSnapshot, skippedCount: 0)
@@ -289,6 +295,19 @@ struct AICullingResult: Codable {
     }
 
     func cancel() { paused = true; task?.cancel() }
+
+    func reset() {
+        cancel()
+        session = nil
+        error = nil
+        guard let directory else { return }
+        let file = directory.appendingPathComponent("session.json")
+        do {
+            if FileManager.default.fileExists(atPath: file.path) {
+                try FileManager.default.removeItem(at: file)
+            }
+        } catch { report(error) }
+    }
 
     private func selectRecommendations() {
         session?.picked = []

@@ -481,7 +481,7 @@ pub fn process_asset_with_override(
         }
         let row: Option<(String, String)> = tx
             .query_row(
-                "SELECT source_hash,status FROM media_cache WHERE library_id=? AND asset_id=?",
+                "SELECT source_hash,status FROM media_cache WHERE library_id=?1 AND asset_id=?2 AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=?1 AND a.id=?2 AND a.trashed=0)",
                 params![lib, id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1642,6 +1642,57 @@ mod tests {
             .execute("UPDATE catalog_assets SET content_hash='changed'", [])?;
         store.reconcile_cache()?;
         assert!(!store.asset_cache_current(&previews, "lib", id)?);
+        Ok(())
+    }
+
+    #[test]
+    fn trashed_assets_skip_normal_and_override_without_changing_published_media() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let jobs = Jobs::open(&dir.path().join("jobs"), dir.path())?;
+        let previews = PreviewStorage::new(
+            &dir.path().join("keeps"),
+            None,
+            "http://localhost",
+            "test-key",
+        )?;
+        seed(&store, 1)?;
+        store.reconcile_cache()?;
+        let id = "00000000-0000-0000-0000-000000000000";
+        store.cache_publish(
+            "lib",
+            id,
+            "hash0",
+            &json!({"version":"raw-thumbnail","width":512,"height":384,"sizeBytes":5,"objectRef":{"bucket":"keeps-previews","key":"libraries/lib/assets/asset/derivatives/thumbnail/old.heic"}}),
+            &json!({"version":"raw-standard"}),
+        )?;
+        store.lock()?.execute(
+            "INSERT INTO catalog_defaults(library_id,asset_id,content_hash) VALUES('lib',?1,'heic-hash')",
+            [id],
+        )?;
+        store.lock()?.execute(
+            "UPDATE catalog_assets SET trashed=1 WHERE library_id='lib' AND id=?1",
+            [id],
+        )?;
+        let state = || -> Result<Vec<rusqlite::types::Value>> {
+            let db = store.lock()?;
+            let mut q =
+                db.prepare("SELECT * FROM media_cache WHERE library_id='lib' AND asset_id=?1")?;
+            let count = q.column_count();
+            Ok(q.query_row([id], |r| (0..count).map(|i| r.get(i)).collect())?)
+        };
+        let before = state()?;
+        for operation in [None, Some("override")] {
+            assert!(!process_asset_with_override(
+                &store, &jobs, &previews, "lib", id, operation
+            )?);
+            assert_eq!(state()?, before);
+        }
+        assert!(store.lock()?.query_row(
+            "SELECT trashed FROM catalog_assets WHERE library_id='lib' AND id=?1",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )?);
         Ok(())
     }
 

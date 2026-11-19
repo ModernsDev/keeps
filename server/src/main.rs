@@ -112,8 +112,8 @@ async fn main() -> Result<()> {
         move || keeps_server::directory_move::run(jobs, store, stop)
     })?;
     let mut imports = keeps_server::background::spawn("imports", {
-        let (jobs, stop) = (jobs.clone(), stop.clone());
-        move || keeps_server::imports::run(jobs, stop)
+        let (jobs, store, stop) = (jobs.clone(), store.clone(), stop.clone());
+        move || keeps_server::imports::run(jobs, store, stop)
     })?;
     let mut video_trim = keeps_server::background::spawn("video_trim", {
         let (jobs, store, stop) = (jobs.clone(), store.clone(), stop.clone());

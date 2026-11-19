@@ -516,6 +516,11 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             folder_id, path, 0, false, false, false, true, "file", "manual",
         )
     }
+    pub(crate) fn enqueue_import_repair(&self, folder_id: &str, path: &Path) -> Result<Job> {
+        self.enqueue_scope(
+            folder_id, path, 0, true, false, false, true, "file", "manual",
+        )
+    }
     pub fn enqueue_manual_media_rebuild(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(
             folder_id, path, 0, false, true, false, true, "file", "manual",

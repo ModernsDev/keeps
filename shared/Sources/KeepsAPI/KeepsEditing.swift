@@ -13,6 +13,7 @@ public struct KeepsEditRecipe: Codable, Equatable, Sendable {
 }
 
 public struct KeepsEditState: Codable, Equatable, Sendable {
+    public var instructionsXMP: String?
     public var rootID: String?
     public var currentVersionID: String?
     public var decisionMetadata: String?
@@ -29,7 +30,8 @@ public struct KeepsEditState: Codable, Equatable, Sendable {
 
     public init(negativeContentHash: String?, revision: Int64, hasEdit: Bool, exposureEV: Double? = nil,
                 sourceFilename: String? = nil, sourceAvailable: Bool, lastRequestID: String? = nil,
-                sourceFileHash: String? = nil, sourceSizeBytes: Int64? = nil, recipe: KeepsEditRecipe? = nil, decisionMetadata: String? = nil, rootID: String? = nil, currentVersionID: String? = nil) {
+                sourceFileHash: String? = nil, sourceSizeBytes: Int64? = nil, recipe: KeepsEditRecipe? = nil, decisionMetadata: String? = nil, rootID: String? = nil, currentVersionID: String? = nil, instructionsXMP: String? = nil) {
+        self.instructionsXMP = instructionsXMP
         self.rootID = rootID
         self.currentVersionID = currentVersionID
         self.decisionMetadata = decisionMetadata
@@ -83,6 +85,7 @@ public struct KeepsEditOutput: Codable, Sendable {
 }
 
 public struct KeepsEditCommit: Codable, Sendable {
+    public var instructionsXMP: String?
     public var requestID: String
     public var expectedRevision: Int64
     public var negativeContentHash: String
@@ -92,7 +95,8 @@ public struct KeepsEditCommit: Codable, Sendable {
     public var rendererVersion: String
     public var outputs: [KeepsEditOutput]
     public init(requestID: String, expectedRevision: Int64, negativeContentHash: String, exposureEV: Double? = nil,
-                algorithmVersion: String, rendererVersion: String, outputs: [KeepsEditOutput], recipe: KeepsEditRecipe? = nil) {
+                algorithmVersion: String, rendererVersion: String, outputs: [KeepsEditOutput], recipe: KeepsEditRecipe? = nil, instructionsXMP: String? = nil) {
+        self.instructionsXMP = instructionsXMP
         self.requestID = requestID; self.expectedRevision = expectedRevision
         self.negativeContentHash = negativeContentHash; self.exposureEV = exposureEV
         self.recipe = recipe

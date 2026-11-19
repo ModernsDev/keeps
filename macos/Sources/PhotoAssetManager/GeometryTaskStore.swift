@@ -3,7 +3,7 @@ import Foundation
 import KeepsAPI
 
 struct GeometryTask: Codable, Identifiable, Sendable {
-    enum Operation: String, Codable { case rotate, crop }
+    enum Operation: String, Codable { case rotate, crop, exposure }
     enum Phase: String, Codable { case preparing, downloading, rendering, uploading, completed }
     let id: UUID
     let assetID: UUID
@@ -12,7 +12,12 @@ struct GeometryTask: Codable, Identifiable, Sendable {
     let operation: Operation
     var requestedQuarterTurns: Int?
     var requestedCrop: CGRect?
+    var requestedExposureEV: Double?
     var requestedRevision: Int64?
+    var cropSourceID: String?
+    var cropSourceVersion: String?
+    var cropRatio: String?
+    var instructionsXMP: String?
     var exposureEV: Double?
     var recipe: KeepsEditRecipe?
     var sourceVersion: String?
@@ -23,6 +28,18 @@ struct GeometryTask: Codable, Identifiable, Sendable {
     var waitingForConnection = false
     var error: String?
     var failed = false
+}
+
+struct PhotoCropSession {
+    let assetID: UUID
+    let configuration: KeepsConfiguration
+    let expectedRevision: Int64
+    let sourceID: String
+    let sourceVersion: String
+    let sourceURL: URL
+    let selection: CGRect
+    let ratio: String?
+    var quarterTurns = 0
 }
 
 @MainActor
@@ -66,10 +83,157 @@ final class GeometryTaskStore: ObservableObject {
     }
 
     func rotate(assetID: UUID, quarterTurns: Int) {
-        enqueue(assetID: assetID, operation: .rotate, quarterTurns: quarterTurns)
+        guard storageError == nil, let configuration, !isPending(assetID: assetID) else { return }
+        tasks.append(GeometryTask(id: UUID(), assetID: assetID, baseURL: configuration.baseURL.absoluteString,
+                                  libraryID: configuration.libraryID, operation: .rotate, requestedQuarterTurns: quarterTurns))
+        do { try persist(); start() } catch { storageError = String(reflecting: error) }
     }
-    func crop(assetID: UUID, crop: CGRect, expectedRevision: Int64) {
-        enqueue(assetID: assetID, operation: .crop, crop: crop, revision: expectedRevision)
+
+    func crop(session: PhotoCropSession, selection: CGRect, ratio: String) throws {
+        guard configuration == session.configuration else { throw GeometryJobError.conflict }
+        guard FileManager.default.fileExists(atPath: session.sourceURL.path) else { throw GeometryJobError.missingCropSource }
+        try enqueueCrop(session: session, selection: selection, ratio: ratio)
+    }
+
+    func prepareExposure(assetID: UUID) async throws -> PhotoCropSession {
+        guard let configuration else { throw GeometryJobError.conflict }
+        let client = KeepsClient(configuration: configuration, session: session)
+        let state = try await client.editState(assetID: assetID)
+        let asset = try await client.asset(id: assetID)
+        guard !asset.trashed, let standard = asset.standard else { throw GeometryJobError.missingRender }
+        let source = try await SmartProxyCache.shared.standard(asset: asset, configuration: configuration)
+        let sourceID = PreviewCache.key(assetID: assetID, preview: standard, configuration: configuration, role: .standard)
+        let retained = cropSourceURL(sourceID)
+        try FileManager.default.createDirectory(at: retained.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: retained.path) {
+            try FileManager.default.copyItem(at: source, to: retained)
+        }
+        let confirmed = try await client.editState(assetID: assetID)
+        try Task.checkCancellation()
+        guard self.configuration == configuration, confirmed.revision == state.revision else { throw GeometryJobError.conflict }
+        return PhotoCropSession(assetID: assetID, configuration: configuration, expectedRevision: state.revision,
+            sourceID: sourceID, sourceVersion: standard.version, sourceURL: retained,
+            selection: CGRect(x: 0, y: 0, width: 1, height: 1), ratio: nil)
+    }
+
+    func exposure(session: PhotoCropSession, ev: Double) throws {
+        guard configuration == session.configuration, storageError == nil, !isPending(assetID: session.assetID),
+              ev.isFinite, (-2...2).contains(ev) else { throw GeometryJobError.conflict }
+        guard FileManager.default.fileExists(atPath: session.sourceURL.path) else { throw GeometryJobError.missingCropSource }
+        let task = GeometryTask(id: UUID(), assetID: session.assetID,
+            baseURL: session.configuration.baseURL.absoluteString, libraryID: session.configuration.libraryID,
+            operation: .exposure, requestedExposureEV: ev, requestedRevision: session.expectedRevision,
+            cropSourceID: session.sourceID, cropSourceVersion: session.sourceVersion)
+        tasks.append(task)
+        do { try persist() }
+        catch { tasks.removeAll { $0.id == task.id }; throw error }
+        start()
+    }
+
+    func prepareCrop(assetID: UUID, cache: PreviewCache = .standards) async throws -> PhotoCropSession {
+        guard let configuration else { throw GeometryJobError.conflict }
+        let client = KeepsClient(configuration: configuration, session: session)
+        let before = try await client.editState(assetID: assetID)
+        let asset = try await client.asset(id: assetID)
+        guard !asset.trashed, var standard = asset.standard else { throw GeometryJobError.missingRender }
+        let storedEdit = try before.instructionsXMP.map { try PhotoEditXMP(xml: $0) }
+        let xmpCrop = storedEdit.flatMap { $0.operation == .geometry && $0.crop != nil ? $0 : nil }
+        var current = tasks.last {
+            $0.assetID == assetID && matches($0) &&
+                $0.id.uuidString.lowercased() == before.lastRequestID?.lowercased()
+        }
+        var history: [GeometryTask] = []
+        while let task = current {
+            history.append(task)
+            if task.cropSourceID != nil { break }
+            guard let version = task.sourceVersion?.split(separator: ":"), version.first == "edit",
+                  version.count >= 2, let parentID = UUID(uuidString: String(version[1])) else { break }
+            current = tasks.first { $0.id == parentID && $0.assetID == assetID && matches($0) }
+        }
+        if !history.contains(where: { $0.operation == .crop }) { history = [] }
+        var selection = CGRect(x: 0, y: 0, width: 1, height: 1)
+        var quarterTurns = 0
+        var ratio: String?
+        if let ancestor = history.last {
+            guard let version = ancestor.cropSourceVersion ?? ancestor.sourceVersion else {
+                throw GeometryJobError.missingCropSource
+            }
+            standard.version = version
+        }
+        for task in history.reversed() {
+            if task.operation == .rotate {
+                let turns = task.requestedQuarterTurns ?? 0
+                selection = GeometryRenderer.rotatedCrop(selection, quarterTurns: turns)
+                quarterTurns += turns
+            } else if task.operation == .crop {
+                guard let crop = task.requestedCrop else { throw GeometryJobError.missingCropSource }
+                if task.cropSourceID != nil {
+                    selection = crop
+                    quarterTurns = task.requestedQuarterTurns ?? 0
+                } else {
+                    selection = CGRect(x: selection.minX + crop.minX * selection.width,
+                                       y: selection.minY + crop.minY * selection.height,
+                                       width: crop.width * selection.width, height: crop.height * selection.height)
+                }
+                ratio = task.cropRatio
+            }
+        }
+        if let xmpCrop {
+            guard xmpCrop.assetID == assetID, xmpCrop.negativeHash == before.negativeContentHash else {
+                throw GeometryJobError.sourceChanged
+            }
+            standard.version = xmpCrop.sourceVersion
+            selection = xmpCrop.crop!
+            quarterTurns = xmpCrop.quarterTurns ?? 0
+            ratio = xmpCrop.ratio
+        }
+        let key = PreviewCache.key(assetID: assetID, preview: standard, configuration: configuration, role: .standard)
+        let sourceID = history.last?.cropSourceID ?? key
+        let source = cropSourceURL(sourceID)
+        if !FileManager.default.fileExists(atPath: source.path) {
+            try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let cached = try await cache.cachedFileURL(forKey: key) {
+                try FileManager.default.copyItem(at: cached, to: source)
+            } else if !history.isEmpty || xmpCrop != nil {
+                throw GeometryJobError.missingCropSource
+            } else {
+                let (temporary, response) = try await session.download(from: standard.downloadURL)
+                defer { try? FileManager.default.removeItem(at: temporary) }
+                guard let response = response as? HTTPURLResponse else { throw KeepsAPIError.invalidResponse }
+                guard (200..<300).contains(response.statusCode) else {
+                    throw KeepsAPIError.http(response.statusCode, "下载完整裁剪源失败")
+                }
+                try Task.checkCancellation()
+                _ = try AIEditingImages.comparisonPreview(temporary)
+                try FileManager.default.moveItem(at: temporary, to: source)
+            }
+        }
+        let after = try await client.editState(assetID: assetID)
+        try Task.checkCancellation()
+        guard self.configuration == configuration, before.revision == after.revision else { throw GeometryJobError.conflict }
+        return PhotoCropSession(assetID: assetID, configuration: configuration, expectedRevision: after.revision,
+            sourceID: sourceID, sourceVersion: standard.version, sourceURL: source,
+            selection: selection, ratio: ratio, quarterTurns: ((quarterTurns % 4) + 4) % 4)
+    }
+
+    private func cropSourceURL(_ id: String) -> URL {
+        root.appendingPathComponent("CropSources", isDirectory: true).appendingPathComponent(id + ".image")
+    }
+
+    private func enqueueCrop(session: PhotoCropSession, selection: CGRect, ratio: String) throws {
+        guard storageError == nil, !isPending(assetID: session.assetID) else { throw GeometryJobError.conflict }
+        let task = GeometryTask(id: UUID(), assetID: session.assetID, baseURL: session.configuration.baseURL.absoluteString,
+            libraryID: session.configuration.libraryID, operation: .crop,
+            requestedQuarterTurns: session.quarterTurns, requestedCrop: selection,
+            requestedRevision: session.expectedRevision, cropSourceID: session.sourceID,
+            cropSourceVersion: session.sourceVersion, cropRatio: ratio)
+        tasks.append(task)
+        do { try persist() }
+        catch {
+            tasks.removeAll { $0.id == task.id }
+            throw error
+        }
+        start()
     }
 
     func discard(id: UUID) {
@@ -95,13 +259,6 @@ final class GeometryTaskStore: ObservableObject {
 
     func isPending(assetID: UUID) -> Bool {
         tasks.contains { matches($0) && $0.assetID == assetID && $0.phase != .completed }
-    }
-
-    private func enqueue(assetID: UUID, operation: GeometryTask.Operation, quarterTurns: Int? = nil, crop: CGRect? = nil, revision: Int64? = nil) {
-        guard storageError == nil, let configuration, !isPending(assetID: assetID) else { return }
-        tasks.append(GeometryTask(id: UUID(), assetID: assetID, baseURL: configuration.baseURL.absoluteString,
-                                  libraryID: configuration.libraryID, operation: operation, requestedQuarterTurns: quarterTurns, requestedCrop: crop, requestedRevision: revision))
-        do { try persist(); start() } catch { storageError = String(reflecting: error) }
     }
 
     private func matches(_ task: GeometryTask) -> Bool {
@@ -178,13 +335,18 @@ final class GeometryTaskStore: ObservableObject {
             job.phase = .downloading
             return
         }
-        let source = directory.appendingPathComponent("source.heic")
+        let source = job.cropSourceID.map(cropSourceURL) ?? directory.appendingPathComponent("source.heic")
         switch job.phase {
         case .downloading:
             let state = try await client.editState(assetID: job.assetID)
             guard state.revision == job.expectedRevision else { throw GeometryJobError.conflict }
             let asset = try await client.asset(id: job.assetID)
             guard let standard = asset.standard, standard.version == job.sourceVersion else { throw GeometryJobError.sourceChanged }
+            if job.cropSourceID != nil {
+                guard FileManager.default.fileExists(atPath: source.path) else { throw GeometryJobError.missingCropSource }
+                job.phase = .rendering
+                return
+            }
             let (temporary, response) = try await session.download(from: standard.downloadURL)
             guard let response = response as? HTTPURLResponse else { throw KeepsAPIError.invalidResponse }
             guard (200..<300).contains(response.statusCode) else { throw KeepsAPIError.http(response.statusCode, "下载当前标准图失败") }
@@ -193,8 +355,22 @@ final class GeometryTaskStore: ObservableObject {
             try FileManager.default.moveItem(at: temporary, to: source)
             job.phase = .rendering
         case .rendering:
+            if job.instructionsXMP == nil {
+                let state = try await client.editState(assetID: job.assetID)
+                guard state.revision == job.expectedRevision else { throw GeometryJobError.conflict }
+                let edit = PhotoEditXMP(assetID: job.assetID, rootID: state.rootID ?? job.assetID.uuidString,
+                    versionID: job.id, negativeHash: job.sourceHash!,
+                    sourceVersion: job.cropSourceVersion ?? job.sourceVersion!,
+                    operation: job.operation == .exposure ? .displayExposure : .geometry,
+                    quarterTurns: job.requestedQuarterTurns ?? 0, crop: job.requestedCrop, ratio: job.cropRatio,
+                    exposureEV: job.requestedExposureEV)
+                job.instructionsXMP = try edit.xml()
+                try save(job)
+            }
+            let edit = try PhotoEditXMP(xml: job.instructionsXMP!)
+            _ = try edit.save(to: directory)
             job.render = try await GeometryRenderer().render(sourceURL: source, outputDirectory: directory,
-                quarterTurns: job.requestedQuarterTurns ?? 0, crop: job.requestedCrop)
+                quarterTurns: edit.quarterTurns ?? 0, crop: edit.crop, exposureEV: edit.exposureEV ?? 0)
             job.phase = .uploading
         case .uploading:
             let state = try await client.editState(assetID: job.assetID)
@@ -218,7 +394,8 @@ final class GeometryTaskStore: ObservableObject {
             }
             _ = try await client.commitEdit(assetID: job.assetID, edit: KeepsEditCommit(requestID: job.id.uuidString.lowercased(),
                 expectedRevision: job.expectedRevision!, negativeContentHash: job.sourceHash!, exposureEV: job.exposureEV,
-                algorithmVersion: "geometry-v1", rendererVersion: "coreimage-v1", outputs: outputs, recipe: job.recipe))
+                algorithmVersion: "geometry-v1", rendererVersion: "coreimage-v1", outputs: outputs, recipe: job.recipe,
+                instructionsXMP: job.instructionsXMP))
             job.phase = .completed
         case .preparing, .completed: break
         }
@@ -226,12 +403,13 @@ final class GeometryTaskStore: ObservableObject {
 }
 
 enum GeometryJobError: LocalizedError {
-    case missingNegative, missingRender, conflict, sourceChanged
+    case missingNegative, missingRender, missingCropSource, conflict, sourceChanged
     var errorDescription: String? {
         switch self {
         case .sourceChanged: "当前标准图已变化，请重新操作。"
         case .missingNegative: "底片不存在或不可用，无法保存调整，请恢复底片后重试。"
         case .missingRender: "当前标准图或本地调整展示图缺失。"
+        case .missingCropSource: "裁剪前的完整成片已不在本机，无法恢复完整裁剪范围。"
         case .conflict: "照片的底片或调整已改变，请核实后重新操作。"
         }
     }

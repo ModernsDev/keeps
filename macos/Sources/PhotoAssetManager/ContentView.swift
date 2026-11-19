@@ -71,16 +71,31 @@ struct ContentView: View {
             AIEditingBackgroundStatus(store: batch) { showsAIWorkspace = true }
                 .disabled(library.batchTagProgress != nil)
         }
-        .sheet(item: $assetToCrop) { asset in
-            PhotoCropSheet(asset: asset)
-        }
+        .onChange(of: library.selectedIDs) { _, _ in assetToCrop = nil }
+        .onChange(of: library.configuration) { _, _ in assetToCrop = nil }
         .onChange(of: library.configuration, initial: true) { _, _ in configureGeometryTasks() }
         .onChange(of: library.isOperationBlocking) { _, _ in configureGeometryTasks() }
         .onChange(of: geometryTasks.completionRevision) { _, _ in library.refresh(force: true) }
+        .task(id: proxyWindowIdentity) {
+            guard detailMode, !showsAIWorkspace, !showsCulling, let configuration = library.configuration,
+                  let selected = library.selectedAsset else { return }
+            await SmartProxyCache.shared.prefetch(
+                assets: SmartProxyCache.window(assets: library.assets, selected: selected.id),
+                configuration: configuration)
+        }
         .focusedSceneValue(\.aiWorkspace, AIWorkspaceActions(open: openAIWorkspace))
         .sheet(isPresented: $library.showsRejectedTrash) {
             RejectedTrashSheet(library: library)
         }
+    }
+
+    private var proxyWindowIdentity: String {
+        guard detailMode, let selected = library.selectedAsset else { return "" }
+        return SmartProxyCache.key([
+            String(describing: library.configuration), String(showsAIWorkspace), String(showsCulling),
+            SmartProxyCache.window(assets: library.assets, selected: selected.id)
+                .map { "\($0.id)|\($0.standard?.version ?? "")" }.joined(separator: ";")
+        ])
     }
 
     private var libraryScreen: some View {
@@ -174,6 +189,7 @@ struct ContentView: View {
             library.refresh()
         }
         .onChange(of: library.query.directory) { _, _ in
+            assetToCrop = nil
             detailMode = false
             galleryReturnAssetID = nil
         }
@@ -268,7 +284,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
             GeometryTaskStatusView(store: geometryTasks, configuration: library.configuration)
-            bottomBar
+            if assetToCrop == nil { bottomBar }
         }
     }
 
@@ -293,8 +309,11 @@ struct ContentView: View {
     }
 
     private var gallery: some View {
-        Group {
-            if detailMode, let asset = library.selectedAsset {
+        ZStack {
+            if detailMode, let asset = assetToCrop {
+                PhotoCropEditor(asset: asset) { assetToCrop = nil; galleryFocused = true }
+                    .id(asset.id)
+            } else if detailMode, let asset = library.selectedAsset {
                 ZoomablePhotoView(asset: asset, configuration: library.configuration)
                     .id("\(asset.id)|\(asset.standard?.version ?? "")|\(String(describing: library.configuration))")
                     .padding(24)
@@ -367,24 +386,29 @@ struct ContentView: View {
                 }
             }
         }
-        .focusable()
+        .focusable(assetToCrop == nil)
         .focusEffectDisabled()
         .focused($galleryFocused)
         .focusedValue(\.gallerySelection, GallerySelectionActions(
             selectAll: { library.selectAll() }, deselectAll: { library.deselectAll() }
         ))
         .onKeyPress(keys: [.leftArrow]) { key in
+            guard assetToCrop == nil else { return .ignored }
             library.selectAdjacent(-1, extending: key.modifiers.contains(.shift)); return .handled
         }
         .onKeyPress(keys: [.rightArrow]) { key in
+            guard assetToCrop == nil else { return .ignored }
             library.selectAdjacent(1, extending: key.modifiers.contains(.shift)); return .handled
         }
         .onKeyPress(keys: ["a"]) { key in
+            guard assetToCrop == nil else { return .ignored }
             guard key.modifiers.contains(.command) || key.modifiers.contains(.control) else { return .ignored }
             library.selectAll(); return .handled
         }
         .onKeyPress(.escape) {
-            if detailMode {
+            if assetToCrop != nil {
+                assetToCrop = nil
+            } else if detailMode {
                 returnToGallery()
             } else {
                 library.deselectAll()
@@ -410,6 +434,7 @@ struct ContentView: View {
 
     private func returnToGallery() {
         guard detailMode else { return }
+        assetToCrop = nil
         galleryReturnAssetID = library.selectedAsset?.id
         detailMode = false
         galleryFocused = true
@@ -495,7 +520,7 @@ struct ContentView: View {
             }.disabled(library.assets.isEmpty)
             Divider().frame(height: 16)
             if detailMode, let asset = library.selectedAsset {
-                Button { assetToCrop = asset } label: { Image(systemName: "crop") }
+                Button { assetToCrop = asset; galleryFocused = false } label: { Image(systemName: "crop") }
                     .buttonStyle(.plain).help("裁剪").accessibilityLabel("裁剪")
                     .disabled(adjustmentUnavailable(for: asset) || asset.standard == nil)
                 Button { geometryTasks.rotate(assetID: asset.id, quarterTurns: -1) } label: { Image(systemName: "rotate.left") }
@@ -605,11 +630,11 @@ struct ContentView: View {
     }
 
     private var canStartAICulling: Bool {
-        library.query.directory != nil && library.client != nil && !library.isMutating && !batch.isRunning && !batch.editor.isBusy
+        library.cullingDirectory != nil && library.client != nil && !library.isMutating && !batch.isRunning && !batch.editor.isBusy
     }
 
     private var aiCullingHelp: String {
-        library.query.directory == nil ? "请先选择一个目录" : "让 AI 引导筛选当前目录，或继续上次筛片"
+        library.cullingDirectory == nil ? "请选择照片或目录" : "从选中的照片开始筛选所在目录"
     }
 
     private var inspectorRail: some View {

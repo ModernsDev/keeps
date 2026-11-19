@@ -36,6 +36,21 @@ enum ImportRenderer {
         try await client.completeWorker(taskID: task.taskID)
     }
 
+    static func repairCopy(source: URL, size: Int64, nasHash: String, copy: URL, task: KeepsWorkerTask) throws -> String? {
+        let (sourceSize, hash) = try ImportSource.hash(source)
+        guard sourceSize == size else { throw KeepsAPIError.invalidResponse }
+        if hash == nasHash { return nil }
+        try Task.checkCancellation()
+        try FileManager.default.copyItem(at: source, to: copy)
+        guard try ImportSource.hash(copy).1 == hash else {
+            throw NSError(domain: "KeepsImport", code: 8, userInfo: [NSLocalizedDescriptionKey: "相机读取不稳定，未修改 NAS 照片。"])
+        }
+        let previews = copy.deletingLastPathComponent().appendingPathComponent("previews")
+        try FileManager.default.createDirectory(at: previews, withIntermediateDirectories: true)
+        try render(input: copy, root: previews, task: task)
+        return hash
+    }
+
     static func render(input: URL, root: URL, task: KeepsWorkerTask) throws {
         try Task.checkCancellation()
         guard let source = CGImageSourceCreateWithURL(input as CFURL, nil),

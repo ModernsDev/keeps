@@ -295,6 +295,20 @@ import Testing
         #expect(fixture.state.snapshot().events.filter { $0 == "claim:first" }.count == 1)
     }
 
+    @Test func uploadsVideoOnlyFolderAndResumesSameBatch() async throws {
+        let fixture = try makeFixture(failFinish: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try FileManager.default.moveItem(at: fixture.root.appendingPathComponent("a.nef"), to: fixture.root.appendingPathComponent("a.MP4"))
+        try FileManager.default.moveItem(at: fixture.root.appendingPathComponent("nested/b.heic"), to: fixture.root.appendingPathComponent("nested/b.mov"))
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage == nil)
+        #expect(fixture.store.job?.id == "import-job")
+        let snapshot = fixture.state.snapshot()
+        #expect(snapshot.manifests.first?.files.map(\.relativePath) == ["a.MP4", "nested/b.mov"])
+        #expect(snapshot.events == ["prepare", "upload:a.MP4", "upload:nested/b.mov", "finish", "status"])
+    }
+
     private func waitForEvent(_ event: String, state: ImportScenario) async throws {
         // These gates verify ordering, not latency; leave the main actor available to drive imports.
         let deadline = ContinuousClock.now + .seconds(30)
@@ -453,6 +467,7 @@ private final class ImportScenario: @unchecked Sendable {
             ])
         }
         if request.httpMethod == "PUT", let file = manifest.files.first(where: { path.hasSuffix($0.id.uuidString) }) {
+            #expect(request.value(forHTTPHeaderField: "X-Keeps-Source-SHA256") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
             events.append("upload:" + file.relativePath)
             if failUpload && file.relativePath == "nested/b.heic" {
                 failUpload = false

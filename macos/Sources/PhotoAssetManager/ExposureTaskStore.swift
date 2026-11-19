@@ -19,6 +19,7 @@ struct ExposureTask: Codable, Identifiable, Sendable {
     var sourceFileHash: String?
     var expectedRevision: Int64?
     var render: ExposureRender?
+    var instructionsXMP: String?
     var waitingForConnection = false
     var error: String?
     var failed = false
@@ -31,6 +32,7 @@ final class ExposureTaskStore: ObservableObject {
     @Published private(set) var completionRevision = 0
     private let root: URL
     private let session: URLSession
+    private let proxies: SmartProxyCache
     var retryInterval: Duration = .seconds(5)
     private var configuration: KeepsConfiguration?
     private var runner: Task<Void, Never>?
@@ -40,6 +42,8 @@ final class ExposureTaskStore: ObservableObject {
         .appendingPathComponent("Keeps/ExposureTasks", isDirectory: true), session: URLSession = KeepsClient.apiSession) {
         self.root = root
         self.session = session
+        self.proxies = session === KeepsClient.apiSession ? .shared :
+            SmartProxyCache(root: root.appendingPathComponent("Proxies"), session: session)
         do {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             let manifest = root.appendingPathComponent("tasks.json")
@@ -230,14 +234,29 @@ final class ExposureTaskStore: ObservableObject {
         let source = directory.appendingPathComponent("source").appendingPathExtension(URL(fileURLWithPath: filename).pathExtension)
         switch job.phase {
         case .downloading:
-            try await client.downloadNegative(assetID: job.assetID, contentHash: job.sourceHash!, to: source)
+            let cached = try await proxies.negative(assetID: job.assetID,
+                state: KeepsEditState(negativeContentHash: job.sourceHash, revision: job.expectedRevision!,
+                    hasEdit: false, sourceFilename: filename, sourceAvailable: true, sourceFileHash: job.sourceFileHash),
+                configuration: client.configuration)
+            if !FileManager.default.fileExists(atPath: source.path) {
+                try FileManager.default.copyItem(at: cached, to: source)
+            }
             if let expectedHash = job.sourceFileHash {
                 let actualHash = try await Self.inspectFile(source, image: false).hash
                 guard actualHash == expectedHash else { throw ExposureJobError.sourceChanged }
             }
             job.phase = .rendering
         case .rendering:
-            job.render = try await ExposureRenderer().render(sourceURL: source, outputDirectory: directory)
+            let storedEV = try job.instructionsXMP.flatMap { try PhotoEditXMP(xml: $0).exposureEV }
+            job.render = try await ExposureRenderer().render(sourceURL: source, outputDirectory: directory,
+                                                             exposureEV: storedEV)
+            let state = try await client.editState(assetID: job.assetID)
+            guard state.revision == job.expectedRevision else { throw ExposureJobError.conflict }
+            let edit = PhotoEditXMP(assetID: job.assetID, rootID: state.rootID ?? job.assetID.uuidString,
+                versionID: job.id, negativeHash: job.sourceHash!, sourceVersion: job.sourceHash!,
+                operation: .exposure, exposureEV: job.render!.exposureEV)
+            job.instructionsXMP = try edit.xml()
+            _ = try edit.save(to: directory)
             job.phase = .uploading
         case .uploading:
             let state = try await client.editState(assetID: job.assetID)
@@ -261,7 +280,8 @@ final class ExposureTaskStore: ObservableObject {
             }
             _ = try await client.commitEdit(assetID: job.assetID, edit: KeepsEditCommit(requestID: job.id.uuidString.lowercased(),
                 expectedRevision: job.expectedRevision!, negativeContentHash: job.sourceHash!, exposureEV: render.exposureEV,
-                algorithmVersion: ExposureRenderer.algorithmVersion, rendererVersion: "coreimage-v1", outputs: outputs))
+                algorithmVersion: ExposureRenderer.algorithmVersion, rendererVersion: "coreimage-v1", outputs: outputs,
+                instructionsXMP: job.instructionsXMP))
             job.phase = .completed
         case .preparing, .completed: break
         }

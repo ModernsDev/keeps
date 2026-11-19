@@ -279,6 +279,7 @@ fn claim_sync(s: &AppState, lib: &str, body: Value, enabled: Option<&str>) -> Re
         }
         deferred_count += 1;
     };
+    let _directory_guard = s.jobs.directory_mutation.read().unwrap();
     let prepared = (|| -> Result<Option<Task>> {
         let selected = s.store.default_version(lib, &asset)?;
         let selected = match selected {

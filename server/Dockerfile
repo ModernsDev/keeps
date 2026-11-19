@@ -17,6 +17,7 @@ COPY --from=build /src/target/release/keeps-server /usr/local/bin/keeps-server
 COPY --from=build /src/target/release/keeps-inspect /usr/local/bin/keeps-inspect
 COPY --from=build /src/target/release/keeps-render /usr/local/bin/keeps-render
 COPY scripts/linux_cache_worker.py /usr/local/bin/linux_cache_worker.py
+RUN KEEPS_WORKER_TMP=/tmp python3 /usr/local/bin/linux_cache_worker.py --check-renderer-only
 ENV RUST_LOG=keeps_server=info,tower_http=info RUST_BACKTRACE=1
 EXPOSE 2283
 ENTRYPOINT ["keeps-server"]

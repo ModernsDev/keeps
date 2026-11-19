@@ -40,3 +40,42 @@ struct ImportRendererTests {
         }
     }
 }
+
+struct ImportRepairTests {
+    @Test func verifiesCameraCopyAndRejectsUndecodableSource() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let staging = root.appendingPathComponent("staging")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let camera = root.appendingPathComponent("photo.jpg")
+        let copy = staging.appendingPathComponent("photo.jpg")
+        let context = try #require(CGContext(data: nil, width: 64, height: 32, bitsPerComponent: 8, bytesPerRow: 256, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        context.setFillColor(CGColor(red: 0.5, green: 0.2, blue: 0.1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 64, height: 32))
+        let destination = try #require(CGImageDestinationCreateWithURL(camera as CFURL, UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try #require(context.makeImage()), nil)
+        #expect(CGImageDestinationFinalize(destination))
+        let task = try JSONDecoder().decode(KeepsWorkerTask.self, from: Data("""
+        {"taskID":"test","inputHash":"bad","filename":"photo.jpg","generateStandard":false,"generateBrowse":true,"thumbnailEdge":512,"thumbnailQuality":85}
+        """.utf8))
+        let original = try Data(contentsOf: camera)
+        let (size, hash) = try ImportSource.hash(camera)
+        #expect(try ImportRenderer.repairCopy(source: camera, size: size, nasHash: hash, copy: copy, task: task) == nil)
+        #expect(!FileManager.default.fileExists(atPath: copy.path))
+        #expect(try ImportRenderer.repairCopy(source: camera, size: size, nasHash: "different", copy: copy, task: task) == hash)
+        #expect(try Data(contentsOf: copy) == original)
+        #expect(try Data(contentsOf: camera) == original)
+        let badCamera = root.appendingPathComponent("bad.jpg")
+        try Data("corrupt".utf8).write(to: badCamera)
+        #expect(throws: (any Error).self) {
+            try ImportRenderer.repairCopy(source: badCamera, size: 7, nasHash: "different", copy: staging.appendingPathComponent("bad.jpg"), task: task)
+        }
+    }
+
+    @MainActor @Test func mediaErrorReportsItsOwnFile() {
+        let client = KeepsClient(configuration: KeepsConfiguration(baseURL: URL(string: "http://localhost")!, libraryID: UUID().uuidString))
+        let store = ImportStore(client: client)
+        store.report(NSError(domain: "KeepsImportMedia", code: 1, userInfo: [NSFilePathErrorKey: "B0022822.HEIC", NSLocalizedDescriptionKey: "Mac 图片编码失败"]))
+        #expect(store.errorMessage?.hasPrefix("文件：B0022822.HEIC\n") == true)
+    }
+}

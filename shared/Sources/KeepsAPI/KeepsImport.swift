@@ -86,3 +86,10 @@ public struct KeepsWorkerTask: Codable, Sendable {
     public var thumbnailEdge: Int
     public var thumbnailQuality: Int
 }
+
+public struct KeepsImportRepairSource: Decodable, Sendable {
+    public var fileID: UUID
+    public var relativePath: String
+    public var sha256: String
+    public var size: Int64
+}

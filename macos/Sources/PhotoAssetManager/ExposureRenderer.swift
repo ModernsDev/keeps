@@ -18,14 +18,17 @@ enum ExposureRenderError: Error {
 struct ExposureRenderer: Sendable {
     static let algorithmVersion = "median-highlight-v1"
 
-    func render(sourceURL: URL, outputDirectory: URL) async throws -> ExposureRender {
+    func render(sourceURL: URL, outputDirectory: URL, exposureEV: Double? = nil) async throws -> ExposureRender {
         let work = Task.detached(priority: .userInitiated) {
-            try Self.renderSynchronously(sourceURL: sourceURL, outputDirectory: outputDirectory)
+            try Self.renderSynchronously(sourceURL: sourceURL, outputDirectory: outputDirectory, requestedEV: exposureEV)
         }
         return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
     }
 
-    private static func renderSynchronously(sourceURL: URL, outputDirectory: URL) throws -> ExposureRender {
+    private static func renderSynchronously(sourceURL: URL, outputDirectory: URL, requestedEV: Double?) throws -> ExposureRender {
+        if let requestedEV, !requestedEV.isFinite || !(-2...2).contains(requestedEV) {
+            throw ExposureRenderError.invalidImage
+        }
         let linear = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
         let context = CIContext(options: [.workingColorSpace: linear])
         let rawExtensions: Set<String> = ["arw", "3fr", "dng", "cr2", "cr3", "nef", "nrw", "orf", "raf", "rw2", "pef", "srw"]
@@ -57,7 +60,7 @@ struct ExposureRenderer: Sendable {
             return max(Float(0), red + green + blue)
         }.sorted()
         let median = Double(luminances[luminances.count / 2])
-        var ev = min(2, max(-2, log2(0.18 / max(median, 0.000001))))
+        var ev = requestedEV ?? min(2, max(-2, log2(0.18 / max(median, 0.000001))))
         func adjusted(_ exposure: Double) throws -> CIImage {
             if let raw {
                 raw.exposure = Float(exposure)
@@ -67,7 +70,7 @@ struct ExposureRenderer: Sendable {
             return original.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: exposure])
         }
         // RAW decoding can include a nonlinear tone curve, so evaluate actual candidate output.
-        if ev > 0 {
+        if requestedEV == nil, ev > 0 {
             var low = 0.0
             var high = ev
             for _ in 0..<9 {

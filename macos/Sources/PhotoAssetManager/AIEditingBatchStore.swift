@@ -791,7 +791,11 @@ struct AIEditingBatch: Codable {
                 item.originalPreview = preview
             }
             stage(item.id, "下载底片（\(completedCount + 1)/\(totalCount)）", 0.04, 0.15)
-            try await client.downloadNegative(assetID: item.assetID, contentHash: hash, to: source)
+            let cached = try await SmartProxyCache.shared.negative(assetID: item.assetID,
+                state: sourceState, configuration: client.configuration)
+            if !FileManager.default.fileExists(atPath: source.path) {
+                try FileManager.default.copyItem(at: cached, to: source)
+            }
             let info = try await AIEditingImages.inspect(source, image: false)
             guard info.hash == (sourceState.sourceFileHash ?? hash) else { throw AIEditingFailure("底片下载校验失败，请重新扫描后再试。") }
             item.phase = .grading
@@ -866,10 +870,14 @@ struct AIEditingBatch: Codable {
             }
             try Task.checkCancellation()
             stage(item.id, "NAS 正在校验并保存调色结果", 0.98, 0.995)
+            let edit = PhotoEditXMP(assetID: item.assetID, rootID: state.rootID ?? item.assetID.uuidString,
+                versionID: item.id, negativeHash: hash, sourceVersion: hash, operation: .color,
+                recipe: .init(recipeJSON: recipe, xmp: xmp, metadata: try editMetadata(item)))
+            _ = try edit.save(to: directory)
             _ = try await client.commitEdit(assetID: item.assetID, edit: .init(requestID: item.id.uuidString.lowercased(),
                 expectedRevision: sourceState.revision, negativeContentHash: hash,
                 algorithmVersion: "keeps-ai-v1", rendererVersion: "darktable-5.6.2", outputs: outputs,
-                recipe: .init(recipeJSON: recipe, xmp: xmp, metadata: try editMetadata(item))))
+                recipe: edit.recipe, instructionsXMP: try edit.xml()))
             item.phase = .done
         case .preparing, .discarding, .done, .review: break
         }

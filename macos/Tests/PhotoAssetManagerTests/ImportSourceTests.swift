@@ -23,7 +23,7 @@ struct ImportSourceTests {
             "one/IMG.ARW", "one/IMG.xmp", "one/IMG.ARW.XMP", "one/unrelated.xmp",
             "two/IMG.ARW", "two/IMG.HEIC", "two/IMG.HEIC.xmp", "third/photo.heif", "photo.hif",
             "deep/nested/IMG.JPG", "deep/nested/IMG.xmp", "deep/nested/IMG.JPG.XMP",
-            "deep/nested/other.JpEg", "deep/nested/other.jpeg.xmp", "two/ignored.mov", "notes.txt", ".hidden/file.arw",
+            "deep/nested/other.JpEg", "deep/nested/other.jpeg.xmp", "two/clip.MP4", "two/clip.MP4.xmp", "two/clip.xmp", "two/movie.mov", "notes.txt", ".hidden/file.arw",
             "@eaDir/thumb.heic", "#recycle/old.nef", "two/.hidden.heif",
         ]
         for path in paths {
@@ -39,6 +39,7 @@ struct ImportSourceTests {
             "deep/nested/other.JpEg", "deep/nested/other.jpeg.xmp",
             "one/IMG.ARW", "one/IMG.ARW.XMP", "one/IMG.xmp", "photo.hif", "third/photo.heif",
             "two/IMG.ARW", "two/IMG.HEIC", "two/IMG.HEIC.xmp",
+            "two/clip.MP4", "two/clip.MP4.xmp", "two/clip.xmp", "two/movie.mov",
         ])
         #expect(files.allSatisfy { $0.size == 3 })
         let hashed = try ImportSource.hash(root.appendingPathComponent("one/IMG.ARW"))
@@ -74,6 +75,20 @@ struct ImportSourceTests {
         }
         #expect(ImportSource.groupKey("Elsewhere/IMG.NEF") != group)
         #expect(ImportSource.groupKey("trip/IMG.NEF") != group)
+    }
+
+    @Test func videoGroupsIncludeEverySupportedFormatAndSidecarForm() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for ext in ["MP4", "mov", "m4v", "avi", "mkv", "mts", "m2ts"] {
+            let name = "clip." + ext
+            try Data([1]).write(to: root.appendingPathComponent(name))
+            try Data([2]).write(to: root.appendingPathComponent(name + ".xmp"))
+            #expect(ImportSource.groupKey(name) == ImportSource.groupKey(name + ".xmp"))
+            #expect(ImportSource.groupKey(name) == ImportSource.groupKey("clip.xmp"))
+        }
+        #expect(try ImportSource.scan(root).count == 14)
     }
 
     @Test func missingSourceFailsInsteadOfReportingEmptySuccess() {
