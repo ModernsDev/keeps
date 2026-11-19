@@ -49,11 +49,11 @@ jobs:
         if: matrix.language == 'swift'
         run: |
           xcodebuild -project macos/Keeps.xcodeproj -scheme Keeps -configuration Debug \
-            -destination 'generic/platform=macOS' -arch arm64 -derivedDataPath .build/codeql-macos \
-            CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO SWIFT_USE_INTEGRATED_DRIVER=NO build
+            -destination 'generic/platform=macOS' -derivedDataPath .build/codeql-macos \
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO SWIFT_USE_INTEGRATED_DRIVER=NO build
           xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -configuration Debug \
-            -destination 'generic/platform=iOS Simulator' -arch arm64 -derivedDataPath .build/codeql-ios \
-            CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO SWIFT_USE_INTEGRATED_DRIVER=NO build
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/codeql-ios \
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO SWIFT_USE_INTEGRATED_DRIVER=NO build
           swift build --package-path macos/ColorTools --arch arm64 --scratch-path .build/codeql-color
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
