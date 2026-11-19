@@ -869,6 +869,13 @@ mod tests {
         store.lock()?.execute("UPDATE catalog_assets SET negative_hash=?1,negative_selected=1 WHERE library_id='lib' AND id=?2",params![loser,id])?;
         let sidecar = crate::identity::ensure_known(&retire, root)?.path;
         let xmp = fs::read(&sidecar)?;
+        let unindexed = jobs.root().join("outside/unindexed.jpg");
+        fs::write(&unindexed, b"other")?;
+        let bad = serde_json::from_value(json!({
+            "assetId":id, "keepPath":unindexed, "recyclePath":retire
+        }))?;
+        let failure = versions::inventory(&jobs, &store, "lib", vec![bad]).unwrap_err();
+        assert!(failure.to_string().contains("找不到保留文件的图库记录"));
         let pick: versions::Pick = serde_json::from_value(json!({
             "assetId":id, "keepPath":keep, "recyclePath":retire
         }))?;

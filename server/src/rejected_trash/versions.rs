@@ -32,7 +32,41 @@ fn sidecars(path: &Path) -> Result<BTreeSet<PathBuf>> {
     Ok(result)
 }
 
-fn selection(db: &Connection, library: &str, pick: Pick) -> Result<Selection> {
+fn indexed_pick(
+    lookup: &mut rusqlite::Statement<'_>,
+    library: &str,
+    pick: Pick,
+) -> Result<(Pick, String, String)> {
+    let (keep_path, keep_hash): (String, String) = lookup
+        .query_row(params![library, pick.asset_id, pick.keep_path], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?
+        .ok_or_else(|| error(409, "找不到保留文件的图库记录"))?;
+    let (recycle_path, recycle_hash): (String, String) = lookup
+        .query_row(params![library, pick.asset_id, pick.recycle_path], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?
+        .ok_or_else(|| error(409, "找不到待回收文件的图库记录"))?;
+    Ok((
+        Pick {
+            asset_id: pick.asset_id,
+            keep_path,
+            recycle_path,
+        },
+        keep_hash,
+        recycle_hash,
+    ))
+}
+
+fn selection(
+    db: &Connection,
+    library: &str,
+    pick: Pick,
+    keep_hash: String,
+    recycle_hash: String,
+) -> Result<Selection> {
     let keep = Path::new(&pick.keep_path);
     let recycle = Path::new(&pick.recycle_path);
     ensure!(
@@ -42,21 +76,6 @@ fn selection(db: &Connection, library: &str, pick: Pick) -> Result<Selection> {
     let photo_id: String = db.query_row("SELECT root_id FROM catalog_identity_roots JOIN catalog_assets USING(library_id) WHERE library_id=?1 AND asset_id=?2 AND id=asset_id AND trashed=0",
         params![library,pick.asset_id], |r| r.get(0)).optional()?
         .ok_or_else(|| error(409, "照片已经移除或在回收站") )?;
-    let mut hash = db.prepare(
-        "SELECT content_hash FROM catalog_paths WHERE library_id=?1 AND asset_id=?2 AND path=?3",
-    )?;
-    let keep_hash: String = hash
-        .query_row(params![library, pick.asset_id, pick.keep_path], |r| {
-            r.get(0)
-        })
-        .optional()?
-        .ok_or_else(|| error(409, "找不到保留文件的图库记录"))?;
-    let recycle_hash: String = hash
-        .query_row(params![library, pick.asset_id, pick.recycle_path], |r| {
-            r.get(0)
-        })
-        .optional()?
-        .ok_or_else(|| error(409, "找不到待回收文件的图库记录"))?;
     let available: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_version_paths p WHERE library_id=?1 AND asset_id=?2 AND path=?3 AND content_hash=?4 AND available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path))",
         params![library,pick.asset_id,pick.keep_path,keep_hash], |r|r.get(0))?;
     ensure!(available, error(409, "保留版本当前不可用"));
@@ -95,7 +114,7 @@ fn selection(db: &Connection, library: &str, pick: Pick) -> Result<Selection> {
             )
         );
         ensure!(
-            fs::metadata(keep)?.dev() == fs::metadata(gallery)?.dev(),
+            fs::metadata(keep)?.dev() == fs::metadata(recycle)?.dev(),
             error(409, "不可跨文件系统归位")
         );
         (recycle, recycle_sidecars, BTreeSet::new())
@@ -155,16 +174,33 @@ pub(super) fn inventory(
         !assets.is_empty() && assets.len() == assets.iter().collect::<HashSet<_>>().len(),
         error(422, "每张照片须各选一个保留文件和一个待回收文件")
     );
-    let picked_paths = picks
+    let indexed = {
+        let db = store.lock()?;
+        let mut lookup = db.prepare(
+            "SELECT path,content_hash FROM catalog_paths WHERE library_id=?1 AND asset_id=?2 AND path=?3",
+        )?;
+        picks
+            .into_iter()
+            .map(|pick| indexed_pick(&mut lookup, library, pick))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let picked_paths = indexed
         .iter()
-        .flat_map(|p| [PathBuf::from(&p.keep_path), PathBuf::from(&p.recycle_path)])
+        .flat_map(|(pick, _, _)| {
+            [
+                PathBuf::from(&pick.keep_path),
+                PathBuf::from(&pick.recycle_path),
+            ]
+        })
         .collect();
     validate_paths(jobs, library, &picked_paths)?;
     let versions = {
         let db = store.lock()?;
-        picks
+        indexed
             .into_iter()
-            .map(|pick| selection(&db, library, pick))
+            .map(|(pick, keep_hash, recycle_hash)| {
+                selection(&db, library, pick, keep_hash, recycle_hash)
+            })
             .collect::<Result<Vec<_>>>()?
     };
     let files: BTreeSet<_> = versions
