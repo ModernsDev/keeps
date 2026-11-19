@@ -53,6 +53,8 @@ struct File {
     received_sha256: Option<String>,
     #[serde(default)]
     skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duplicate_path: Option<String>,
     #[serde(default)]
     matched: bool,
     #[serde(default)]
@@ -356,7 +358,9 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
             &BTreeMap::new(),
             None,
         )? {
-            file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
+            if file.duplicate_path.is_none() {
+                file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
+            }
             files.push(file);
         }
     }
@@ -404,7 +408,11 @@ fn plan_files(
         .collect();
     let mut pending_names = HashSet::new();
     for batch in batches {
-        for file in &batch.files {
+        for file in batch
+            .files
+            .iter()
+            .filter(|file| file.duplicate_path.is_none())
+        {
             if matching_batch == Some(batch.id.as_str())
                 && source_ids.contains(file.input.id.as_str())
             {
@@ -481,6 +489,7 @@ fn plan_files(
                         file_name: name,
                         received_sha256: if skipped { input.sha256.clone() } else { None },
                         skipped,
+                        duplicate_path: None,
                         matched: true,
                         publication_pending: !skipped,
                         digest_stamp: None,
@@ -527,6 +536,7 @@ fn plan_files(
                     file_name: name,
                     received_sha256: None,
                     skipped: false,
+                    duplicate_path: None,
                     matched: false,
                     publication_pending: true,
                     digest_stamp: None,
@@ -723,11 +733,14 @@ async fn prepare_handler(
 #[derive(Deserialize)]
 struct MatchGroup {
     files: Vec<InputFile>,
+    #[serde(rename = "photoID")]
+    photo_id: Option<uuid::Uuid>,
 }
 
 // Match one complete photo, keeping its original and sidecars together.
 fn match_group(
     jobs: &Jobs,
+    catalog: Option<(&crate::store::Store, Option<uuid::Uuid>)>,
     library: &str,
     id: &str,
     file_id: &str,
@@ -832,20 +845,69 @@ fn match_group(
         entries.push((input.clone(), stem, suffix));
     }
     let groups = BTreeMap::from([(key, entries)]);
-    let existing = if directory.exists() {
-        existing_groups(&directory)?
-    } else {
-        BTreeMap::new()
+    let duplicate = match catalog {
+        Some((store, photo_id)) => {
+            cross_directory_duplicate(jobs, store, library, &directory, &inputs, photo_id)?
+        }
+        None => None,
     };
-    let reservations = reserved_batches(&jobs.db.lock().unwrap())?;
-    let planned = plan_files(
-        &reservations,
-        &directory,
-        &groups,
-        true,
-        &existing,
-        Some(&batch.id),
-    )?;
+    let duplicate = duplicate.or_else(|| {
+        batch
+            .files
+            .iter()
+            .filter(|file| {
+                file.uploaded
+                    && file.duplicate_path.is_none()
+                    && !file.file_name.to_ascii_lowercase().ends_with(".xmp")
+            })
+            .filter(|file| {
+                !indices
+                    .iter()
+                    .any(|i| batch.files[*i].input.id == file.input.id)
+            })
+            .filter(|file| {
+                inputs.iter().any(|input| {
+                    !input.relative_path.to_ascii_lowercase().ends_with(".xmp")
+                        && input.sha256.is_some()
+                        && input.sha256 == file.received_sha256
+                })
+            })
+            .map(|file| destination.join(&file.file_name))
+            .find(|path| path.parent() != Some(directory.as_path()))
+            .map(|path| path.to_string_lossy().into_owned())
+    });
+    let planned = if let Some(path) = duplicate {
+        indices
+            .iter()
+            .map(|i| {
+                let mut file = batch.files[*i].clone();
+                file.input.sha256 = inputs
+                    .iter()
+                    .find(|input| input.id == file.input.id)
+                    .and_then(|input| input.sha256.clone());
+                file.skipped = true;
+                file.uploaded = true;
+                file.published = true;
+                file.duplicate_path = Some(path.clone());
+                file
+            })
+            .collect()
+    } else {
+        let existing = if directory.exists() {
+            existing_groups(&directory)?
+        } else {
+            BTreeMap::new()
+        };
+        let reservations = reserved_batches(&jobs.db.lock().unwrap())?;
+        plan_files(
+            &reservations,
+            &directory,
+            &groups,
+            true,
+            &existing,
+            Some(&batch.id),
+        )?
+    };
     let db = jobs.db.lock().unwrap();
     // Uploads of other groups may have advanced while destination files were read.
     batch = load(&db, library, id)?;
@@ -858,7 +920,9 @@ fn match_group(
             .context("import file disappeared")?;
         file.received_sha256 = file.input.sha256.clone();
         file.input = batch.files[index].input.clone();
-        file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
+        if file.duplicate_path.is_none() {
+            file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
+        }
         file.matched = true;
         batch.files[index] = file.clone();
         result.push(file);
@@ -868,6 +932,76 @@ fn match_group(
     Ok(batch)
 }
 
+fn cross_directory_duplicate(
+    jobs: &Jobs,
+    store: &crate::store::Store,
+    library: &str,
+    destination: &FsPath,
+    inputs: &[InputFile],
+    photo_id: Option<uuid::Uuid>,
+) -> Result<Option<String>> {
+    let db = store.read()?;
+    if let Some(photo_id) = photo_id {
+        let location: Option<String> = db
+            .query_row(
+                "SELECT l.path FROM catalog_identity_aliases i
+            JOIN catalog_asset_locations l ON l.library_id=i.library_id AND l.asset_id=i.asset_id
+            JOIN catalog_assets a ON a.library_id=i.library_id AND a.id=i.asset_id
+            WHERE i.library_id=? AND i.root_id=? AND a.trashed=0",
+                params![library, photo_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(path) = location
+            && FsPath::new(&path).try_exists()?
+        {
+            return Ok((FsPath::new(&path).parent() != Some(destination)).then_some(path));
+        }
+    }
+    let mut matched = BTreeMap::new();
+    for input in inputs {
+        if input.relative_path.to_ascii_lowercase().ends_with(".xmp") {
+            continue;
+        }
+        let mut statement = db.prepare("SELECT DISTINCT a.id,p.path,l.path FROM catalog_files f
+            JOIN catalog_paths p USING(library_id,asset_id,content_hash,role)
+            JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id
+            JOIN catalog_asset_locations l ON l.library_id=p.library_id AND l.asset_id=p.asset_id
+            WHERE f.library_id=?1 AND f.content_hash=?2 AND f.holder='keeps-nas' AND f.availability='online' AND a.trashed=0
+            ORDER BY l.path,p.path")?;
+        let rows = statement.query_map(params![library, input.sha256], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, file, location) = row?;
+            let file = FsPath::new(&file);
+            let metadata = match std::fs::symlink_metadata(file) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err).with_context(|| format!("inspect duplicate {file:?}")),
+            };
+            if metadata.is_file()
+                && metadata.len() == input.size
+                && FsPath::new(&location).try_exists()?
+                && Some(&file_digest(jobs, library, file)?) == input.sha256.as_ref()
+            {
+                matched.insert(id, location);
+            }
+        }
+    }
+    if matched
+        .values()
+        .any(|location| FsPath::new(location).parent() == Some(destination))
+    {
+        return Ok(None);
+    }
+    Ok(matched.into_values().min())
+}
+
 async fn match_handler(
     State(state): State<Arc<AppState>>,
     Path((library, id, file)): Path<(String, String, String)>,
@@ -875,7 +1009,14 @@ async fn match_handler(
 ) -> Result<Json<Value>, ApiError> {
     let batch = tokio::task::spawn_blocking(move || -> Result<Batch> {
         let _guard = state.jobs.import_mutation.lock().unwrap();
-        let batch = match_group(&state.jobs, &library, &id, &file, body.files)?;
+        let batch = match_group(
+            &state.jobs,
+            Some((&state.store, body.photo_id)),
+            &library,
+            &id,
+            &file,
+            body.files,
+        )?;
         let worker: Option<String> = state.store.lock()?.query_row(
             "SELECT worker_id FROM import_compute_leases WHERE library_id=? AND batch_id=? LIMIT 1",
             params![library, batch.id], |row| row.get(0)).optional()?;
@@ -940,7 +1081,11 @@ fn reserve_compute(state: &AppState, library: &str, batch: &Batch, worker: &str)
     );
     let mut db = state.store.lock()?;
     let tx = db.transaction()?;
-    for file in &batch.files {
+    for file in batch
+        .files
+        .iter()
+        .filter(|file| file.duplicate_path.is_none())
+    {
         let path = FsPath::new(&batch.target_path)
             .join(&file.file_name)
             .to_string_lossy()
@@ -1122,6 +1267,7 @@ fn pipeline_status(state: &AppState, library: &str, id: &str) -> Result<Value> {
     let paths: Vec<String> = batch
         .files
         .iter()
+        .filter(|f| f.duplicate_path.is_none())
         .filter(|f| {
             FsPath::new(&f.file_name)
                 .extension()
@@ -1168,6 +1314,22 @@ fn pipeline_status(state: &AppState, library: &str, id: &str) -> Result<Value> {
     }
     drop(db);
     response["publicationComplete"] = json!(batch.finished);
+    response["skippedFiles"] = json!(batch.files.iter().filter(|file| file.skipped).count());
+    response["duplicatePaths"] = json!(
+        batch
+            .files
+            .iter()
+            .filter(|file| file.skipped && !file.file_name.to_ascii_lowercase().ends_with(".xmp"))
+            .map(
+                |file| file.duplicate_path.clone().unwrap_or_else(|| FsPath::new(
+                    &batch.target_path
+                )
+                .join(&file.file_name)
+                .to_string_lossy()
+                .into_owned())
+            )
+            .collect::<std::collections::BTreeSet<_>>()
+    );
     response["indexedFiles"] = json!(
         photo_groups
             .values()
@@ -1444,7 +1606,12 @@ fn finish_batch(
     }
     let destination = target(jobs, library, &batch.target_path)?;
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (index, file) in batch.files.iter().enumerate() {
+    for (index, file) in batch
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| file.duplicate_path.is_none())
+    {
         let path = FsPath::new(&file.file_name);
         let key = format!(
             "{}/{}",
@@ -1803,6 +1970,7 @@ mod tests {
         );
         match_group(
             &jobs,
+            None,
             "lib",
             &batch.id,
             &input.files[0].id,
@@ -1811,6 +1979,7 @@ mod tests {
         .unwrap();
         match_group(
             &jobs,
+            None,
             "lib",
             &batch.id,
             &input.files[2].id,
@@ -1827,7 +1996,7 @@ mod tests {
             vec![
                 ("card/day/IMG.CR3", true),
                 ("card/day/IMG.CR3.xmp", false),
-                ("other/IMG.CR3", false)
+                ("other/IMG.CR3", true)
             ]
         );
         assert!(!root.join("other").exists());
@@ -1855,7 +2024,7 @@ mod tests {
                 .iter()
                 .map(|f| f.file_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["card/day/IMG (1).CR3", "other/IMG (1).CR3"]
+            vec!["card/day/IMG (1).CR3", "other/IMG.CR3"]
         );
         let mut direct = structure_input(&jobs.root().join("card/day"), &["IMG.CR3"], false);
         direct.preserve_structure = false;
@@ -2501,6 +2670,7 @@ mod tests {
         assert!(
             match_group(
                 &jobs,
+                None,
                 "lib",
                 &initial.id,
                 &matching[0].id,
@@ -2508,21 +2678,45 @@ mod tests {
             )
             .is_err()
         );
-        let matched =
-            match_group(&jobs, "lib", &initial.id, &matching[0].id, matching.clone()).unwrap();
+        let matched = match_group(
+            &jobs,
+            None,
+            "lib",
+            &initial.id,
+            &matching[0].id,
+            matching.clone(),
+        )
+        .unwrap();
         assert_eq!(matched.files.len(), 2);
         assert!(matched.files[0].skipped);
         assert!(!matched.files[1].skipped);
         let resumed = prepare(&jobs, "lib", input.clone()).unwrap();
         assert!(!resumed.files[2].matched);
         matching[0].sha256 = Some("0".repeat(64));
-        assert!(match_group(&jobs, "lib", &initial.id, &input.files[0].id, matching).is_err());
+        assert!(
+            match_group(
+                &jobs,
+                None,
+                "lib",
+                &initial.id,
+                &input.files[0].id,
+                matching
+            )
+            .is_err()
+        );
         // The next photo sees destination changes made after batch creation.
         std::fs::write(dir.path().join("target/late.CR3"), b"latefile").unwrap();
         let mut second = input.files[2].clone();
         second.sha256 = Some(format!("{:x}", Sha256::digest(b"latefile")));
-        let result =
-            match_group(&jobs, "lib", &initial.id, &second.id, vec![second.clone()]).unwrap();
+        let result = match_group(
+            &jobs,
+            None,
+            "lib",
+            &initial.id,
+            &second.id,
+            vec![second.clone()],
+        )
+        .unwrap();
         assert_eq!(result.files[0].file_name, "late.CR3");
         assert!(result.files[0].skipped);
         // Another destination must not use identical files outside that directory.
@@ -2532,6 +2726,7 @@ mod tests {
         let prepared = prepare(&jobs, "lib", other.clone()).unwrap();
         let result = match_group(
             &jobs,
+            None,
             "lib",
             &prepared.id,
             &other.files[0].id,
@@ -2600,6 +2795,7 @@ mod tests {
             if enabled {
                 batch = match_group(
                     &jobs,
+                    None,
                     "lib",
                     &batch.id,
                     &input.files[0].id,
@@ -2608,6 +2804,7 @@ mod tests {
                 .unwrap();
                 let resumed = match_group(
                     &jobs,
+                    None,
                     "lib",
                     &batch.id,
                     &input.files[0].id,

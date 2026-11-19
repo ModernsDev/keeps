@@ -15,9 +15,9 @@ import Testing
         #expect(fixture.store.sentBytes == 6)
         #expect(fixture.store.totalBytes == 6)
         let snapshot = fixture.state.snapshot()
-        #expect(snapshot.events == ["prepare", "upload:a.nef", "upload:nested/b.heic", "finish"])
+        #expect(snapshot.events == ["prepare", "match:a.nef", "upload:a.nef", "match:nested/b.heic", "upload:nested/b.heic", "finish"])
         #expect(snapshot.manifests.first?.targetPath == "incoming")
-        #expect(snapshot.manifests.first?.deduplicate == false)
+        #expect(snapshot.manifests.first?.deduplicate == true)
         #expect(snapshot.manifests.first?.preserveStructure == false)
         #expect(snapshot.manifests.first?.files.allSatisfy { $0.sha256 == nil } == true)
         #expect(snapshot.manifests.first?.files.map(\.relativePath) == ["a.nef", "nested/b.heic"])
@@ -70,6 +70,7 @@ import Testing
     @Test func uploadFailureResumesSameManifestAndSkipsCompletedFile() async throws {
         let fixture = try makeFixture(failUpload: true)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.deduplicate = false
         fixture.store.start(targetPath: "incoming")
         try await waitForCompletion(fixture.store)
         #expect(fixture.store.errorMessage != nil)
@@ -130,7 +131,7 @@ import Testing
         #expect(fixture.store.job?.id == "import-job")
         #expect(fixture.store.sentBytes == 6)
         let snapshot = fixture.state.snapshot()
-        #expect(snapshot.events == ["prepare", "upload:a.nef", "upload:nested/b.heic", "finish", "status"])
+        #expect(snapshot.events == ["prepare", "match:a.nef", "upload:a.nef", "match:nested/b.heic", "upload:nested/b.heic", "finish", "status"])
         #expect(snapshot.manifests.count == 1)
     }
 
@@ -169,7 +170,7 @@ import Testing
         try await waitForCompletion(fixture.store)
         #expect(fixture.store.errorMessage == nil)
         #expect(fixture.store.job?.id == "import-job")
-        #expect(fixture.state.snapshot().events == ["prepare", "upload:a.nef", "upload:nested/b.heic", "finish", "finish"])
+        #expect(fixture.state.snapshot().events == ["prepare", "match:a.nef", "upload:a.nef", "match:nested/b.heic", "upload:nested/b.heic", "finish", "finish"])
     }
 
     @Test func restartRestoresBatchAndUploadedFiles() async throws {

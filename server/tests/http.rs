@@ -530,6 +530,7 @@ async fn navigation_photo_counts_are_distinct_recursive_live_catalog_counts() {
     let trashed = seed(&state, dir.path(), "trashed.jpg");
     state.store.set_trashed("photos", &trashed, true).unwrap();
     let db = rusqlite::Connection::open(dir.path().join("keeps/db/control_plane.sqlite")).unwrap();
+    db.execute("DELETE FROM catalog_paths", []).unwrap();
     for (relative, asset) in [
         ("foo/first.jpg", &first),
         ("foo/年份/duplicate.jpg", &first),
@@ -553,8 +554,7 @@ async fn navigation_photo_counts_are_distinct_recursive_live_catalog_counts() {
     for directory in page["directories"].as_array().unwrap() {
         let expected = match directory["name"].as_str().unwrap() {
             "foo" => 2,
-            "Foo" | "foobar" | "旅行_%" => 1,
-            "empty" => 0,
+            "Foo" | "foobar" | "旅行_%" | "empty" => 0,
             name => panic!("unexpected {name}"),
         };
         assert_eq!(directory["photoCount"], expected, "{directory}");
@@ -1823,6 +1823,132 @@ async fn imports_without_client_digest_validate_size_and_resume_staged_upload() 
     assert_eq!(completed.0, StatusCode::OK, "{}", completed.1);
     assert_eq!(std::fs::read(root.join("IMG.CR3")).unwrap(), data);
     assert!(!staged.exists());
+}
+
+#[tokio::test]
+async fn cross_directory_import_skip_reports_existing_path_and_needs_no_index_job() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    state.jobs.add_folder("photos", ".").unwrap();
+    let root = state.jobs.root();
+    std::fs::create_dir(root.join("existing")).unwrap();
+    std::fs::create_dir(root.join("target")).unwrap();
+    let original = root.join("existing/photo.jpg");
+    std::fs::write(&original, b"original").unwrap();
+    let hash = format!("{:x}", Sha256::digest(b"original"));
+    state.store.ingest_original("photos", original.to_str().unwrap(),
+        &json!({"contentHash":hash,"sizeBytes":8,"role":"jpeg_original"}),
+        &json!({"originalFilename":"photo.jpg","contentFingerprint":hash,"metadataFingerprint":"meta","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
+    ).unwrap();
+    let app = router(state.clone());
+    let batch = uuid::Uuid::new_v4();
+    let file = uuid::Uuid::new_v4();
+    let sidecar = uuid::Uuid::new_v4();
+    let mut files = json!([
+        {"id":file,"relativePath":"photo.jpg","size":8},
+        {"id":sidecar,"relativePath":"photo.jpg.xmp","size":3}
+    ]);
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        "/libraries/photos/imports",
+        json!({"id":batch,"targetPath":root.join("target"),"deduplicate":true,"files":files}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    files[0]["sha256"] = json!(hash);
+    files[1]["sha256"] = json!(format!("{:x}", Sha256::digest(b"xmp")));
+    let url = format!("/libraries/photos/imports/{batch}/files/{file}/match");
+    for _ in 0..2 {
+        let (status, body) = call(app.clone(), "POST", &url, json!({"files":files})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| f["skipped"] == true
+                    && f["uploaded"] == true
+                    && f["duplicatePath"] == json!(original))
+        );
+    }
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        &format!("/libraries/photos/imports/{batch}/finish"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "finished", "{body}");
+    let (status, body) = call(
+        app,
+        "GET",
+        &format!("/libraries/photos/imports/{batch}/finish"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "finished", "{body}");
+    assert_eq!(body["duplicatePaths"], json!([original]));
+    assert_eq!(body["skippedFiles"], 2);
+    assert!(body["job"].is_null());
+    assert_eq!(std::fs::read_dir(root.join("target")).unwrap().count(), 0);
+    assert_eq!(std::fs::read(original).unwrap(), b"original");
+}
+
+#[tokio::test]
+async fn choosing_a_legacy_location_updates_gallery_without_touching_either_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let root = state.jobs.root();
+    let first = root.join("first/photo.jpg");
+    let second = root.join("second/photo.jpg");
+    state.jobs.add_folder("photos", ".").unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    for path in [&first, &second] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"original").unwrap();
+        std::fs::write(path.with_extension("jpg.xmp"), b"xmp preserved").unwrap();
+        state.store.ingest_original("photos",path.to_str().unwrap(),
+            &json!({"contentHash":"hash","sizeBytes":8,"role":"jpeg_original"}),
+            &json!({"photoID":id,"originalFilename":"photo.jpg","contentFingerprint":"hash","metadataFingerprint":"meta","rating":3,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
+        ).unwrap();
+    }
+    let app = router(state.clone());
+    let route = "/libraries/photos/assets/duplicate-locations";
+    let (status, body) = call(app.clone(), "GET", route, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"][0]["locations"][0]["paths"], json!([first]));
+    assert_eq!(body["items"][0]["locations"][1]["paths"], json!([second]));
+    assert!(body["items"][0]["selectedPath"].is_null());
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        &format!("/libraries/photos/assets/{id}/location"),
+        json!({"path":second}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = call(app.clone(), "GET", route, Value::Null).await;
+    assert_eq!(body["items"][0]["selectedPath"], json!(second));
+    let (_, asset) = call(
+        app,
+        "GET",
+        &format!("/libraries/photos/assets/{id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(asset["paths"], json!([second]));
+    assert_eq!(asset["rating"], 3);
+    for path in [&first, &second] {
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(path.with_extension("jpg.xmp")).unwrap(),
+            b"xmp preserved"
+        );
+    }
 }
 
 #[tokio::test]

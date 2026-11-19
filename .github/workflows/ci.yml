@@ -187,3 +187,40 @@ jobs:
       - run: python -m unittest discover -s scripts -p 'test_backfill_standard_names.py'
       - run: python -m unittest discover -s scripts -p 'test_linux_cache_worker.py'
       - run: python -m unittest discover -s deploy/spk -p 'test_*.py'
+
+  keeps-ci-gate:
+    name: keeps-ci-gate
+    if: ${{ always() }}
+    needs: [scope, checks, server, shared, macos, ios, python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify required jobs for the change scope
+        env:
+          CI_JOBS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          jobs = json.loads(os.environ["CI_JOBS"])
+          failures = []
+          for name in ("scope", "checks"):
+              result = jobs[name]["result"]
+              if result != "success":
+                  failures.append(f"{name}: expected success, got {result}")
+
+          scope = jobs["scope"]["outputs"]
+          for name in ("server", "shared", "macos", "ios", "python"):
+              required = scope.get(name)
+              if required not in {"true", "false"}:
+                  failures.append(f"{name}: invalid scope {required!r}")
+                  continue
+              expected = "success" if required == "true" else "skipped"
+              result = jobs[name]["result"]
+              if result != expected:
+                  failures.append(f"{name}: expected {expected}, got {result}")
+
+          if failures:
+              raise SystemExit("\n".join(failures))
+          PY

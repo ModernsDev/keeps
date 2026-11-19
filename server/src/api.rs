@@ -81,6 +81,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(tag_library).post(add_tags_to_library),
         )
         .route(
+            "/libraries/{library}/assets/duplicate-locations",
+            get(duplicate_locations),
+        )
+        .route(
+            "/libraries/{library}/assets/{asset}/location",
+            post(choose_photo_location),
+        )
+        .route(
             "/libraries/{library}/assets/{asset}",
             get(asset).patch(patch_asset),
         )
@@ -824,6 +832,33 @@ async fn revision(
     )
     .into_response())
 }
+async fn duplicate_locations(
+    State(state): State<Arc<AppState>>,
+    Path(library): Path<String>,
+) -> ApiResult {
+    Ok(Json(blocking(move || state.store.duplicate_locations(&library)).await?).into_response())
+}
+
+#[derive(Deserialize)]
+struct PhotoLocationChoice {
+    path: String,
+}
+
+async fn choose_photo_location(
+    State(state): State<Arc<AppState>>,
+    Path((library, id)): Path<(String, String)>,
+    Json(body): Json<PhotoLocationChoice>,
+) -> ApiResult {
+    let id = asset_id(&id)?;
+    let path = body.path;
+    interactive(move || {
+        let _guard = metadata_guard(&state.jobs)?;
+        state.store.choose_photo_location(&library, &id, &path)?;
+        Ok(Json(json!({"path":path})).into_response())
+    })
+    .await
+}
+
 async fn versions(
     State(state): State<Arc<AppState>>,
     Path((library, id)): Path<(String, String)>,

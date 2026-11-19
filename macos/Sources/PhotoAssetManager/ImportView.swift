@@ -22,7 +22,7 @@ struct ImportView: View {
         _targetPath = State(initialValue: store.manifest?.targetPath ?? initialTarget)
     }
 
-    private var importInProgress: Bool { store.isBusy || (store.manifest != nil && store.job == nil) }
+    private var importInProgress: Bool { store.isBusy || (store.manifest != nil && !store.isComplete) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -42,14 +42,22 @@ struct ImportView: View {
                  ? "在目标目录中保留来源文件夹内的子目录层级，不额外创建来源文件夹本身。"
                  : "默认关闭：所有照片及关联 XMP 平铺到同一个目标文件夹。")
                 .font(.caption).foregroundStyle(.secondary)
-            Toggle("跳过目标文件夹中内容完全相同的文件", isOn: $store.deduplicate)
+            Toggle("跳过重复照片", isOn: $store.deduplicate)
                 .disabled(store.isBusy || store.manifest != nil)
-            Text(store.deduplicate
-                 ? "开启后按照片逐组读取并匹配，仅比较导入来源与实际目标目录，不扫描全图库；缺失的 RAW、JPEG、HEIF 或 XMP 会按配对补齐。"
-                 : "默认不去重、不预读整批照片；RAW、JPEG、HEIF 和 XMP 保持配对，同名冲突整组改名。")
+            Text("检查目标文件夹和资料库中已索引的照片。跨目录命中时跳过整组文件，并显示已有位置。")
                 .font(.caption).foregroundStyle(.secondary)
             Divider()
             Text(store.message).textSelection(.enabled)
+            if !store.duplicatePaths.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("已跳过的重复照片").font(.headline)
+                        ForEach(store.duplicatePaths, id: \.self) { path in
+                            Text(path).textSelection(.enabled)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxHeight: 110)
+            }
             if store.isBusy {
                 ProgressView().progressViewStyle(.linear)
                     .accessibilityLabel(store.message)
@@ -85,7 +93,7 @@ struct ImportView: View {
                 Spacer()
                 if store.isBusy {
                     Button("暂停导入") { store.pause() }
-                } else if store.job == nil {
+                } else if !store.isComplete {
                     Button(store.manifest == nil ? "开始导入" : "继续导入") { store.start(targetPath: targetPath ?? "") }
                         .keyboardShortcut(.defaultAction)
                         .disabled((store.source == nil && !store.isFinishing) || targetPath == nil || loadingDirectories || creatingDirectory || directoryError != nil)
@@ -94,8 +102,8 @@ struct ImportView: View {
         }
         .padding(24).frame(width: 660)
         .interactiveDismissDisabled(creatingDirectory || importInProgress)
-        .onChange(of: store.job?.id, initial: true) { _, completedJob in
-            if completedJob != nil { dismiss() }
+        .onChange(of: store.isComplete, initial: true) { _, complete in
+            if complete && store.duplicatePaths.isEmpty { dismiss() }
         }
         .fileImporter(isPresented: $choosingSource, allowedContentTypes: [.folder]) { result in
             switch result {

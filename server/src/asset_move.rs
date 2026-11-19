@@ -262,6 +262,10 @@ fn plan(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Result<
                 eligible,
                 error(409, "Photo is missing or has changed recycle-bin status")
             );
+            let location = crate::catalog::photo_location(&db, library, asset)?;
+            let directory = location
+                .as_deref()
+                .and_then(|path| Path::new(path).parent());
             let candidates = query
                 .query_map(params![library, asset], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -269,10 +273,11 @@ fn plan(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Result<
                 .into_iter()
                 .map(PathBuf::from)
                 .filter(|p| {
-                    request
-                        .source_path
-                        .as_ref()
-                        .is_none_or(|source| p.starts_with(source))
+                    directory.is_some_and(|directory| p.parent() == Some(directory))
+                        && request
+                            .source_path
+                            .as_ref()
+                            .is_none_or(|source| p.starts_with(source))
                 })
                 .collect();
             ensure!(
@@ -490,6 +495,7 @@ pub(crate) fn reconcile_files(
         tx.execute(RELOCATE_CACHE, [library])?;
         for (table, column) in [
             ("catalog_paths", "path"),
+            ("catalog_location_choices", "path"),
             ("catalog_version_paths", "path"),
             ("catalog_deprecated_files", "path"),
             ("catalog_deprecated_files", "retained_path"),
@@ -726,9 +732,14 @@ mod tests {
         let sidecar = source.with_extension("jpg.xmp");
         let target = jobs.root().join("target");
         let already_there = target.join("already.jpg");
-        let first = ingest(&store, &source, "first")?;
+        let alternate = jobs.root().join("source/nested/alternate.jpg");
+        let alternate_sidecar = alternate.with_extension("jpg.xmp");
+        let first = ingest(&store, &alternate, "first")?;
+        assert_eq!(ingest(&store, &source, "first")?, first);
+        store.choose_photo_location("lib", &first, source.to_str().unwrap())?;
         let second = ingest(&store, &already_there, "second")?;
         fs::write(&sidecar, b"identity metadata")?;
+        fs::write(&alternate_sidecar, b"alternate identity metadata")?;
         for id in [&first, &second] {
             store.set_trashed("lib", id, true)?;
         }
@@ -741,6 +752,12 @@ mod tests {
         assert_eq!(task.status, "completed", "{task:?}");
         assert!(task.from_trash);
         assert!(!source.exists() && !sidecar.exists());
+        assert_eq!(fs::read(&alternate)?, b"original bytes");
+        assert_eq!(
+            fs::read(&alternate_sidecar)?,
+            b"alternate identity metadata"
+        );
+        assert!(!target.join("alternate.jpg").exists());
         assert_eq!(fs::read(target.join("photo.jpg"))?, b"original bytes");
         assert_eq!(
             fs::read(target.join("photo.jpg.xmp"))?,
@@ -995,7 +1012,7 @@ mod tests {
         let (_tmp, jobs, store, mut request) = setup()?;
         let source = Path::new(request.source_path.as_deref().unwrap()).join("nested/photo.jpg");
         let id = ingest(&store, &source, "same")?;
-        let outside = jobs.root().join("outside.jpg");
+        let outside = jobs.root().join("source/outside.jpg");
         assert_eq!(ingest(&store, &outside, "same")?, id);
         fs::write(source.with_extension("jpg.xmp"), b"identity metadata")?;
         let snapshot: String = store.lock()?.query_row(
@@ -1022,6 +1039,10 @@ mod tests {
         );
         assert!(!source.exists());
         assert!(outside.exists());
+        assert_eq!(
+            store.asset("lib", &id)?["paths"],
+            json!([Path::new(&request.parent_path).join("photo.jpg")])
+        );
         let db = store.lock()?;
         let asset: String = db.query_row(
             "SELECT asset_id FROM catalog_paths WHERE path=?1",

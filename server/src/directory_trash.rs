@@ -748,14 +748,18 @@ mod tests {
             fs::create_dir(&source)?;
             let folder = jobs.add_folder("lib", source.to_str().unwrap())?;
             let file = json!({"contentHash":"hash", "sizeBytes":8, "role":"jpeg_original"});
-            let snapshot = json!({"contentFingerprint":"hash", "metadataFingerprint":"metadata", "createdAt":"2024-01-01T00:00:00Z", "updatedAt":"2024-01-01T00:00:00Z", "originalFilename":"photo.jpg", "rating":0, "flagState":"unflagged", "tags":[]});
+            let snapshot = json!({"photoID":uuid::Uuid::new_v4().to_string(),"contentFingerprint":"hash", "metadataFingerprint":"metadata", "createdAt":"2024-01-01T00:00:00Z", "updatedAt":"2024-01-01T00:00:00Z", "originalFilename":"photo.jpg", "rating":0, "flagState":"unflagged", "tags":[]});
             let photo = source.join("photo.jpg");
             fs::write(&photo, b"original")?;
-            store.ingest_original("lib", photo.to_str().unwrap(), &file, &snapshot)?;
+            let id = store.ingest_original("lib", photo.to_str().unwrap(), &file, &snapshot)?;
+            let other = jobs.root().join("retained.jpg");
             if retain_other {
-                let other = jobs.root().join("retained.jpg");
                 fs::write(&other, b"original")?;
-                store.ingest_original("lib", other.to_str().unwrap(), &file, &snapshot)?;
+                assert_eq!(
+                    store.ingest_original("lib", other.to_str().unwrap(), &file, &snapshot)?,
+                    id
+                );
+                assert_eq!(store.asset("lib", &id)?["paths"], json!([photo]));
             }
             let before = store.library_revision("lib")?;
             let result = trash_with_config(
@@ -774,6 +778,10 @@ mod tests {
                 vec![(0, 0)]
             );
             assert_eq!(store.counts("lib", false)?["all"], i32::from(retain_other));
+            if retain_other {
+                assert_eq!(store.asset("lib", &id)?["paths"], json!([other]));
+                assert_eq!(fs::read(other)?, b"original");
+            }
             assert_eq!(
                 store.query_assets("lib", &Default::default())?["total"],
                 i32::from(retain_other)
