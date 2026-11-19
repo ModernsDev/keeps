@@ -70,6 +70,27 @@ enum ImportSource {
         return path.deletingLastPathComponent().path + "/" + path.lastPathComponent.lowercased()
     }
 
+    static func sidecarPhotoID(_ url: URL) throws -> UUID? {
+        guard url.pathExtension.lowercased() == "xmp" else { return nil }
+        let data = try Data(contentsOf: url)
+        let identifierPrefix = "https://keeps.photos/photo/"
+        let legacyNamespace = "https://keeps.photos/ns/1.0/"
+        guard data.range(of: Data(identifierPrefix.utf8)) != nil ||
+                data.range(of: Data(legacyNamespace.utf8)) != nil else { return nil }
+        let xml = try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever])
+        let identifiers = try xml.nodes(forXPath: "//*[local-name()='Identifier'] | //@*[local-name()='Identifier']")
+        for identifier in identifiers where identifier.uri == "http://ns.adobe.com/xap/1.0/" {
+            let nested = identifier is XMLElement ? try identifier.nodes(forXPath: ".//*[not(*)]") : []
+            for node in nested.isEmpty ? [identifier] : nested {
+                if let value = node.stringValue, value.hasPrefix(identifierPrefix),
+                   let id = UUID(uuidString: String(value.dropFirst(identifierPrefix.count))) { return id }
+            }
+        }
+        let legacy = try xml.nodes(forXPath: "//*[local-name()='PhotoID'] | //@*[local-name()='PhotoID']")
+        return legacy.lazy.filter { $0.uri == legacyNamespace }
+            .compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) }.first
+    }
+
     static func hash(_ url: URL) throws -> (Int64, String) {
         try Task.checkCancellation()
         let before = try FileManager.default.attributesOfItem(atPath: url.path)

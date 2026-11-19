@@ -7,8 +7,10 @@ import SwiftUI
 final class ImportStore: ObservableObject {
     let client: KeepsClient
     @Published var preserveStructure = false
-    @Published var deduplicate = false
+    @Published var deduplicate = true
     @Published private(set) var skippedFiles = 0
+    @Published private(set) var duplicatePaths: [String] = []
+    @Published private(set) var isComplete = false
     @Published private(set) var source: URL?
     @Published private(set) var isBusy = false { didSet { onActivity?(isBusy) } }
     @Published private(set) var message = "选择来源文件夹和 NAS 目标文件夹。"
@@ -102,7 +104,7 @@ final class ImportStore: ObservableObject {
     }
 
     func start(targetPath: String) {
-        guard !isBusy, job == nil, (source != nil || manifest != nil), !targetPath.isEmpty else { return }
+        guard !isBusy, !isComplete, (source != nil || manifest != nil), !targetPath.isEmpty else { return }
         isBusy = true
         errorMessage = nil
         operation = Task {
@@ -170,6 +172,8 @@ final class ImportStore: ObservableObject {
         mediaTasks = []
         completedFiles = 0
         skippedFiles = 0
+        duplicatePaths = []
+        isComplete = false
         fileCount = 0
         sentBytes = 0
         totalBytes = 0
@@ -229,6 +233,7 @@ final class ImportStore: ObservableObject {
         let batch = try await prepare(manifest)
         let sourceByPath = Dictionary(uniqueKeysWithValues: sources.map { ($0.sourcePath, $0) })
         skippedFiles = batch.files.filter { $0.skipped == true }.count
+        duplicatePaths = Set(batch.files.compactMap(\.duplicatePath)).sorted()
         completedFiles = batch.files.filter(\.uploaded).count
         let completeBytes = batch.files.filter(\.uploaded).reduce(Int64(0)) { $0 + $1.size }
         sentBytes = completeBytes
@@ -255,6 +260,7 @@ final class ImportStore: ObservableObject {
                 let matched = try await match(files, batchID: batch.id, sourceByPath: sourceByPath)
                 files = matched.files
                 skippedFiles += files.filter { $0.skipped == true }.count
+                duplicatePaths = Set(duplicatePaths + files.compactMap(\.duplicatePath)).sorted()
                 completedFiles += files.filter(\.uploaded).count
                 completeBytes += files.filter(\.uploaded).reduce(0) { $0 + $1.size }
                 sentBytes = completeBytes
@@ -297,13 +303,18 @@ final class ImportStore: ObservableObject {
         message = "正在匹配 \(first.relativePath) 及关联文件…"
         activeFileID = first.id
         let hashTask = Task.detached(priority: .userInitiated) {
-            try zip(files, originals).map { file, source in
+            let hashed = try zip(files, originals).map { file, source in
                 KeepsImportFile(id: file.id, relativePath: file.relativePath, size: file.size, sha256: try ImportSource.hash(source.url).1)
             }
+            let ids = Set(try originals.compactMap { try ImportSource.sidecarPhotoID($0.url) })
+            guard ids.count <= 1 else {
+                throw NSError(domain: "KeepsImport", code: 6, userInfo: [NSLocalizedDescriptionKey: "这组照片的 XMP 含有不同的照片身份，请核对后重试。"])
+            }
+            return (hashed, ids.first)
         }
-        let hashed = try await withTaskCancellationHandler { try await hashTask.value } onCancel: { hashTask.cancel() }
+        let (hashed, photoID) = try await withTaskCancellationHandler { try await hashTask.value } onCancel: { hashTask.cancel() }
         for source in originals { try validateSource(source) }
-        let matched = try await client.matchImportFiles(batchID: batchID, fileID: first.id, files: hashed)
+        let matched = try await client.matchImportFiles(batchID: batchID, fileID: first.id, files: hashed, photoID: photoID)
         for source in originals { try validateSource(source) }
         guard Set(matched.files.map(\.id)) == Set(files.map(\.id)) else { throw KeepsAPIError.invalidResponse }
         activeFileID = nil
@@ -312,6 +323,8 @@ final class ImportStore: ObservableObject {
 
     private func updateProgress(_ status: KeepsImportFinish) {
         publishedFiles = status.completedFiles
+        if let skipped = status.skippedFiles { skippedFiles = skipped }
+        if let duplicates = status.duplicatePaths { duplicatePaths = duplicates }
         indexTotal = status.indexTotal ?? fileCount
         indexedFiles = status.indexedFiles ?? 0
         thumbnailTotal = status.thumbnailTotal ?? 0
@@ -365,7 +378,7 @@ final class ImportStore: ObservableObject {
     }
 
     private func consumeMedia(id: UUID) async throws {
-        while job == nil {
+        while !isComplete {
             try Task.checkCancellation()
             if let task = try await nextMediaTask(id: id) {
                 defer { activeMediaTasks.remove(task.taskID) }
@@ -416,7 +429,7 @@ final class ImportStore: ObservableObject {
 
     private func finish(id: UUID) async throws {
         var submit = true
-        while job == nil {
+        while !isComplete {
             try Task.checkCancellation()
             do {
                 let status = try await (submit ? client.finishImport(id: id) : client.importFinishStatus(id: id))
@@ -425,8 +438,9 @@ final class ImportStore: ObservableObject {
                 errorMessage = nil
                 switch status.status {
                 case "finished":
-                    guard let completedJob = status.job else { throw KeepsAPIError.invalidResponse }
-                    job = completedJob
+                    guard status.job != nil || status.skippedFiles == fileCount else { throw KeepsAPIError.invalidResponse }
+                    job = status.job
+                    isComplete = true
                 case "indexing":
                     message = "正在提取元数据：\(indexedFiles) / \(indexTotal)"
                 case "thumbnails":
@@ -445,7 +459,7 @@ final class ImportStore: ObservableObject {
                 report(error)
                 message = "连接暂时中断，正在恢复查询同一导入批次。NAS 已接收的任务会继续运行。"
             }
-            if job == nil { try await Task.sleep(for: .seconds(1)) }
+            if !isComplete { try await Task.sleep(for: .seconds(1)) }
         }
     }
 }
@@ -466,12 +480,12 @@ final class ImportTaskOwner: ObservableObject {
         store = current
         current.onCompletion = completed
         if let activity { current.onActivity = activity; activity(current.isBusy) }
-        if let manifest = current.manifest, current.job == nil, !current.isBusy, current.errorMessage == nil {
+        if let manifest = current.manifest, !current.isComplete, !current.isBusy, current.errorMessage == nil {
             current.start(targetPath: manifest.targetPath)
         }
     }
 
     func prepareNewIfCompleted() {
-        if store?.job != nil { store?.reset() }
+        if store?.isComplete == true { store?.reset() }
     }
 }

@@ -326,13 +326,21 @@ mod tests {
                 .len(),
             2
         );
-        for directory in ["Mexico", "Vail"] {
+        for (directory, total) in [("Mexico", 0), ("Vail", 1)] {
             let query = crate::catalog::AssetQuery {
                 directory: Some(dir.path().join(directory).to_string_lossy().into_owned()),
                 ..Default::default()
             };
-            assert_eq!(store.query_assets("lib", &query)?["total"], 1);
+            assert_eq!(store.query_assets("lib", &query)?["total"], total);
         }
+        store.set_hidden_directory("lib", raw.parent().unwrap().to_str().unwrap(), true)?;
+        assert_eq!(store.counts("lib", false)?["all"], 1);
+        store.set_trashed("lib", &ids[0], true)?;
+        assert_eq!(store.counts("lib", false)?["trashed"], 1);
+        assert_eq!(std::fs::read(&raw)?, b"raw");
+        assert_eq!(std::fs::read(&heif)?, b"heif");
+        store.set_trashed("lib", &ids[0], false)?;
+        assert_eq!(store.asset("lib", &ids[0])?["paths"], json!([heif]));
         let unrelated = dir.path().join("Other/B0003498.HEIC");
         std::fs::create_dir_all(unrelated.parent().unwrap())?;
         std::fs::write(&unrelated, "different")?;

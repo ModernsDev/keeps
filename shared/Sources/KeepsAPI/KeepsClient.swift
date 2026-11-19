@@ -36,6 +36,14 @@ public final class KeepsClient: Sendable {
     public func asset(id: UUID) async throws -> KeepsAsset {
         try await request("GET", library + ["assets", id.uuidString])
     }
+    public func duplicateLocations() async throws -> [KeepsDuplicateLocation] {
+        struct Response: Decodable { let items: [KeepsDuplicateLocation] }
+        let response: Response = try await request("GET", library + ["assets", "duplicate-locations"])
+        return response.items
+    }
+    public func choosePhotoLocation(assetID: UUID, path: String) async throws {
+        let _: [String: String] = try await request("POST", library + ["assets", assetID.uuidString, "location"], body: JSONEncoder().encode(["path": path]))
+    }
     public func versions(assetID: UUID) async throws -> [KeepsAssetVersion] {
         try await versionDetails(assetID: assetID).items
     }
@@ -269,9 +277,9 @@ public final class KeepsClient: Sendable {
         let (data, response) = try await session.data(for: request)
         return try JSONDecoder().decode(KeepsImportBatch.self, from: checkedData(data, response))
     }
-    public func matchImportFiles(batchID: UUID, fileID: UUID, files: [KeepsImportFile]) async throws -> KeepsImportBatch {
-        struct MatchRequest: Encodable { let files: [KeepsImportFile] }
-        let request = try makeRequest("POST", library + ["imports", batchID.uuidString, "files", fileID.uuidString, "match"], body: JSONEncoder().encode(MatchRequest(files: files)))
+    public func matchImportFiles(batchID: UUID, fileID: UUID, files: [KeepsImportFile], photoID: UUID? = nil) async throws -> KeepsImportBatch {
+        struct MatchRequest: Encodable { let files: [KeepsImportFile]; let photoID: UUID? }
+        let request = try makeRequest("POST", library + ["imports", batchID.uuidString, "files", fileID.uuidString, "match"], body: JSONEncoder().encode(MatchRequest(files: files, photoID: photoID)))
         let (data, response) = try await session.data(for: request)
         return try JSONDecoder().decode(KeepsImportBatch.self, from: checkedData(data, response))
     }

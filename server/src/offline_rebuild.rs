@@ -529,10 +529,6 @@ impl Manager {
     ) -> Result<Vec<(&'static str, String, PathBuf)>> {
         let lib = &self.app.library_id;
         let tx = target.transaction()?;
-        let mut paths = source.prepare(
-            // ORDER BY otherwise makes SQLite scan every path in the library for each asset.
-            "SELECT path FROM catalog_paths INDEXED BY catalog_paths_asset WHERE library_id=? AND asset_id=? ORDER BY path",
-        )?;
         let mut thumbnails = Vec::new();
         let selection = if status.from_revision.is_some() {
             "a.id IN (SELECT asset_id FROM catalog_sync_assets WHERE library_id=?1 AND revision>?4 AND deleted=0)"
@@ -563,9 +559,7 @@ impl Manager {
             let (id, snapshot, thumbnail, standard, browse, negative, trashed_at) = row?;
             let mut asset: Value = serde_json::from_str(&snapshot)?;
             let upper = Uuid::parse_str(&id)?.to_string().to_uppercase();
-            let asset_paths = paths
-                .query_map(params![lib, id], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let asset_paths = crate::catalog::photo_location_paths(source, lib, &id)?;
             asset["id"] = json!(upper);
             asset["paths"] = json!(asset_paths);
             asset["negativeContentHash"] = json!(negative);
@@ -648,8 +642,8 @@ impl Manager {
                 if let Some(name) = self.app.original_root_names.get(FsPath::new(&child_path)) {
                     child["name"] = json!(name);
                 }
-                let root = child_path.trim_end_matches('/');
-                let (direct,count):(i64,i64)=source.query_row("SELECT count(DISTINCT CASE WHEN instr(substr(p.path,length(?2)+1),'/')=0 THEN p.asset_id END),count(DISTINCT p.asset_id) FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0",params![lib,format!("{root}/"),format!("{root}0")],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                let (direct, count) =
+                    crate::catalog::directory_photo_counts(source, lib, &child_path)?;
                 child["directPhotoCount"] = json!(direct);
                 child["photoCount"] = json!(count);
             }
@@ -1003,7 +997,7 @@ mod tests {
                 .unwrap(),
         )?;
         let retained = seed(&app, root.path(), "B0014325.HEIC");
-        let removed = seed(&app, root.path(), "other.3FR");
+        let removed = seed(&app, root.path(), "duplicate/other.3FR");
         let unchanged = seed(&app, root.path(), "unchanged.jpg");
         let manager = manager(app.clone());
         let replica = Uuid::new_v4();
@@ -1122,7 +1116,7 @@ mod tests {
                 [retained.to_uppercase()],
                 |r| r.get::<_, i64>(0)
             )?,
-            2
+            1
         );
         let mut db = app.store.lock()?;
         let tx = db.transaction()?;
@@ -1312,6 +1306,50 @@ mod tests {
         let mut tar = tar::Builder::new(BrokenWriter);
         assert!(
             append_optional_image(&mut tar, "thumbnails", "good", &good, &mut |_| Ok(())).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_v24_republishes_existing_cross_directory_paths_for_offline_sync() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = fixture(root.path());
+        let id = seed(&app, root.path(), "primary/photo.jpg");
+        let alias = app.jobs.root().join("copy/photo.jpg");
+        let mut db = app.store.lock()?;
+        {
+            let tx = db.transaction()?;
+            tx.execute(
+                "INSERT INTO catalog_paths VALUES('photos',?,?,'primary/photo.jpg','jpeg_original')",
+                params![alias.to_str(), id],
+            )?;
+            crate::revisions::flush(&tx)?;
+            tx.commit()?;
+        }
+        let before: i64 = db.query_row(
+            "SELECT revision FROM catalog_sync_assets WHERE library_id='photos' AND asset_id=?",
+            [&id],
+            |r| r.get(0),
+        )?;
+        db.execute_batch("DROP VIEW catalog_asset_locations; PRAGMA user_version=23;")?;
+        crate::catalog::ensure_schema(&mut db, true)?;
+        let after: i64 = db.query_row(
+            "SELECT revision FROM catalog_sync_assets WHERE library_id='photos' AND asset_id=?",
+            [&id],
+            |r| r.get(0),
+        )?;
+        assert!(after > before);
+        assert_eq!(
+            crate::catalog::photo_location_paths(&db, "photos", &id)?,
+            [app.jobs.root().join("primary/photo.jpg").to_str().unwrap()]
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM catalog_paths WHERE asset_id=?",
+                [&id],
+                |r| r.get::<_, i64>(0)
+            )?,
+            2
         );
         Ok(())
     }

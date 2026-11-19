@@ -39,6 +39,7 @@ struct ContentView: View {
     @State private var showsAIWorkspace = false
     @State private var startsAIWorkspace = false
     @State private var showsImport = false
+    @State private var showsDuplicateLocations = false
     @State private var showsCulling = false
     @EnvironmentObject private var importTasks: ImportTaskOwner
     private var importStore: ImportStore? { importTasks.store }
@@ -112,6 +113,14 @@ struct ContentView: View {
         .tint(WorkspaceStyle.accent)
         .disabled(library.isOperationBlocking)
         .overlay { if library.isOperationBlocking { Color.clear.contentShape(Rectangle()).onTapGesture {} } }
+        .sheet(isPresented: $showsDuplicateLocations) {
+            if let client = library.client {
+                DuplicateLocationsSheet(client: client) {
+                    library.refreshNavigation()
+                    library.refresh(force: true)
+                }
+            }
+        }
         .sheet(isPresented: $showsImport, onDismiss: { library.refreshNavigation(); library.refresh(force: true) }) {
             if let importStore {
                 ImportView(store: importStore, initialTarget: library.query.directory)
@@ -170,6 +179,8 @@ struct ContentView: View {
                 showsImport = true
             } label: { Label("导入", systemImage: "square.and.arrow.down") }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
+                .disabled(library.client == nil)
+            Button("重复照片", systemImage: "rectangle.on.rectangle") { showsDuplicateLocations = true }
                 .disabled(library.client == nil)
             Spacer(minLength: 12)
             HStack(spacing: 10) {
@@ -773,5 +784,75 @@ private struct SidebarLayoutAutosave: NSViewRepresentable {
                 ancestor = view.superview
             }
         }
+    }
+}
+
+
+private struct DuplicateLocationsSheet: View {
+    let client: KeepsClient
+    let onChange: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var items: [KeepsDuplicateLocation] = []
+    @State private var working = true
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("重复照片的位置").font(.title2)
+            Text("为每张照片选择图库归属。磁盘上的原片和 XMP 会保留在各自的位置。")
+                .foregroundStyle(.secondary)
+            if working { ProgressView() }
+            if let error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+            if items.isEmpty && !working && error == nil {
+                Text("没有发现跨目录重复照片。").foregroundStyle(.secondary)
+            }
+            List(items) { item in
+                Section(item.filename) {
+                    ForEach(item.locations) { location in
+                        let selected = location.paths.contains { $0 == item.selectedPath }
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(location.directory).font(.headline).textSelection(.enabled)
+                                if !selected && location.paths.contains(where: { $0 == item.displayedPath }) {
+                                    Text("当前显示目录").font(.caption).foregroundStyle(.secondary)
+                                }
+                                ForEach(location.paths, id: \.self) { Text($0).font(.caption).textSelection(.enabled) }
+                            }
+                            Spacer()
+                            if selected { Text("已选位置").foregroundStyle(.secondary) }
+                            else if let path = location.paths.first {
+                                Button("保留此位置") { Task { await choose(item.id, path: path) } }
+                                    .disabled(working)
+                            }
+                        }
+                    }
+                }
+            }
+            HStack {
+                Button("刷新") { Task { await load() } }.disabled(working)
+                Spacer()
+                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction).disabled(working)
+            }
+        }
+        .padding(24).frame(minWidth: 700, minHeight: 420)
+        .task { await load() }
+    }
+
+    private func load() async {
+        working = true
+        defer { working = false }
+        do { items = try await client.duplicateLocations(); error = nil }
+        catch { self.error = error.localizedDescription }
+    }
+
+    private func choose(_ id: UUID, path: String) async {
+        working = true
+        defer { working = false }
+        do {
+            try await client.choosePhotoLocation(assetID: id, path: path)
+            onChange()
+            items = try await client.duplicateLocations()
+            error = nil
+        } catch { self.error = error.localizedDescription }
     }
 }

@@ -402,3 +402,17 @@ public struct KeepsTrashSettings: Codable, Equatable, Sendable {
         self.retentionDays = retentionDays
     }
 }
+
+public struct KeepsDuplicateLocation: Decodable, Identifiable, Sendable {
+    public struct Location: Decodable, Identifiable, Sendable {
+        public let directory: String
+        public let paths: [String]
+        public var id: String { directory }
+    }
+
+    public let id: UUID
+    public let filename: String
+    public let selectedPath: String?
+    public let displayedPath: String?
+    public let locations: [Location]
+}

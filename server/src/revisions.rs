@@ -737,7 +737,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                23
+                24
             );
             assert_eq!(
                 db.query_row(
@@ -926,7 +926,7 @@ mod tests {
         assert_eq!(revision(&store, "lib", None)?, old + 1);
         store.set_hidden_directory("lib", "/private", false)?;
         assert_eq!(revision(&store, "lib", Some("/public"))?, old + 2);
-        assert_eq!(store.query_assets("lib", &query)?["total"], 1);
+        assert_eq!(store.query_assets("lib", &query)?["total"], 0);
         Ok(())
     }
 

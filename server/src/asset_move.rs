@@ -206,6 +206,10 @@ fn plan(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Result<
         for asset in &request.asset_ids {
             let active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_assets WHERE library_id=?1 AND id=?2 AND trashed=0)",params![library,asset],|r|r.get(0))?;
             ensure!(active, error(409, "Photo is missing or in the recycle bin"));
+            let location = crate::catalog::photo_location(&db, library, asset)?;
+            let directory = location
+                .as_deref()
+                .and_then(|path| Path::new(path).parent());
             let candidates = query
                 .query_map(params![library, asset], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -213,10 +217,11 @@ fn plan(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Result<
                 .into_iter()
                 .map(PathBuf::from)
                 .filter(|p| {
-                    request
-                        .source_path
-                        .as_ref()
-                        .is_none_or(|source| p.starts_with(source))
+                    directory.is_some_and(|directory| p.parent() == Some(directory))
+                        && request
+                            .source_path
+                            .as_ref()
+                            .is_none_or(|source| p.starts_with(source))
                 })
                 .collect();
             ensure!(
@@ -425,6 +430,7 @@ pub(crate) fn reconcile_files(
         tx.execute(RELOCATE_CACHE, [library])?;
         for (table, column) in [
             ("catalog_paths", "path"),
+            ("catalog_location_choices", "path"),
             ("catalog_version_paths", "path"),
             ("catalog_deprecated_files", "path"),
             ("catalog_deprecated_files", "retained_path"),
@@ -828,7 +834,7 @@ mod tests {
         let (_tmp, jobs, store, mut request) = setup()?;
         let source = Path::new(request.source_path.as_deref().unwrap()).join("nested/photo.jpg");
         let id = ingest(&store, &source, "same")?;
-        let outside = jobs.root().join("outside.jpg");
+        let outside = jobs.root().join("source/outside.jpg");
         assert_eq!(ingest(&store, &outside, "same")?, id);
         fs::write(source.with_extension("jpg.xmp"), b"identity metadata")?;
         let snapshot: String = store.lock()?.query_row(
@@ -855,6 +861,10 @@ mod tests {
         );
         assert!(!source.exists());
         assert!(outside.exists());
+        assert_eq!(
+            store.asset("lib", &id)?["paths"],
+            json!([Path::new(&request.parent_path).join("photo.jpg")])
+        );
         let db = store.lock()?;
         let asset: String = db.query_row(
             "SELECT asset_id FROM catalog_paths WHERE path=?1",

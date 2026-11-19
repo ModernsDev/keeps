@@ -20,11 +20,53 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 23;
+const VERSION: i64 = 24;
 const DIRECTORY_ASSET_SET: &str =
-    " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
+    " AND a.id IN (SELECT f.asset_id FROM catalog_asset_locations f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
 const ASSET_PATHS: &str = "SELECT path FROM catalog_paths INDEXED BY catalog_paths_asset WHERE library_id=? AND asset_id=? ORDER BY path";
+// Path updates preserve rowid, so an explicit move carries the photo location with it.
+const ASSET_LOCATIONS: &str = "CREATE VIEW IF NOT EXISTS catalog_asset_locations AS
+    SELECT p.library_id,p.asset_id,p.path FROM catalog_paths p WHERE p.rowid=(
+        SELECT q.rowid FROM catalog_paths q
+        LEFT JOIN catalog_deprecated_files x ON x.library_id=q.library_id AND x.path=q.path
+        WHERE q.library_id=p.library_id AND q.asset_id=p.asset_id
+        ORDER BY NOT EXISTS(SELECT 1 FROM catalog_location_choices c WHERE c.library_id=q.library_id AND c.asset_id=q.asset_id AND c.path=q.path),
+                 x.path IS NOT NULL,q.rowid LIMIT 1
+    );";
+
+pub(crate) fn photo_location(db: &Connection, lib: &str, id: &str) -> Result<Option<String>> {
+    Ok(db
+        .prepare_cached(
+            "SELECT path FROM catalog_asset_locations WHERE library_id=? AND asset_id=?",
+        )?
+        .query_row(params![lib, id], |row| row.get(0))
+        .optional()?)
+}
+
+pub(crate) fn photo_location_paths(db: &Connection, lib: &str, id: &str) -> Result<Vec<String>> {
+    let Some(location) = photo_location(db, lib, id)? else {
+        return Ok(Vec::new());
+    };
+    let directory = std::path::Path::new(&location).parent();
+    let mut paths = db.prepare_cached(ASSET_PATHS)?;
+    let paths = paths.query_map(params![lib, id], |row| row.get::<_, String>(0))?;
+    let mut result = Vec::new();
+    for path in paths {
+        let path = path?;
+        if std::path::Path::new(&path).parent() == directory {
+            result.push(path);
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn directory_photo_counts(db: &Connection, lib: &str, path: &str) -> Result<(i64, i64)> {
+    let root = path.trim_end_matches('/');
+    Ok(db.prepare_cached("SELECT count(CASE WHEN instr(substr(p.path,length(?2)+1),'/')=0 THEN 1 END), count(*) FROM catalog_asset_locations p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0")?
+        .query_row(params![lib, format!("{root}/"), format!("{root}0")], |row| Ok((row.get(0)?, row.get(1)?)))?)
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE catalog_assets(library_id TEXT NOT NULL,id TEXT NOT NULL,snapshot TEXT NOT NULL,content_hash TEXT NOT NULL,fingerprint TEXT NOT NULL,sort_time TEXT NOT NULL,filename TEXT NOT NULL,rating INTEGER NOT NULL,flag TEXT NOT NULL,color TEXT,trashed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(library_id,id));
 CREATE INDEX catalog_hash ON catalog_assets(library_id,content_hash);
@@ -78,6 +120,8 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
             "SELECT asset_id,content_hash,size,role,holder,availability FROM catalog_files LIMIT 0",
         )?;
         db.prepare("SELECT library_id,path,asset_id,content_hash,role FROM catalog_paths LIMIT 0")?;
+        db.prepare("SELECT library_id,asset_id,path FROM catalog_asset_locations LIMIT 0")?;
+        db.prepare("SELECT library_id,asset_id,path FROM catalog_location_choices LIMIT 0")?;
         db.prepare("SELECT library_id,path FROM catalog_hidden_directories LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,content_hash,visual_hash,capture_key,width,height,priority,evidence FROM catalog_versions LIMIT 0")?;
         db.prepare("SELECT library_id,path,asset_id,content_hash,available FROM catalog_version_paths LIMIT 0")?;
@@ -205,6 +249,16 @@ CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NUL
         tx.execute_batch("INSERT OR IGNORE INTO catalog_revision_dirty SELECT library_id,'asset',asset_id FROM catalog_trash_entries;")?;
         crate::revisions::flush(&tx)?;
     }
+    if version < 24 {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS catalog_location_choices(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(library_id,asset_id));")?;
+        tx.execute_batch(ASSET_LOCATIONS)?;
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO catalog_revision_dirty
+            SELECT library_id,'asset',lower(asset_id) FROM catalog_paths
+            GROUP BY library_id,asset_id HAVING count(*)>1;",
+        )?;
+        crate::revisions::flush(&tx)?;
+    }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
     Ok(())
@@ -315,12 +369,7 @@ fn decorate(db: &Connection, lib: &str, mut a: Value) -> Result<Value> {
             .optional()?
         );
     }
-    let mut paths = db.prepare_cached(ASSET_PATHS)?;
-    a["paths"] = json!(
-        paths
-            .query_map(params![lib, id], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    );
+    a["paths"] = json!(photo_location_paths(db, lib, &id)?);
     let preview:Option<String>=db.query_row("SELECT json_object('objectRef',json_object('bucket',object_bucket,'key',object_key),'width',pixel_width,'height',pixel_height,'version',json_extract(file_object,'$.contentHash')) FROM derivative_objects WHERE library_id=? AND asset_id=? AND role='preview'",params![lib,id],|r|r.get(0)).optional()?;
     a["_preview"] = preview
         .map(|s| serde_json::from_str(&s))
@@ -335,7 +384,7 @@ fn hidden_filter(
     lib: &str,
     directory: Option<&str>,
 ) {
-    filter.push_str(" AND a.id NOT IN (SELECT p.asset_id FROM catalog_hidden_directories h JOIN catalog_paths p ON p.library_id=h.library_id AND p.path>=rtrim(h.path,'/') || '/' AND p.path<rtrim(h.path,'/') || '0' WHERE h.library_id=? AND NOT (?=h.path OR substr(?,1,length(rtrim(h.path,'/'))+1)=rtrim(h.path,'/') || '/'))");
+    filter.push_str(" AND a.id NOT IN (SELECT p.asset_id FROM catalog_hidden_directories h JOIN catalog_asset_locations p ON p.library_id=h.library_id AND p.path>=rtrim(h.path,'/') || '/' AND p.path<rtrim(h.path,'/') || '0' WHERE h.library_id=? AND NOT (?=h.path OR substr(?,1,length(rtrim(h.path,'/'))+1)=rtrim(h.path,'/') || '/'))");
     values.push(lib.to_string().into());
     let directory = directory
         .map(|p| if p == "/" { p } else { p.trim_end_matches('/') })
@@ -345,6 +394,96 @@ fn hidden_filter(
 }
 
 impl Store {
+    pub(crate) fn duplicate_locations(&self, lib: &str) -> Result<Value> {
+        let mut connection = self.read()?;
+        let db = connection.transaction()?;
+        let mut statement = db.prepare("SELECT a.id,a.filename,p.path FROM (
+            SELECT asset_id FROM catalog_paths WHERE library_id=?1 GROUP BY asset_id HAVING count(*)>1
+        ) multiple JOIN catalog_assets a ON a.library_id=?1 AND a.id=multiple.asset_id AND a.trashed=0
+        JOIN catalog_paths p ON p.library_id=?1 AND p.asset_id=a.id ORDER BY a.id,p.path")?;
+        let mut candidates = std::collections::BTreeMap::<
+            String,
+            (String, std::collections::BTreeMap<String, Vec<String>>),
+        >::new();
+        for row in statement.query_map([lib], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })? {
+            let (id, name, path) = row?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => (),
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("inspect photo location {path}"));
+                }
+            }
+            if let Some(directory) = std::path::Path::new(&path)
+                .parent()
+                .and_then(|p| p.to_str())
+            {
+                candidates
+                    .entry(id)
+                    .or_insert_with(|| (name, Default::default()))
+                    .1
+                    .entry(directory.into())
+                    .or_default()
+                    .push(path);
+            }
+        }
+        let mut items = Vec::new();
+        for (id, (name, directories)) in candidates
+            .into_iter()
+            .filter(|(_, (_, dirs))| dirs.len() > 1)
+        {
+            let chosen: Option<String> = db.query_row("SELECT c.path FROM catalog_location_choices c JOIN catalog_paths p USING(library_id,asset_id,path) WHERE c.library_id=? AND c.asset_id=?", params![lib,id], |r| r.get(0)).optional()?;
+            let chosen =
+                chosen.filter(|path| directories.values().any(|paths| paths.contains(path)));
+            let displayed_path = photo_location(&db, lib, &id)?;
+            items.push(json!({"id":id,"filename":name,"selectedPath":chosen,"displayedPath":displayed_path,"locations":
+                directories.into_iter().map(|(directory,paths)| json!({"directory":directory,"paths":paths})).collect::<Vec<_>>()}));
+        }
+        Ok(json!({"items":items}))
+    }
+
+    pub(crate) fn choose_photo_location(&self, lib: &str, id: &str, path: &str) -> Result<()> {
+        let mut db = self.lock()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let selectable: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=? AND p.asset_id=? AND p.path=? AND a.trashed=0)", params![lib,id,path], |r| r.get(0))?;
+        ensure!(selectable, invalid("照片位置已变化，请刷新重复照片列表"));
+        ensure!(
+            std::fs::symlink_metadata(path)
+                .with_context(|| format!("inspect photo location {path}"))?
+                .is_file(),
+            invalid("照片文件已不可用")
+        );
+        let directory = std::path::Path::new(path).parent();
+        let mut paths = tx.prepare_cached(ASSET_PATHS)?;
+        let mut rows = paths.query(params![lib, id])?;
+        let mut has_other_directory = false;
+        while let Some(row) = rows.next()? {
+            let other: String = row.get(0)?;
+            if std::path::Path::new(&other).parent() != directory
+                && std::path::Path::new(&other).try_exists()?
+            {
+                has_other_directory = true;
+                break;
+            }
+        }
+        drop(rows);
+        drop(paths);
+        ensure!(has_other_directory, invalid("照片已没有其他可用位置"));
+        if tx.execute("INSERT INTO catalog_location_choices VALUES(?,?,?) ON CONFLICT(library_id,asset_id) DO UPDATE SET path=excluded.path WHERE path<>excluded.path",params![lib,id,path])? > 0 {
+            tx.execute("INSERT OR IGNORE INTO catalog_revision_dirty VALUES(?,'asset',?)",params![lib,id])?;
+            crate::revisions::flush(&tx)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn hidden_directories(&self, lib: &str) -> Result<Value> {
         let db = self.read()?;
         let mut statement = db.prepare(
@@ -543,26 +682,18 @@ impl Store {
         let result=db.query_row(&format!("SELECT count(*) FILTER(WHERE trashed=0),count(*) FILTER(WHERE trashed=1),count(*) FILTER(WHERE trashed=0 AND flag='picked') FROM catalog_assets a WHERE {filter}"),rusqlite::params_from_iter(&values),|r|Ok(json!({"all":r.get::<_,i64>(0)?,"trashed":r.get::<_,i64>(1)?,"picked":r.get::<_,i64>(2)?})))?;
         Ok(result)
     }
-    /// Indexed descendant counts; each asset counts once even with multiple paths.
     pub fn directory_photo_counts(&self, lib: &str, paths: &[String]) -> Result<Vec<(i64, i64)>> {
         let mut connection = self.read()?;
         let db = connection.transaction()?;
-        let mut statement = db.prepare("SELECT count(DISTINCT CASE WHEN instr(substr(p.path,length(?2)+1),'/')=0 THEN p.asset_id END), count(DISTINCT p.asset_id) FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0")?;
         paths
             .iter()
-            .map(|path| {
-                let root = path.trim_end_matches('/');
-                Ok(statement.query_row(
-                    params![lib, format!("{root}/"), format!("{root}0")],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?)
-            })
+            .map(|path| directory_photo_counts(&db, lib, path))
             .collect()
     }
     pub fn directories(&self, lib: &str) -> Result<Value> {
         let db = self.read()?;
         let mut statement =
-            db.prepare("SELECT path,asset_id FROM catalog_paths WHERE library_id=?")?;
+            db.prepare("SELECT path,asset_id FROM catalog_asset_locations WHERE library_id=?")?;
         let paths = statement.query_map([lib], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -716,6 +847,7 @@ impl Store {
             let live:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths WHERE library_id=?1 AND asset_id=?2) OR EXISTS(SELECT 1 FROM catalog_version_paths WHERE library_id=?1 AND asset_id=?2 AND available=1)",params![lib,id],|r|r.get(0))?;
             ensure!(!live, invalid("仍有可用原片路径，不能清理照片资料"));
             for table in [
+                "catalog_location_choices",
                 "catalog_files",
                 "catalog_versions",
                 "catalog_version_paths",
@@ -1808,14 +1940,13 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn mixed_paths_remain_hidden_and_v1_migration_preserves_assets() -> Result<()> {
+    fn single_location_respects_hidden_directory_and_v1_migration_preserves_assets() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("db");
         let store = Store::open(&path, true)?;
         let file = json!({"contentHash":"photo-hash","sizeBytes":100,"role":"jpeg_original"});
         let asset = snapshot();
         let id = store.ingest_original("lib", "/private/photo.jpg", &file, &asset)?;
-        // Preserve the historical cross-directory association without creating new ones.
         store.lock()?.execute(
             "INSERT INTO catalog_paths VALUES(?,?,?,?,?)",
             params![
@@ -1838,10 +1969,7 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(
-            all["items"][0]["paths"],
-            json!(["/private/photo.jpg", "/public/photo.jpg"])
-        );
+        assert_eq!(all["items"][0]["paths"], json!(["/private/photo.jpg"]));
         assert_eq!(store.asset("lib", &id)?["paths"], all["items"][0]["paths"]);
         assert_eq!(
             store.query_assets(
@@ -1882,7 +2010,7 @@ mod tests {
         let db = Connection::open(&path)?;
         crate::revisions::remove_schema(&db)?;
         crate::edits::remove_schema(&db)?;
-        db.execute_batch("DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; DROP TABLE catalog_hidden_directories; DROP TABLE catalog_versions; DROP TABLE catalog_version_paths; DROP TABLE catalog_defaults; PRAGMA user_version=1;")?;
+        db.execute_batch("DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; DROP TABLE catalog_hidden_directories; DROP TABLE catalog_versions; DROP TABLE catalog_version_paths; DROP TABLE catalog_defaults; DROP VIEW catalog_asset_locations; PRAGMA user_version=1;")?;
         drop(db);
         assert!(Store::open(&path, false).is_err());
         let store = Store::open(&path, true)?;
@@ -2153,7 +2281,10 @@ mod directory_plan_tests {
     #[test]
     fn directory_asset_set_is_not_correlated_per_catalog_asset() -> Result<()> {
         let db = Connection::open_in_memory()?;
-        db.execute_batch("CREATE TABLE catalog_assets(library_id TEXT,id TEXT,trashed INTEGER,PRIMARY KEY(library_id,id)); CREATE INDEX catalog_sort ON catalog_assets(library_id,trashed); CREATE TABLE catalog_paths(library_id TEXT,path TEXT,asset_id TEXT,PRIMARY KEY(library_id,path)); CREATE INDEX catalog_paths_asset ON catalog_paths(library_id,asset_id);")?;
+        db.execute_batch(SCHEMA)?;
+        db.execute_batch("CREATE TABLE catalog_deprecated_files(library_id TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(library_id,path));")?;
+        db.execute_batch("CREATE TABLE catalog_location_choices(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(library_id,asset_id));")?;
+        db.execute_batch(ASSET_LOCATIONS)?;
         for suffix in [
             "f.path>=? AND f.path<?)",
             "f.path>=? AND f.path<? AND substr(f.path,7) NOT LIKE '%/%')",
@@ -2166,7 +2297,7 @@ mod directory_plan_tests {
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             assert!(
-                plan.iter().all(|step| !step.contains("CORRELATED")),
+                plan.iter().any(|step| step.contains("catalog_paths_asset") && step.contains("asset_id=?")),
                 "{plan:?}"
             );
             assert!(
