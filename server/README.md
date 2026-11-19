@@ -55,15 +55,21 @@ NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现
 
 任务与逐文件断点保存在 `jobs.sqlite`，API 返回 `{id,count,status,phase,completedFiles,totalFiles,error,createdAt,updatedAt,finishedAt}`。回收与扫描、目录移动、照片状态修改及曝光提交互斥。中断原生调用不盲目重放；原文件消失则继续剩余清单。失败对账消失路径，未回收文件和照片资料保留；失败任务不重试，需核实 NAS 回收站后重新预览。全部文件确认回收后，清除照片图库资料及编辑记录，专属生成缓存进入现有安全 GC 队列；NAS 回收站恢复后需重新扫描索引。
 
+## 按版本归并与回收
+
+`POST /libraries/{library}/version-recycle/preview` 接收 `[{assetId,keepPath,recyclePath}]`，只创建待确认清单。版本面板可打开这张照片所属的批量预览。预览锁定图库路径、保留版、专属 XMP、归位目标及默认展示、编辑底片的变更。`POST /libraries/{library}/version-recycle/{id}` 接收与预览照片数完全一致的 `{confirmationCount}`，`GET` 同路径查询进度。
+
+NAS 再次检查索引归属、文件 SHA-256、XMP 照片 ID 和共享关系，再通过 DSM 原生回收核对回收凭证。保留文件已在图库目录则留在原位，符合原名归位条件时执行无覆盖移动并同步索引。有编辑引用的落选版本、文件变化或归位冲突会停止任务。整张照片的回收继续使用原有入口。
+
 ## Mac 显式导入
 
 `POST /libraries/{library}/directories` 接收 `{parentPath,name}`，在当前资料库已追踪的父目录中创建单层子目录，返回 `201 {path}`。名称不能是隐藏或系统目录、多层路径或包含控制字符；重名返回 409，不覆盖现有文件或目录。
 
 `POST /libraries/{library}/imports` 接收 `{id,targetPath,deduplicate,preserveStructure,workerID?,files:[{id,relativePath,size,sha256?}]}`。提供 `workerID` 时为该批次照片目标文件保存一小时计算租约；视频由 NAS 生成缩略图，不分配 Mac 计算租约；`POST /libraries/{library}/imports/{batch}/heartbeat` 接收 `{workerID}` 续期。有效租约阻止 NAS 对关联照片编码，到期后报告导入处理失败，由用户显式重试。`POST /libraries/{library}/worker/claim` 接收 `{workerID,importID}`，仅领取归属该批次且租约有效的任务，无需开启全库远端 worker。Mac 上传 thumbnail、browse 及必要 standard 后提交 complete，NAS 校验来源与任务状态。`deduplicate` 默认 false，此时不要求源文件 SHA256，不按内容跳过文件。批次和文件 ID 为 UUID；提供 SHA256 时使用小写十六进制。目标必须是活跃追踪范围内的已存在目录；来源路径仅用于识别同源配对，所有文件平铺在目标目录。每批最多 10000 项，单文件 1 字节至 8 GiB。允许 RAW、JPEG、HEIF/HEIC/HIF、MP4/MOV/M4V/AVI/MKV/MTS/M2TS 及关联 XMP；不接受独立 XMP。响应包含每项 `fileName`、`uploaded`，以及批次 `finished`、`jobId`。
 
-开启 `deduplicate` 后，创建批次仅登记清单和暂定名称，不读取整批源文件或目标文件摘要。客户端按来源照片组逐组调用 `POST /libraries/{library}/imports/{batch}/files/{file}/match`，请求 `{files:[{id,relativePath,size,sha256}]}` 必须包含该组全部文件和 SHA256；响应沿用批次结构，`files` 仅包含该组的最终名称、`matched`、`skipped` 和上传状态。匹配结果持久化，断线后恢复同一批次；随后上传该组，再匹配下一组。只比较该组实际目标目录这一层的文件，保留目录结构时不跨目标子目录或扫描全库；不比较画面相似度。以内容一致的 RAW/JPEG/HEIF 为配对依据；所有重叠配套文件都一致时跳过已有项并补齐缺失项，响应 `skipped:true`。已有 XMP 或其他配套文件冲突时整组另名。目标摘要计算不持有任务数据库锁，提交时再次验证跳过的文件。
+开启 `deduplicate` 后，创建批次仅登记清单和暂定名称，不读取整批源文件或目标文件摘要。客户端按来源照片组逐组调用 `POST /libraries/{library}/imports/{batch}/files/{file}/match`，请求 `{files:[{id,relativePath,size,sha256}]}` 必须包含该组全部文件和 SHA256；响应沿用批次结构，`files` 仅包含该组的最终名称、`matched`、`skipped` 和上传状态。匹配结果持久化，断线后恢复同一批次；随后上传该组，再匹配下一组。跨目录优先通过已登记的永久照片 ID 或复核同字节的原片定位重复照片，整组跳过并返回现有 `duplicatePath`。本地配套匹配只检查该组实际目标目录这一层的文件，不比较画面相似度。以内容一致的 RAW/JPEG/HEIF 为配对依据；所有重叠配套文件都一致时跳过已有项并补齐缺失项，响应 `skipped:true`。已有 XMP 或其他配套文件冲突时整组另名。目标摘要计算不持有任务数据库锁，提交时再次验证跳过的文件。
 
-服务端按来源父目录和不区分大小写的 stem 为 RAW/HEIF/XMP 分组。目标已有相同 stem（包括不同扩展）时，全组使用 `IMG (1)` 等共同后缀，保留配对。大小写不同的 XMP 以原片 stem 和扩展规范化命名。分配名称持久化在 jobs.sqlite，同一批次 ID 和 manifest 可重复提交恢复状态；不同批次即使内容相同也作为一次新导入。
+服务端按来源父目录和不区分大小写的 stem 为 RAW/HEIF/XMP 分组。目标已有相同 stem（包括不同扩展）时，全组使用 `IMG (1)` 等共同后缀，保留配对。大小写不同的 XMP 以原片 stem 和扩展规范化命名。分配名称持久化在 jobs.sqlite，同一批次 ID 和 manifest 可重复提交恢复状态。新批次开启查重时同样执行重复检查。
 
 `PUT /libraries/{library}/imports/{batch}/files/{file}` 流式上传二进制，不在内存保存完整文件。流式检查大小并计算接收摘要；如提供了源 SHA256 则额外比较。验证成功后保存到目标目录内隐藏的 `.keeps-import-*` 暂存文件，响应 `{uploaded:true}`。扫描跳过暂存文件。单文件失败可以重新上传；成功项重试不会重复写入。
 
