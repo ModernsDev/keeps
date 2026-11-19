@@ -217,6 +217,19 @@ public final class KeepsClient: Sendable {
         let response: MovedDirectory = try await request("POST", library + ["directories", "move"], body: JSONEncoder().encode(["path": path, "parentPath": parentPath, "requestID": requestID.uuidString.lowercased()]))
         return response.path
     }
+    public func previewVersionRecycle(_ picks: [KeepsVersionRecyclePick]) async throws -> KeepsVersionRecycleTask {
+        try await request("POST", library + ["version-recycle", "preview"], body: JSONEncoder().encode(picks))
+    }
+    public func versionRecycleDraft(assetID: UUID) async throws -> KeepsVersionRecycleTask {
+        try await request("GET", library + ["version-recycle", "draft", assetID.uuidString.lowercased()])
+    }
+    public func confirmVersionRecycle(id: UUID, count: Int) async throws -> KeepsVersionRecycleTask {
+        try await request("POST", library + ["version-recycle", id.uuidString.lowercased()], body: JSONEncoder().encode(["confirmationCount": count]))
+    }
+    public func versionRecycleTask(id: UUID) async throws -> KeepsVersionRecycleTask {
+        try await request("GET", library + ["version-recycle", id.uuidString.lowercased()])
+    }
+
     public func previewRejectedTrash() async throws -> KeepsRejectedTrashTask {
         try await request("POST", library + ["rejected-trash", "preview"])
     }

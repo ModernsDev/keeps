@@ -116,6 +116,123 @@ pub(crate) fn recycle_file(share: &SharedFolder, source: &Path) -> Result<()> {
     recycle_native_operation(share, source, "--unlink")
 }
 
+fn recycle_target(share: &SharedFolder, source: &Path) -> Result<PathBuf> {
+    Ok(share
+        .path
+        .join("#recycle")
+        .join(source.strip_prefix(&share.path)?))
+}
+
+pub(crate) fn recycle_version_file(share: &SharedFolder, source: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let target = recycle_target(share, source)?;
+    let parent = target.parent().context("missing recycle parent")?;
+    type RecycleEntries = std::collections::BTreeMap<PathBuf, (u64, u64, u64, i64, i64)>;
+    let sibling_names = |path: &Path| -> Result<RecycleEntries> {
+        if !path.try_exists()? {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        ensure!(
+            path.canonicalize()? == path,
+            error(409, "回收站目录不是规范路径")
+        );
+        let stem = target
+            .file_stem()
+            .context("missing recycle filename")?
+            .to_string_lossy();
+        fs::read_dir(path)?
+            .filter_map(|entry| match entry {
+                Err(e) => Some(Err(e.into())),
+                Ok(entry) => {
+                    let candidate = entry.path();
+                    let same_name = candidate == target
+                        || (candidate.extension() == target.extension()
+                            && candidate.file_stem().is_some_and(|name| {
+                                name.to_string_lossy()
+                                    .strip_prefix(stem.as_ref())
+                                    .is_some_and(|tail| tail.starts_with('_'))
+                            }));
+                    same_name.then(|| {
+                        let info = fs::symlink_metadata(&candidate)?;
+                        Ok((
+                            candidate,
+                            (
+                                info.dev(),
+                                info.ino(),
+                                info.len(),
+                                info.mtime(),
+                                info.mtime_nsec(),
+                            ),
+                        ))
+                    })
+                }
+            })
+            .collect()
+    };
+    let before = sibling_names(parent)?;
+    let source_info = fs::symlink_metadata(source)?;
+    let source_id = (source_info.dev(), source_info.ino());
+    let checksum = crate::media::sha256_file(source)?;
+    recycle_file(share, source)?;
+    for _ in 0..20 {
+        let current = sibling_names(parent)?;
+        ensure!(
+            before
+                .iter()
+                .all(|(path, old)| current.get(path) == Some(old)),
+            error(503, "DSM 改变了已有的回收站文件")
+        );
+        for (path, info) in current
+            .iter()
+            .filter(|(path, _)| !before.contains_key(*path))
+        {
+            if (info.0, info.1) == source_id && crate::media::sha256_file(path)? == checksum {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err(error(
+        503,
+        format!("DSM 未留下可核对的回收文件：{}", source.display()),
+    ))
+}
+
+pub(crate) fn preflight_version_recycle(config: &str, paths: &[&Path]) -> Result<()> {
+    let mut probes = std::collections::BTreeMap::new();
+    for source in paths {
+        let share = recycle_share(config, source)?;
+        let parent = source.parent().context("missing recycle source parent")?;
+        let suffix = source
+            .extension()
+            .context("missing recycle file extension")?;
+        probes.insert((parent, suffix), share);
+    }
+    for ((parent, suffix), share) in probes {
+        let scratch = tempfile::Builder::new()
+            .prefix("KeepsRecycleProbe-")
+            .tempdir_in(parent)?;
+        let source = scratch.path().join("fixture").with_extension(suffix);
+        let target = recycle_target(&share, &source)?;
+        let receipt_dir = target.parent().context("missing recycle probe parent")?;
+        ensure!(!receipt_dir.try_exists()?, error(409, "回收测试路径冲突"));
+        let test = || -> Result<()> {
+            for content in [b"Keeps recycle fixture one", b"Keeps recycle fixture two"] {
+                fs::write(&source, content)?;
+                recycle_version_file(&share, &source)?;
+            }
+            Ok(())
+        };
+        let result = test();
+        if receipt_dir.is_dir() {
+            fs::remove_dir_all(receipt_dir)?;
+        }
+        result.context("DSM 回收预检失败，未回收图库文件")?;
+    }
+    Ok(())
+}
+
 fn recycle_native_operation(share: &SharedFolder, source: &Path, operation: &str) -> Result<()> {
     let output = recycle_command(share, source, operation)?
         .output()

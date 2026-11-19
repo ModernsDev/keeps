@@ -602,7 +602,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         let relative = absolute
             .strip_prefix(&self.root)
             .context("scan scope must be under originals root")?;
-        let mut resolved = self.root.clone();
+        let mut requested = self.root.clone();
         for component in relative.components() {
             match component {
                 Component::Normal(name) => {
@@ -610,32 +610,48 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
                     if name.starts_with('.') || name == "@eaDir" || name == "#recycle" {
                         bail!("excluded scan component");
                     }
-                    resolved.push(name);
-                    match std::fs::symlink_metadata(&resolved) {
-                        Ok(metadata) if metadata.file_type().is_symlink() => {
-                            bail!("symlinks are not allowed")
-                        }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
+                    requested.push(name);
                 }
                 Component::CurDir => {}
                 _ => bail!("invalid scan component"),
             }
         }
-        match std::fs::symlink_metadata(&resolved) {
-            Ok(metadata) if scope_kind == "file" && !metadata.is_file() => {
-                bail!("file scope must be a regular file")
+        let mut missing_child = None;
+        for ancestor in requested.ancestors() {
+            let resolved = match ancestor.canonicalize() {
+                Ok(path) => path,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && ancestor != self.root =>
+                {
+                    missing_child = ancestor.file_name();
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if !resolved.starts_with(&self.root) {
+                bail!("scan scope must be under originals root");
             }
-            Ok(metadata) if scope_kind != "file" && !metadata.is_dir() => {
-                bail!("directory scope must be a directory")
+            if resolved != ancestor {
+                bail!("symlinks are not allowed");
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            if let Some(name) = missing_child {
+                for entry in std::fs::read_dir(&resolved)? {
+                    if entry?.file_name() == name {
+                        bail!("missing scan component is a symlink or changed during validation");
+                    }
+                }
+                return Ok(requested);
+            }
+            let metadata = std::fs::metadata(&resolved)?;
+            if scope_kind == "file" && !metadata.is_file() {
+                bail!("file scope must be a regular file");
+            }
+            if scope_kind != "file" && !metadata.is_dir() {
+                bail!("directory scope must be a directory");
+            }
+            return Ok(resolved);
         }
-        Ok(resolved)
+        bail!("scan scope must be under originals root")
     }
     #[allow(clippy::too_many_arguments)]
     fn enqueue_scope(
@@ -1769,12 +1785,21 @@ mod tests {
         for path in ["../escape", ".hidden/a.jpg", "gone/../../escape"] {
             assert!(jobs.validate_scan_path(Path::new(path), "file").is_err());
         }
+        let file = jobs.root().join("photo.jpg");
+        std::fs::write(&file, b"fixture").unwrap();
+        assert_eq!(jobs.validate_scan_path(&file, "file").unwrap(), file);
+        assert!(jobs.validate_scan_path(&file, "directory").is_err());
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(jobs.root().join("missing"), jobs.root().join("link"))
                 .unwrap();
             assert!(
                 jobs.validate_scan_path(&jobs.root().join("link/a.jpg"), "file")
+                    .is_err()
+            );
+            std::os::unix::fs::symlink(&file, jobs.root().join("linked.jpg")).unwrap();
+            assert!(
+                jobs.validate_scan_path(Path::new("linked.jpg"), "file")
                     .is_err()
             );
         }

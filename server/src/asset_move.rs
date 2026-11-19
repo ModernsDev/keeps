@@ -362,7 +362,12 @@ fn plan(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Result<
     );
     Ok(result)
 }
-fn preflight(jobs: &Jobs, store: &Store, library: &str, plan: &[FileMove]) -> Result<bool> {
+pub(crate) fn preflight(
+    jobs: &Jobs,
+    store: &Store,
+    library: &str,
+    plan: &[FileMove],
+) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let mut pending = Vec::new();
     for item in plan {
@@ -574,19 +579,21 @@ fn execute(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Resu
         check_trash(&db, library, entries, !pending)?;
     }
     transition(jobs, &request.request_id, "moving", None)?;
-    move_files(jobs, store, library, &request.request_id, moves)?;
+    move_files(jobs, store, library, moves, || {
+        transition(jobs, &request.request_id, "catalog", None)
+    })?;
     if let Some(entries) = entries {
         restore_trash(store, library, &entries)?;
     }
     transition(jobs, &request.request_id, "completed", None)
 }
 
-fn move_files(
+pub(crate) fn move_files(
     jobs: &Jobs,
     store: &Store,
     library: &str,
-    task: &str,
     moves: Vec<FileMove>,
+    catalog_phase: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let mut moved = Vec::new();
     let movement = (|| -> Result<()> {
@@ -618,7 +625,7 @@ fn move_files(
         }
         Ok(())
     })();
-    transition(jobs, task, "catalog", None)?;
+    catalog_phase()?;
     let reconciliation = reconcile_files(jobs, store, library, &moved)
         .context("Photos moved on NAS; index reconciliation will resume on retry or restart");
     if let Err(failure) = movement {
@@ -988,7 +995,15 @@ mod tests {
         preflight(&jobs, &store, "lib", &moves)?;
         fs::write(&moves[1].destination, b"late conflict")?;
         let first_destination = moves[0].destination.clone();
-        assert!(move_files(&jobs, &store, "lib", &request.request_id, moves).is_err());
+        assert!(
+            move_files(&jobs, &store, "lib", moves, || transition(
+                &jobs,
+                &request.request_id,
+                "catalog",
+                None
+            ))
+            .is_err()
+        );
         directory_move::ensure_reconciled(&jobs)?;
         assert!(
             Path::new(request.source_path.as_deref().unwrap())
