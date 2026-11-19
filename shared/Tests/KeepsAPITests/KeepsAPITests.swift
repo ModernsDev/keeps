@@ -234,11 +234,11 @@ struct KeepsAPITests {
         #expect(try await fixture.client.createDirectory(parentPath: "/volume2/photo", name: "旅行 & RAW") == "/volume2/photo/旅行 & RAW")
     }
 
-    @Test func defaultImportOmitsDigestAndDisablesDeduplication() async throws {
+    @Test func defaultImportEnablesDeduplicationAndDefersDigest() async throws {
         let batchID = UUID()
         let fixture = Fixture { request in
             let body = try JSONSerialization.jsonObject(with: request.bodyData) as! [String: Any]
-            #expect(body["deduplicate"] as? Bool == false)
+            #expect(body["deduplicate"] as? Bool == true)
             #expect(body["preserveStructure"] as? Bool == false)
             let files = body["files"] as! [[String: Any]]
             #expect(files.first?["sha256"] == nil)
