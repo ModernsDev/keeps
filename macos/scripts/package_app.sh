@@ -8,8 +8,11 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 cd "$ROOT_DIR"
-swift build --arch arm64 >&2
-BIN_DIR="$(swift build --arch arm64 --show-bin-path)"
+BIN_DIR="${1:-}"
+if [[ -z "$BIN_DIR" ]]; then
+    swift build --arch arm64 >&2
+    BIN_DIR="$(swift build --arch arm64 --show-bin-path)"
+fi
 KEEPS_API_RESOURCES="$BIN_DIR/KeepsAPI_KeepsAPI.bundle"
 [[ -d "$KEEPS_API_RESOURCES" ]]
 

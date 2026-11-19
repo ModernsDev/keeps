@@ -129,17 +129,36 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Identify SwiftPM build products
+        id: swiftpm
+        run: |
+          xcode="$(xcodebuild -version)"
+          sdk="$(xcrun --sdk macosx --show-sdk-build-version)"
+          workspace="$(pwd -P)"
+          identity="$(printf '%s\n' "$xcode" "$sdk" "$workspace" | shasum -a 256 | cut -d ' ' -f 1)"
+          macos="$(swift build --package-path macos --arch arm64 --show-bin-path)"
+          color="$(swift build --package-path macos/ColorTools --arch arm64 --show-bin-path)"
+          printf 'identity=%s\nmacos=%s\ncolor=%s\n' "$identity" "$macos" "$color" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: macos-products
         with:
           path: |
-            macos/.build
-            macos/ColorTools/.build
-          key: swift-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('macos/**/*.swift', 'macos/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'macos/**/*.pbxproj', 'macos/Version.xcconfig') }}
-          restore-keys: |
-            swift-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
-      - run: swift test --package-path macos
-      - run: swift test --package-path macos/ColorTools
-      - run: bash macos/scripts/package_app.sh
+            ${{ steps.swiftpm.outputs.macos }}/PhotoAssetManager
+            ${{ steps.swiftpm.outputs.macos }}/PhotoAssetManagerPackageTests.xctest
+            ${{ steps.swiftpm.outputs.macos }}/KeepsAPI_KeepsAPI.bundle
+          key: swiftpm-macos-products-${{ runner.arch }}-${{ steps.swiftpm.outputs.identity }}-${{ hashFiles('macos/Package.*', 'macos/Sources/**', 'macos/Tests/**', 'shared/Package.*', 'shared/Sources/**') }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: color-products
+        with:
+          path: |
+            ${{ steps.swiftpm.outputs.color }}/keeps-color-mcp
+            ${{ steps.swiftpm.outputs.color }}/KeepsColorToolsPackageTests.xctest
+          key: swiftpm-color-products-${{ runner.arch }}-${{ steps.swiftpm.outputs.identity }}-${{ hashFiles('macos/ColorTools/Package.*', 'macos/ColorTools/Sources/**', 'macos/ColorTools/Tests/**') }}
+      - run: swift test --package-path macos --arch arm64 ${{ steps.macos-products.outputs.cache-hit == 'true' && '--skip-build' || '' }}
+      - run: swift test --package-path macos/ColorTools --arch arm64 ${{ steps.color-products.outputs.cache-hit == 'true' && '--skip-build' || '' }}
+      - env:
+          MACOS_PRODUCTS: ${{ steps.swiftpm.outputs.macos }}
+        run: bash macos/scripts/package_app.sh "$MACOS_PRODUCTS"
 
   macos_xcode:
     name: macOS Xcode build
