@@ -1,17 +1,11 @@
 import SwiftUI
 import KeepsAPI
 
-@MainActor private final class TagGenerationProgress: ObservableObject {
-    @Published var message: String?
-    var completed = 0
-}
-
 struct AssetTagsView: View {
     let asset: KeepsAsset
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var batch: AIEditingBatchStore
     private var ai: AIEditingSettingsStore { batch.editor }
-    @StateObject private var progress = TagGenerationProgress()
     @State private var draft = ""
     @State private var vocabulary: [String] = []
     @State private var libraryError: String?
@@ -55,9 +49,6 @@ struct AssetTagsView: View {
                 .disabled(blocked || ai.isBusy)
             Text("仅点击后分析所选照片，逐张追加标签并保存到标签库。使用设置中的 AI 账户。")
                 .font(.caption).foregroundStyle(.secondary)
-            if library.isMutating, let message = progress.message {
-                ProgressView(message).controlSize(.small)
-            }
         }
         .task(id: library.configuration) {
             vocabulary = []
@@ -67,7 +58,6 @@ struct AssetTagsView: View {
         .onChange(of: asset.id) { _, _ in draft = "" }
         .onChange(of: library.isMutating) { _, mutating in
             if !mutating {
-                progress.message = nil
                 Task { await loadVocabulary() }
             }
         }
@@ -100,7 +90,7 @@ struct AssetTagsView: View {
 
     private func append(_ tags: [String]) {
         let library = library, configuration = library.configuration
-        library.mutateSelected { client, id in
+        library.tagSelected(title: "正在添加标签…") { client, id in
             let current = try await client.asset(id: id)
             guard await library.configuration == configuration else { throw CancellationError() }
             return try await client.updateAsset(id: id, patch: KeepsAssetPatch(tags: PhotoTagSuggestions.merging(current.tags, tags)))
@@ -109,7 +99,7 @@ struct AssetTagsView: View {
 
     private func remove(_ tag: String) {
         let library = library, configuration = library.configuration
-        library.mutateSelected { client, id in
+        library.tagSelected(title: "正在移除标签…") { client, id in
             let current = try await client.asset(id: id)
             guard await library.configuration == configuration else { throw CancellationError() }
             return try await client.updateAsset(id: id, patch: KeepsAssetPatch(tags: current.tags.filter { $0 != tag }))
@@ -117,29 +107,20 @@ struct AssetTagsView: View {
     }
 
     private func generate() {
-        let library = library, ai = ai, progress = progress
+        let library = library, ai = ai
         let configuration = library.configuration
-        let total = library.selectedIDs.count
-        progress.completed = 0
-        progress.message = "准备分析 1/\(total)"
-        library.mutateSelected { client, id in
+        library.tagSelected(title: "正在自动生成标签…") { client, id in
             guard await library.configuration == configuration else { throw CancellationError() }
             let image = FileManager.default.temporaryDirectory.appendingPathComponent("keeps-tags-\(UUID().uuidString).jpg")
             defer { try? FileManager.default.removeItem(at: image) }
             try await client.downloadCurrentStandard(assetID: id, to: image)
             let vocabulary = try await client.tagLibrary()
             guard await library.configuration == configuration else { throw CancellationError() }
-            await MainActor.run { progress.message = "正在分析 \(progress.completed + 1)/\(total)" }
             let tags = try await ai.generateTags(image: image, vocabulary: vocabulary)
             guard await library.configuration == configuration else { throw CancellationError() }
             let current = try await client.asset(id: id)
             guard await library.configuration == configuration else { throw CancellationError() }
-            let updated = try await client.updateAsset(id: id, patch: KeepsAssetPatch(tags: PhotoTagSuggestions.merging(current.tags, tags)))
-            await MainActor.run {
-                progress.completed += 1
-                progress.message = "已完成 \(progress.completed)/\(total)"
-            }
-            return updated
+            return try await client.updateAsset(id: id, patch: KeepsAssetPatch(tags: PhotoTagSuggestions.merging(current.tags, tags)))
         }
     }
 }

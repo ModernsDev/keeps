@@ -127,6 +127,30 @@ import KeepsAPI
         #expect(store.selectedIDs == [store.assets[1].id])
     }
 
+    @Test(arguments: [false, true]) func batchTagProgressBlocksUntilCompletionOrFailure(fails: Bool) async throws {
+        let store = try await loadedStore()
+        let assets = Dictionary(uniqueKeysWithValues: store.assets.prefix(2).map { ($0.id, $0) })
+        let ids = Set(assets.keys)
+        store.selectedIDs = ids
+
+        store.tagSelected(title: "正在添加标签…") { _, id in
+            let completed = try #require(await store.batchTagProgress?.completed)
+            #expect(await store.isOperationBlocking)
+            if completed == 1 && fails { throw URLError(.networkConnectionLost) }
+            return try #require(assets[id])
+        }
+
+        #expect(store.batchTagProgress?.total == 2)
+        #expect(store.batchTagProgress?.completed == 0)
+        store.deselectAll()
+        #expect(store.selectedIDs == ids)
+
+        try await waitUntil { !store.isMutating && !store.isLoading }
+        #expect(store.batchTagProgress == nil)
+        #expect(!store.isOperationBlocking)
+        #expect(fails ? store.lastError?.contains("已完成 1/2 项") == true : store.lastError == nil)
+    }
+
     @Test func finishingSettingsWorkDoesNotUnlockPhotoBatch() {
         let store = LibraryStore(loadSavedSettings: false, preferences: UserDefaults(suiteName: UUID().uuidString)!)
         store.isAIEditingBlocking = true

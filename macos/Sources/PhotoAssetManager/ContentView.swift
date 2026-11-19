@@ -69,6 +69,7 @@ struct ContentView: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             AIEditingBackgroundStatus(store: batch) { showsAIWorkspace = true }
+                .disabled(library.batchTagProgress != nil)
         }
         .sheet(item: $assetToCrop) { asset in
             PhotoCropSheet(asset: asset)
@@ -131,7 +132,16 @@ struct ContentView: View {
             }
         }
         .overlay {
-            if library.isAISettingsBusy {
+            if let progress = library.batchTagProgress {
+                ProgressView(value: Double(progress.completed), total: Double(progress.total)) {
+                    Text(progress.title)
+                } currentValueLabel: {
+                    Text("已完成 \(progress.completed) / \(progress.total) 张").monospacedDigit()
+                }
+                .frame(width: 260)
+                .padding(28)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            } else if library.isAISettingsBusy {
                 VStack(spacing: 16) {
                     ProgressView()
                     Text("AI 修图设置正在运行，请在设置中查看进度。")
@@ -523,6 +533,10 @@ struct ContentView: View {
                         .help(library.selectedAsset?.flagState == "rejected" ? "取消弃用" : "标记为弃用")
                         .accessibilityLabel(library.selectedAsset?.flagState == "rejected" ? "取消弃用" : "标记为弃用")
                         .accessibilityAddTraits(library.selectedAsset?.flagState == "rejected" ? [.isSelected] : [])
+                    Button { library.updateSelected(KeepsAssetPatch(flagState: "unflagged")) } label: {
+                        Label("无状态", systemImage: "flag")
+                    }.buttonStyle(.plain)
+                        .help("清除所选照片的标记")
                 }.disabled(library.isMutating || library.isSelectingAll)
             }
             Group {
