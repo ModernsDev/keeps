@@ -76,9 +76,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             server/target
-          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ github.job }}-${{ github.sha }}
+          key: rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ hashFiles('server/Cargo.toml', 'server/src/**', 'server/tests/**') }}
           restore-keys: |
-            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
+            rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
       - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
       - run: cargo +stable clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
       - name: Install video metadata test dependencies
@@ -225,9 +225,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             server/target
-          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ github.job }}-${{ github.sha }}
+          key: rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ hashFiles('server/Cargo.toml', 'server/src/**') }}
           restore-keys: |
-            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
+            rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
       - name: Build server for schema integration tests
         run: cargo +stable build --manifest-path server/Cargo.toml --locked --bin keeps-server
       - run: python -m unittest discover -s scripts -p 'test_backfill_standard_names.py'
