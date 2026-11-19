@@ -1903,8 +1903,8 @@ async fn choosing_a_legacy_location_updates_gallery_without_touching_either_file
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let root = state.jobs.root();
-    let first = root.join("first/photo.jpg");
-    let second = root.join("second/photo.jpg");
+    let first = root.join("2026/F1/photo.jpg");
+    let second = root.join("2026/Las Vegas/photo.jpg");
     state.jobs.add_folder("photos", ".").unwrap();
     let id = uuid::Uuid::new_v4().to_string();
     for path in [&first, &second] {
@@ -1934,7 +1934,7 @@ async fn choosing_a_legacy_location_updates_gallery_without_touching_either_file
     let (_, body) = call(app.clone(), "GET", route, Value::Null).await;
     assert_eq!(body["items"][0]["selectedPath"], json!(second));
     let (_, asset) = call(
-        app,
+        app.clone(),
         "GET",
         &format!("/libraries/photos/assets/{id}"),
         Value::Null,
@@ -1942,6 +1942,69 @@ async fn choosing_a_legacy_location_updates_gallery_without_touching_either_file
     .await;
     assert_eq!(asset["paths"], json!([second]));
     assert_eq!(asset["rating"], 3);
+    let asset_route = format!("/libraries/photos/assets/{id}");
+    let location_route = format!("{asset_route}/location");
+    let (status, trashed) = call(
+        app.clone(),
+        "POST",
+        &format!("{asset_route}/trash"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{trashed}");
+    assert!(trashed["trashedAt"].is_i64(), "{trashed}");
+    let (_, active) = call(app.clone(), "GET", route, Value::Null).await;
+    assert_eq!(active["items"], json!([]));
+    let trash_route = format!("{route}?trashed=true");
+    let (status, duplicates) = call(app.clone(), "GET", &trash_route, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{duplicates}");
+    assert_eq!(duplicates["items"].as_array().unwrap().len(), 1);
+    assert_eq!(duplicates["items"][0]["id"], id);
+    assert_eq!(duplicates["items"][0]["displayedPath"], json!(second));
+
+    let (status, _) = call(app.clone(), "POST", &location_route, json!({"path":first})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = call(
+        app.clone(),
+        "POST",
+        &location_route,
+        json!({"path":first,"trashed":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, duplicates) = call(app.clone(), "GET", &trash_route, Value::Null).await;
+    assert_eq!(duplicates["items"][0]["selectedPath"], json!(first));
+    assert_eq!(duplicates["items"][0]["displayedPath"], json!(first));
+    let (_, page) = call(
+        app.clone(),
+        "GET",
+        "/libraries/photos/assets?trashed=true",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["items"][0]["paths"], json!([first]));
+    assert_eq!(page["items"][0]["trashedAt"], trashed["trashedAt"]);
+    for (path, count) in [(&first, 1), (&second, 0)] {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("trashed", "true")
+            .append_pair("directory", path.parent().unwrap().to_str().unwrap())
+            .finish();
+        let (status, page) = call(
+            app.clone(),
+            "GET",
+            &format!("/libraries/photos/assets?{query}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["total"], count);
+    }
+    let (status, restored) =
+        call(app, "POST", &format!("{asset_route}/restore"), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+    assert_eq!(restored["paths"], json!([first]));
+    assert_eq!(restored["trashed"], false);
     for path in [&first, &second] {
         assert_eq!(std::fs::read(path).unwrap(), b"original");
         assert_eq!(

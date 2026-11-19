@@ -115,7 +115,7 @@ struct ContentView: View {
         .overlay { if library.isOperationBlocking { Color.clear.contentShape(Rectangle()).onTapGesture {} } }
         .sheet(isPresented: $showsDuplicateLocations) {
             if let client = library.client {
-                DuplicateLocationsSheet(client: client) {
+                DuplicateLocationsSheet(client: client, trashed: library.query.trashed) {
                     library.refreshNavigation()
                     library.refresh(force: true)
                 }
@@ -790,6 +790,7 @@ private struct SidebarLayoutAutosave: NSViewRepresentable {
 
 private struct DuplicateLocationsSheet: View {
     let client: KeepsClient
+    let trashed: Bool
     let onChange: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var items: [KeepsDuplicateLocation] = []
@@ -798,7 +799,7 @@ private struct DuplicateLocationsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("重复照片的位置").font(.title2)
+            Text(trashed ? "回收站中的重复照片" : "重复照片的位置").font(.title2)
             Text("为每张照片选择图库归属。磁盘上的原片和 XMP 会保留在各自的位置。")
                 .foregroundStyle(.secondary)
             if working { ProgressView() }
@@ -841,7 +842,7 @@ private struct DuplicateLocationsSheet: View {
     private func load() async {
         working = true
         defer { working = false }
-        do { items = try await client.duplicateLocations(); error = nil }
+        do { items = try await client.duplicateLocations(trashed: trashed); error = nil }
         catch { self.error = error.localizedDescription }
     }
 
@@ -849,9 +850,9 @@ private struct DuplicateLocationsSheet: View {
         working = true
         defer { working = false }
         do {
-            try await client.choosePhotoLocation(assetID: id, path: path)
+            try await client.choosePhotoLocation(assetID: id, path: path, trashed: trashed)
             onChange()
-            items = try await client.duplicateLocations()
+            items = try await client.duplicateLocations(trashed: trashed)
             error = nil
         } catch { self.error = error.localizedDescription }
     }

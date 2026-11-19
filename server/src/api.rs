@@ -828,16 +828,28 @@ async fn revision(
     )
     .into_response())
 }
+#[derive(Deserialize)]
+struct DuplicateLocationsQuery {
+    #[serde(default)]
+    trashed: bool,
+}
+
 async fn duplicate_locations(
     State(state): State<Arc<AppState>>,
     Path(library): Path<String>,
+    Query(query): Query<DuplicateLocationsQuery>,
 ) -> ApiResult {
-    Ok(Json(blocking(move || state.store.duplicate_locations(&library)).await?).into_response())
+    Ok(
+        Json(blocking(move || state.store.duplicate_locations(&library, query.trashed)).await?)
+            .into_response(),
+    )
 }
 
 #[derive(Deserialize)]
 struct PhotoLocationChoice {
     path: String,
+    #[serde(default)]
+    trashed: bool,
 }
 
 async fn choose_photo_location(
@@ -849,7 +861,9 @@ async fn choose_photo_location(
     let path = body.path;
     interactive(move || {
         let _guard = metadata_guard(&state.jobs)?;
-        state.store.choose_photo_location(&library, &id, &path)?;
+        state
+            .store
+            .choose_photo_location(&library, &id, &path, body.trashed)?;
         Ok(Json(json!({"path":path})).into_response())
     })
     .await
