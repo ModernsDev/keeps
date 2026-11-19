@@ -390,14 +390,9 @@ struct IOSLibraryStoreTests {
         try fixture.database().ingest([fixture.asset(99)])
         try fixture.database().completeSync(revision: 0, isStable: true)
         await store.refresh()
-        ReplicaProtocol.delayDownload(host: fixture.configuration.baseURL.host!)
-        let sync = Task { await store.synchronize() }
-        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-        while !fixture.requests.contains(where: { $0.hasSuffix("/download") }), ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        #expect(fixture.requests.contains(where: { $0.hasSuffix("/download") }))
+        let (sync, deliver) = try await fixture.startPausedDownload(store)
         sync.cancel()
+        deliver()
         await sync.value
         #expect(!store.isSyncing)
         #expect(store.syncError == nil)
@@ -437,15 +432,26 @@ struct IOSLibraryStoreTests {
     @Test func repeatedForegroundSynchronizationCoalescesOneDownload() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        ReplicaProtocol.delayDownload(host: fixture.configuration.baseURL.host!)
-        await withTaskGroup(of: Void.self) { group in
-            for _ in 0..<20 { group.addTask { await store.synchronize() } }
+        let (sync, deliver) = try await fixture.startPausedDownload(store)
+        let (starts, start) = AsyncStream<Void>.makeStream()
+        let followers = (0..<19).map { _ in
+            Task { @MainActor in
+                start.yield(())
+                await store.synchronize()
+            }
         }
+        var started = starts.makeAsyncIterator()
+        for _ in followers { _ = await started.next() }
+        start.finish()
+        deliver()
+        await sync.value
+        for follower in followers { await follower.value }
         #expect(store.syncError == nil)
         #expect(!store.isSyncing)
         #expect(store.assets.map(\.originalFilename) == ["photo-1"])
         #expect(fixture.requests.filter { $0 == "POST /libraries/library/offline-rebuild" }.count == 1)
         #expect(fixture.requests.filter { $0.hasSuffix("/download") }.count == 1)
+        #expect(fixture.requests.filter { $0 == "GET /libraries/library/revision" }.count == 2)
         let before = fixture.requests.count
         for _ in 0..<10 { await store.synchronize() }
         #expect(Array(fixture.requests.dropFirst(before)) == Array(repeating: "GET /libraries/library/revision", count: 10))
@@ -454,17 +460,7 @@ struct IOSLibraryStoreTests {
     @Test func connectionSwitchDuringDownloadCannotPublishOldCatalog() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        let (downloads, download) = AsyncStream<@Sendable () -> Void>.makeStream()
-        ReplicaProtocol.interceptDownload(host: fixture.configuration.baseURL.host!) { deliver in
-            _ = download.yield(deliver)
-        }
-        let sync = Task {
-            defer { download.finish() }
-            await store.synchronize()
-        }
-        var iterator = downloads.makeAsyncIterator()
-        let pendingDelivery = await iterator.next()
-        let deliver = try #require(pendingDelivery, "Download did not start: \(fixture.requests), \(String(describing: store.syncError))")
+        let (sync, deliver) = try await fixture.startPausedDownload(store)
         var other = fixture.configuration
         other.accessCredential = "switched"
         store.configure(other)
@@ -630,6 +626,20 @@ private final class ReplicaFixture: @unchecked Sendable {
         await store.waitForLocalLoad()
         return store
     }
+    @MainActor func startPausedDownload(_ store: IOSLibraryStore) async throws -> (Task<Void, Never>, @Sendable () -> Void) {
+        let (downloads, download) = AsyncStream<@Sendable () -> Void>.makeStream()
+        ReplicaProtocol.interceptDownload(host: configuration.baseURL.host!) { deliver in
+            _ = download.yield(deliver)
+        }
+        let sync = Task {
+            defer { download.finish() }
+            await store.synchronize()
+        }
+        var iterator = downloads.makeAsyncIterator()
+        let pendingDelivery = await iterator.next()
+        let deliver = try #require(pendingDelivery, "Download did not start: \(requests), \(String(describing: store.syncError))")
+        return (sync, deliver)
+    }
     func asset(_ id: Int) throws -> KeepsAsset {
         try JSONDecoder().decode(KeepsAsset.self, from: Data(assetJSON(id).utf8))
     }
@@ -753,11 +763,6 @@ private final class ReplicaProtocol: URLProtocol, @unchecked Sendable {
     private var stopped = false
     static func interceptDownload(host: String, delivery: @escaping DownloadDelivery) {
         lock.withLock { downloads[host] = delivery }
-    }
-    static func delayDownload(host: String) {
-        interceptDownload(host: host) { deliver in
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.2, execute: deliver)
-        }
     }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
