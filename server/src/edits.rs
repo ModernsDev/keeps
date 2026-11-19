@@ -430,14 +430,15 @@ fn validate_instructions(v: &Value, id: &str, root: &str) -> Result<Option<Strin
 fn persist_instructions(s: &AppState, lib: &str, id: &str, request: &str, xml: &str) -> Result<()> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
-    let directory = s
-        .previews
-        .keeps_root()
-        .join("edits")
-        .join(format!("{:x}", Sha256::digest(lib.as_bytes())))
-        .join(uuid::Uuid::parse_str(id)?.to_string());
-    std::fs::create_dir_all(&directory)?;
-    let path = directory.join(format!("{}.xmp", uuid::Uuid::parse_str(request)?));
+    let key = format!(
+        "edits/{:x}/{}/{}.xmp",
+        Sha256::digest(lib.as_bytes()),
+        uuid::Uuid::parse_str(id)?,
+        uuid::Uuid::parse_str(request)?
+    );
+    let path = s.previews.edit_instructions_path(&key)?;
+    let directory = path.parent().context("edit instructions parent missing")?;
+    std::fs::create_dir_all(directory)?;
     if path.exists() {
         ensure!(
             std::fs::read_to_string(&path)? == xml,
@@ -445,11 +446,11 @@ fn persist_instructions(s: &AppState, lib: &str, id: &str, request: &str, xml: &
         );
         return Ok(());
     }
-    let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
     file.write_all(xml.as_bytes())?;
     file.as_file().sync_all()?;
     file.persist_noclobber(&path).map_err(|e| e.error)?;
-    std::fs::File::open(&directory)?.sync_all()?;
+    std::fs::File::open(directory)?.sync_all()?;
     Ok(())
 }
 
@@ -1076,6 +1077,17 @@ mod tests {
         edit["assetID"] = json!(uuid::Uuid::new_v4().to_string());
         input["instructionsXMP"] = json!(instructions_xml(&edit)?);
         assert!(validate_instructions(&input, &id, &id).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_xmp_rejects_redirect_into_originals() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        let request = uuid::Uuid::new_v4().to_string();
+        std::os::unix::fs::symlink(s.jobs.root(), s.previews.keeps_root().join("edits"))?;
+        assert!(persist_instructions(&s, "lib", &id, &request, "<xmp/>").is_err());
+        assert_eq!(std::fs::read_dir(s.jobs.root())?.count(), 1);
         Ok(())
     }
     fn add_version(
