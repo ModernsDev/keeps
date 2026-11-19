@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import SwiftUI
 import os
 import Testing
 import KeepsAPI
@@ -36,13 +38,27 @@ import KeepsAPI
         #expect(!store.isSelectingAll)
     }
 
-    @Test func restoringMenuTargetKeepsOtherPhotosSelectedAndInTrash() async throws {
+    @Test(arguments: [false, true]) func restoringTargetKeepsOtherPhotosSelectedAndInTrash(fromDrop: Bool) async throws {
         let store = try await loadedStore(trashed: true)
         let selected = store.assets[0].id
         let target = store.assets[1].id
         store.select(selected)
 
-        store.restorePhotos([target])
+        if fromDrop {
+            let payload = try #require(store.photoDragPayload(for: target))
+            #expect(store.canMovePhotos(payload, to: "/other"))
+            let info = TestDragInfo(source: PhotoDragSource.SourceView())
+            let type = NSPasteboard.PasteboardType(PhotoDragPayload.pasteboardType)
+            info.draggingPasteboard.declareTypes([type], owner: nil)
+            info.draggingPasteboard.setData(try JSONEncoder().encode(payload), forType: type)
+            let dropTarget = RestorePhotosDropTarget<Text>.TargetView(rootView: Text("全部照片"))
+            dropTarget.library = store
+            #expect(dropTarget.draggingEntered(info) == .move)
+            #expect(dropTarget.prepareForDragOperation(info))
+            #expect(dropTarget.performDragOperation(info))
+        } else {
+            store.restorePhotos([target])
+        }
         try await waitUntil { !store.isMutating && !store.isLoading && store.counts?.trashed == 4 }
 
         #expect(store.lastError == nil)
@@ -123,7 +139,7 @@ import KeepsAPI
     private func loadedStore(paginated: Bool = false, trashed: Bool = false) async throws -> LibraryStore {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [SelectionProtocol.self]
-        let host = trashed ? "restore.invalid" : paginated ? "pages.invalid" : "all.invalid"
+        let host = trashed ? "restore-\(UUID().uuidString.lowercased()).invalid" : paginated ? "pages.invalid" : "all.invalid"
         let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://\(host)")!, libraryID: "selection"), session: URLSession(configuration: configuration), loadSavedSettings: false, preferences: UserDefaults(suiteName: UUID().uuidString)!, persistConfiguration: { _ in })
         store.showLibrary(trashed: trashed)
         try await waitUntil { !store.isLoading }
@@ -141,14 +157,15 @@ import KeepsAPI
 }
 
 private final class SelectionProtocol: URLProtocol, @unchecked Sendable {
-    private static let restored = OSAllocatedUnfairLock(initialState: Set<String>())
+    private static let restored = OSAllocatedUnfairLock(initialState: [String: Set<String>]())
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let url = request.url!
-        let trash = url.host == "restore.invalid"
-        let restored = Self.restored.withLock { $0 }
+        let host = url.host!
+        let trash = host.hasPrefix("restore-")
+        let restored = Self.restored.withLock { $0[host] ?? [] }
         let body: String
         func photo(_ suffix: String, trashed: Bool) -> String {
             """
@@ -165,7 +182,7 @@ private final class SelectionProtocol: URLProtocol, @unchecked Sendable {
             body = "{\"items\":[\(items)],\"total\":\(total),\"revision\":1,\"isUpdating\":false" + (paginated && !cursor ? ",\"nextCursor\":\"next\"}" : "}")
         } else if trash, request.httpMethod == "POST", url.lastPathComponent == "restore",
                   let suffix = url.deletingLastPathComponent().lastPathComponent.last {
-            Self.restored.withLock { _ = $0.insert(String(suffix)) }
+            Self.restored.withLock { _ = $0[host, default: []].insert(String(suffix)) }
             body = photo(String(suffix), trashed: false)
         } else if url.path.hasSuffix("/revision") { body = "{\"revision\":1,\"isUpdating\":false}" }
         else if url.path.hasSuffix("/navigation") { body = "{\"directories\":[]}" }

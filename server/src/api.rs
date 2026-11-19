@@ -143,6 +143,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(submit_asset_move),
         )
         .route(
+            "/libraries/{library}/assets/restore-move-tasks",
+            post(submit_asset_restore_move),
+        )
+        .route(
             "/libraries/{library}/assets/move-tasks/{request_id}",
             get(asset_move_status),
         )
@@ -1358,7 +1362,25 @@ async fn submit_asset_move(
     Path(library): Path<String>,
     Json(body): Json<crate::asset_move::Request>,
 ) -> ApiResult {
+    submit_photo_move(state, library, body, false).await
+}
+
+async fn submit_asset_restore_move(
+    State(state): State<Arc<AppState>>,
+    Path(library): Path<String>,
+    Json(body): Json<crate::asset_move::Request>,
+) -> ApiResult {
+    submit_photo_move(state, library, body, true).await
+}
+
+async fn submit_photo_move(
+    state: Arc<AppState>,
+    library: String,
+    mut body: crate::asset_move::Request,
+    from_trash: bool,
+) -> ApiResult {
     require_library(&state, &library)?;
+    body.from_trash = from_trash;
     let result = blocking(move || crate::asset_move::submit(&state.jobs, &library, body)).await?;
     Ok((StatusCode::ACCEPTED, Json(result)).into_response())
 }

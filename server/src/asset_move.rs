@@ -34,6 +34,8 @@ pub struct Request {
     pub asset_ids: Vec<String>,
     pub source_path: Option<String>,
     pub parent_path: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_trash: bool,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +45,7 @@ pub struct Task {
     pub asset_ids: Vec<String>,
     pub source_path: Option<String>,
     pub parent_path: String,
+    pub from_trash: bool,
     pub status: String,
     pub phase: String,
     pub error: Option<String>,
@@ -62,6 +65,7 @@ pub(crate) fn get(jobs: &Jobs, library: &str, id: &str) -> Result<Task> {
         asset_ids: request.asset_ids,
         source_path: request.source_path,
         parent_path: request.parent_path,
+        from_trash: request.from_trash,
         status: row.1,
         phase: row.2,
         error: row.3,
@@ -101,7 +105,7 @@ pub(crate) fn submit(jobs: &Jobs, library: &str, mut request: Request) -> Result
         error(422, "Paths must be canonical and absolute")
     );
     ensure!(
-        request.source_path.as_ref() != Some(&request.parent_path),
+        request.from_trash || request.source_path.as_ref() != Some(&request.parent_path),
         error(422, "Choose a different destination folder")
     );
     let encoded = serde_json::to_string(&request)?;
@@ -127,6 +131,55 @@ pub(crate) struct FileMove {
     pub(crate) source: String,
     pub(crate) destination: String,
 }
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum MovePlan {
+    Files(Vec<FileMove>),
+    Trash {
+        files: Vec<FileMove>,
+        entries: Vec<(String, i64)>,
+    },
+}
+
+fn trash_time(db: &Connection, library: &str, id: &str) -> Result<Option<i64>> {
+    db.prepare_cached("SELECT t.trashed_at FROM catalog_assets a LEFT JOIN catalog_trash_entries t ON t.library_id=a.library_id AND t.asset_id=a.id WHERE a.library_id=?1 AND a.id=?2")?
+        .query_row(params![library, id], |row| row.get(0))
+        .optional()?
+        .ok_or_else(|| error(409, format!("Photo {id} is missing")))
+}
+
+fn check_trash(
+    db: &Connection,
+    library: &str,
+    entries: &[(String, i64)],
+    allow_restored: bool,
+) -> Result<()> {
+    for (id, expected) in entries {
+        let current = trash_time(db, library, id)?;
+        ensure!(
+            current == Some(*expected) || (allow_restored && current.is_none()),
+            error(409, format!("Photo {id} has changed recycle-bin status"))
+        );
+    }
+    Ok(())
+}
+
+fn restore_trash(store: &Store, library: &str, entries: &[(String, i64)]) -> Result<()> {
+    let mut db = store.lock()?;
+    let tx = db.transaction()?;
+    check_trash(&tx, library, entries, true)?;
+    let updated = chrono::Utc::now().to_rfc3339();
+    {
+        let mut restore = tx.prepare("UPDATE catalog_assets SET trashed=0,snapshot=json_set(snapshot,'$.trashed',json('false'),'$.updatedAt',?3) WHERE library_id=?1 AND id=?2 AND trashed=1")?;
+        for (id, _) in entries {
+            restore.execute(params![library, id, updated])?;
+        }
+    }
+    crate::revisions::flush(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn transition(jobs: &Jobs, id: &str, phase: &str, message: Option<&str>) -> Result<()> {
     let status = match phase {
         "completed" => "completed",
@@ -204,8 +257,11 @@ fn plan(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Result<
         let db = store.lock()?;
         let mut query=db.prepare("SELECT path FROM (SELECT path FROM catalog_paths WHERE library_id=?1 AND asset_id=?2 UNION SELECT path FROM catalog_version_paths WHERE library_id=?1 AND asset_id=?2 AND available=1) p WHERE NOT EXISTS(SELECT 1 FROM catalog_deprecated_files d WHERE d.library_id=?1 AND d.path=p.path)")?;
         for asset in &request.asset_ids {
-            let active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_assets WHERE library_id=?1 AND id=?2 AND trashed=0)",params![library,asset],|r|r.get(0))?;
-            ensure!(active, error(409, "Photo is missing or in the recycle bin"));
+            let eligible:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_assets WHERE library_id=?1 AND id=?2 AND trashed=?3)",params![library,asset,request.from_trash],|r|r.get(0))?;
+            ensure!(
+                eligible,
+                error(409, "Photo is missing or has changed recycle-bin status")
+            );
             let location = crate::catalog::photo_location(&db, library, asset)?;
             let directory = location
                 .as_deref()
@@ -276,6 +332,15 @@ fn plan(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Result<
         let destination =
             Path::new(&request.parent_path).join(source.file_name().context("file has no name")?);
         if source == destination {
+            if request.from_trash {
+                ensure!(
+                    fs::symlink_metadata(&source)?.is_file(),
+                    error(
+                        409,
+                        format!("Photo source is no longer a file: {}", source.display())
+                    )
+                );
+            }
             continue;
         }
         ensure!(
@@ -292,12 +357,12 @@ fn plan(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Result<
         });
     }
     ensure!(
-        !result.is_empty(),
+        request.from_trash || !result.is_empty(),
         error(409, "Selected photos are already in the destination")
     );
     Ok(result)
 }
-fn preflight(jobs: &Jobs, store: &Store, library: &str, plan: &[FileMove]) -> Result<()> {
+fn preflight(jobs: &Jobs, store: &Store, library: &str, plan: &[FileMove]) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let mut pending = Vec::new();
     for item in plan {
@@ -380,7 +445,7 @@ fn preflight(jobs: &Jobs, store: &Store, library: &str, plan: &[FileMove]) -> Re
             )
         );
     }
-    Ok(())
+    Ok(!pending.is_empty())
 }
 
 const RELOCATE_CACHE: &str = "UPDATE media_cache SET standard=json_set(standard,'$.path',(SELECT destination FROM photo_move_paths WHERE source=json_extract(standard,'$.path'))) WHERE library_id=?1 AND asset_id IN (SELECT asset_id FROM photo_move_assets) AND json_extract(standard,'$.path') IN (SELECT source FROM photo_move_paths)";
@@ -472,20 +537,48 @@ fn execute(jobs: &Jobs, store: &Store, library: &str, request: &Request) -> Resu
         [&request.request_id],
         |r| r.get(0),
     )?;
-    let moves: Vec<FileMove> = match saved {
+    let prepared: MovePlan = match saved {
         Some(saved) => serde_json::from_str(&saved)?,
         None => {
-            let moves = plan(jobs, store, library, request)?;
+            let files = plan(jobs, store, library, request)?;
+            let prepared = if request.from_trash {
+                let db = store.lock()?;
+                let entries = request
+                    .asset_ids
+                    .iter()
+                    .map(|id| {
+                        let timestamp = trash_time(&db, library, id)?.ok_or_else(|| {
+                            error(409, format!("Photo {id} is no longer in the recycle bin"))
+                        })?;
+                        Ok((id.clone(), timestamp))
+                    })
+                    .collect::<Result<_>>()?;
+                MovePlan::Trash { files, entries }
+            } else {
+                MovePlan::Files(files)
+            };
             jobs.trash_db.lock().unwrap().execute(
                 "UPDATE asset_move_tasks SET plan=?2 WHERE id=?1",
-                params![request.request_id, serde_json::to_string(&moves)?],
+                params![request.request_id, serde_json::to_string(&prepared)?],
             )?;
-            moves
+            prepared
         }
     };
-    preflight(jobs, store, library, &moves)?;
+    let (moves, entries) = match prepared {
+        MovePlan::Files(files) => (files, None),
+        MovePlan::Trash { files, entries } => (files, Some(entries)),
+    };
+    let pending = preflight(jobs, store, library, &moves)?;
+    if let Some(entries) = &entries {
+        let db = store.lock()?;
+        check_trash(&db, library, entries, !pending)?;
+    }
     transition(jobs, &request.request_id, "moving", None)?;
-    move_files(jobs, store, library, &request.request_id, moves)
+    move_files(jobs, store, library, &request.request_id, moves)?;
+    if let Some(entries) = entries {
+        restore_trash(store, library, &entries)?;
+    }
+    transition(jobs, &request.request_id, "completed", None)
 }
 
 fn move_files(
@@ -545,17 +638,14 @@ pub(crate) fn process_next(jobs: &Jobs, store: &Store) -> Result<bool> {
         return Ok(false);
     };
     let request: Request = serde_json::from_str(&encoded)?;
-    match execute(jobs, store, &library, &request) {
-        Ok(()) => transition(jobs, &request.request_id, "completed", None)?,
-        Err(failure) => {
-            tracing::error!(id=%request.request_id,error=%format!("{failure:#}"),"Photo move task failed");
-            transition(
-                jobs,
-                &request.request_id,
-                "failed",
-                Some(&format!("{failure:#}")),
-            )?;
-        }
+    if let Err(failure) = execute(jobs, store, &library, &request) {
+        tracing::error!(id=%request.request_id,error=%format!("{failure:#}"),"Photo move task failed");
+        transition(
+            jobs,
+            &request.request_id,
+            "failed",
+            Some(&format!("{failure:#}")),
+        )?;
     }
     Ok(true)
 }
@@ -577,6 +667,7 @@ mod tests {
             asset_ids: vec![],
             source_path: Some(jobs.root().join("source").to_str().unwrap().into()),
             parent_path: jobs.root().join("target").to_str().unwrap().into(),
+            from_trash: false,
         };
         Ok((tmp, jobs, store, request))
     }
@@ -631,6 +722,93 @@ mod tests {
         assert!(jobs.root().join("target/a.xmp").exists());
         assert!(jobs.root().join("target/b.jpg").exists());
         assert!(!first.exists() && !second.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recycle_bin_move_restores_moved_photos_and_photos_already_in_target() -> Result<()> {
+        let (_tmp, jobs, store, mut request) = setup()?;
+        let source = jobs.root().join("source/photo.jpg");
+        let sidecar = source.with_extension("jpg.xmp");
+        let target = jobs.root().join("target");
+        let already_there = target.join("already.jpg");
+        let alternate = jobs.root().join("source/nested/alternate.jpg");
+        let alternate_sidecar = alternate.with_extension("jpg.xmp");
+        let first = ingest(&store, &alternate, "first")?;
+        assert_eq!(ingest(&store, &source, "first")?, first);
+        store.choose_photo_location("lib", &first, source.to_str().unwrap())?;
+        let second = ingest(&store, &already_there, "second")?;
+        fs::write(&sidecar, b"identity metadata")?;
+        fs::write(&alternate_sidecar, b"alternate identity metadata")?;
+        for id in [&first, &second] {
+            store.set_trashed("lib", id, true)?;
+        }
+        request.asset_ids = vec![first.clone(), second.clone()];
+        request.source_path = None;
+        request.from_trash = true;
+        submit(&jobs, "lib", request.clone())?;
+        process_next(&jobs, &store)?;
+        let task = get(&jobs, "lib", &request.request_id)?;
+        assert_eq!(task.status, "completed", "{task:?}");
+        assert!(task.from_trash);
+        assert!(!source.exists() && !sidecar.exists());
+        assert_eq!(fs::read(&alternate)?, b"original bytes");
+        assert_eq!(
+            fs::read(&alternate_sidecar)?,
+            b"alternate identity metadata"
+        );
+        assert!(!target.join("alternate.jpg").exists());
+        assert_eq!(fs::read(target.join("photo.jpg"))?, b"original bytes");
+        assert_eq!(
+            fs::read(target.join("photo.jpg.xmp"))?,
+            b"identity metadata"
+        );
+        for (id, path) in [(first, target.join("photo.jpg")), (second, already_there)] {
+            let asset = store.asset("lib", &id)?;
+            assert_eq!(asset["trashed"], false);
+            assert_eq!(asset["paths"], json!([path]));
+            assert!(asset.get("trashedAt").is_none());
+        }
+        assert_eq!(submit(&jobs, "lib", request)?.status, "completed");
+        assert!(!process_next(&jobs, &store)?);
+        Ok(())
+    }
+
+    #[test]
+    fn recycle_bin_move_preserves_status_on_conflict_and_resumes_after_reconciliation() -> Result<()>
+    {
+        let (_tmp, jobs, store, mut request) = setup()?;
+        let source = jobs.root().join("source/photo.jpg");
+        let target = jobs.root().join("target/photo.jpg");
+        let id = ingest(&store, &source, "photo")?;
+        let trashed = store.set_trashed("lib", &id, true)?;
+        request.asset_ids = vec![id.clone()];
+        request.source_path = None;
+        request.from_trash = true;
+        fs::write(&target, b"existing file")?;
+        submit(&jobs, "lib", request.clone())?;
+        process_next(&jobs, &store)?;
+        assert_eq!(get(&jobs, "lib", &request.request_id)?.status, "failed");
+        assert_eq!(store.asset("lib", &id)?["trashedAt"], trashed["trashedAt"]);
+        assert_eq!(fs::read(&target)?, b"existing file");
+        assert!(source.exists());
+
+        fs::rename(&target, target.with_extension("kept"))?;
+        store.lock()?.execute_batch("CREATE TRIGGER interrupt_restore BEFORE UPDATE OF trashed ON catalog_assets WHEN new.trashed=0 BEGIN SELECT RAISE(ABORT,'simulate restore transaction failure'); END")?;
+        submit(&jobs, "lib", request.clone())?;
+        process_next(&jobs, &store)?;
+        assert_eq!(get(&jobs, "lib", &request.request_id)?.status, "failed");
+        assert!(!source.exists() && target.exists());
+        assert_eq!(store.asset("lib", &id)?["trashedAt"], trashed["trashedAt"]);
+
+        store
+            .lock()?
+            .execute_batch("DROP TRIGGER interrupt_restore")?;
+        submit(&jobs, "lib", request.clone())?;
+        process_next(&jobs, &store)?;
+        assert_eq!(get(&jobs, "lib", &request.request_id)?.status, "completed");
+        assert_eq!(store.asset("lib", &id)?["trashed"], false);
+        assert_eq!(fs::read(&target)?, b"original bytes");
         Ok(())
     }
 

@@ -2487,6 +2487,30 @@ async fn photo_move_tasks_are_durable_scoped_and_idempotent() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(read, task);
+    let restore_path = "/libraries/photos/assets/restore-move-tasks";
+    assert_eq!(
+        call(app.clone(), "POST", restore_path, body.clone())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let restore_id = uuid::Uuid::new_v4().to_string();
+    let mut restore_request = body.clone();
+    restore_request["requestID"] = json!(restore_id);
+    let (status, restore) = call(app.clone(), "POST", restore_path, restore_request).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(restore["fromTrash"], true);
+    assert_eq!(
+        call(
+            app.clone(),
+            "GET",
+            &format!("{path}/{restore_id}"),
+            Value::Null
+        )
+        .await
+        .1,
+        restore
+    );
     let mut conflict = body;
     conflict["parentPath"] = json!(format!("{root}/different"));
     assert_eq!(

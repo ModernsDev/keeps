@@ -240,7 +240,7 @@ import KeepsAPI
         outline.expandItem(try #require(outline.item(atRow: 0)))
         let source = try #require(outline.item(atRow: 1))
         let writer = try #require(coordinator.outlineView(outline, pasteboardWriterForItem: source))
-        let info = DirectoryTestDragInfo(source: outline, window: window)
+        let info = TestDragInfo(source: outline, window: window)
         info.draggingPasteboard.writeObjects([writer])
         defer { info.draggingPasteboard.releaseGlobally() }
         let destinationRow = 2
@@ -372,7 +372,7 @@ private final class DirectoryMoveProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
-@MainActor private final class DirectoryTestDragInfo: NSObject, NSDraggingInfo {
+@MainActor final class TestDragInfo: NSObject, NSDraggingInfo {
     let draggingSource: Any?
     let draggingDestinationWindow: NSWindow?
     let draggingPasteboard = NSPasteboard.withUniqueName()
@@ -385,7 +385,7 @@ private final class DirectoryMoveProtocol: URLProtocol, @unchecked Sendable {
     var animatesToDestination = false
     var numberOfValidItemsForDrop = 1
     var springLoadingHighlight: NSSpringLoadingHighlight { .none }
-    init(source: NSOutlineView, window: NSWindow) { draggingSource = source; draggingDestinationWindow = window }
+    init(source: NSView, window: NSWindow? = nil) { draggingSource = source; draggingDestinationWindow = window }
     func slideDraggedImage(to screenPoint: NSPoint) {}
     override func namesOfPromisedFilesDropped(atDestination dropDestination: URL) -> [String]? { nil }
     func resetSpringLoading() {}

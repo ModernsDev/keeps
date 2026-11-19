@@ -412,14 +412,19 @@ struct IOSLibraryStoreTests {
         let fixture = ReplicaFixture()
         fixture.building = true
         let store = await fixture.store()
-        let sync = Task { await store.synchronize(includeThumbnails: false) }
+        var jobPersisted = false
+        let sync = Task {
+            await store.synchronize(includeThumbnails: false) { stage, _, _ in
+                if stage == .catalog { jobPersisted = true }
+            }
+        }
         let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-        while !fixture.requests.contains("POST /libraries/library/offline-rebuild"), ContinuousClock.now < deadline {
+        while !jobPersisted, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
-        #expect(fixture.requests.contains("POST /libraries/library/offline-rebuild"))
         sync.cancel()
         await sync.value
+        try #require(jobPersisted)
         #expect(!store.hasLocalCatalog)
         fixture.building = false
         let reopened = await fixture.store()

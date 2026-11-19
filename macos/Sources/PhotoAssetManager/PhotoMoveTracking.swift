@@ -10,6 +10,12 @@ struct PhotoDragPayload: Codable {
     let baseURL: String
     let libraryID: String
     let query: KeepsAssetQuery
+
+    @MainActor static func read(from info: NSDraggingInfo) -> Self? {
+        guard info.draggingSource is PhotoDragSource.SourceView,
+              let data = info.draggingPasteboard.data(forType: .init(pasteboardType)) else { return nil }
+        return try? JSONDecoder().decode(Self.self, from: data)
+    }
 }
 
 struct PendingPhotoMove: Codable {
@@ -26,7 +32,7 @@ struct PendingPhotoMove: Codable {
 
     func photoDragPayload(for id: UUID) -> PhotoDragPayload? {
         guard let configuration,
-              !query.trashed, !isOperationBlocking, !isMutating,
+              !isOperationBlocking, !isMutating,
               !isSelectingAll, hasCurrentPhotoResults, assets.contains(where: { $0.id == id }) else { return nil }
         let ids = selectedIDs.contains(id) ? selectedIDs : [id]
         return PhotoDragPayload(assetIDs: ids.sorted { $0.uuidString < $1.uuidString },
@@ -48,14 +54,28 @@ struct PendingPhotoMove: Codable {
         }
     }
 
-    func canMovePhotos(_ payload: PhotoDragPayload, to parentPath: String) -> Bool {
+    private func canUsePhotoDrop(_ payload: PhotoDragPayload) -> Bool {
         client != nil && hasCurrentPhotoResults && !isOperationBlocking && !isMutating && !isSelectingAll &&
-        !isUpdatingHiddenDirectory && !isCheckingConnection && !query.trashed &&
+        !isUpdatingHiddenDirectory && !isCheckingConnection &&
         configuration?.baseURL.absoluteString == payload.baseURL && configuration?.libraryID == payload.libraryID &&
         query == payload.query && query.directory == payload.sourcePath &&
-        (payload.sourcePath?.hasPrefix("/") ?? true) && parentPath.hasPrefix("/") && payload.sourcePath != parentPath &&
         !payload.assetIDs.isEmpty && Set(payload.assetIDs).count == payload.assetIDs.count &&
         Set(payload.assetIDs).isSubset(of: Set(assets.map(\.id)))
+    }
+
+    func canMovePhotos(_ payload: PhotoDragPayload, to parentPath: String) -> Bool {
+        canUsePhotoDrop(payload) && (payload.sourcePath?.hasPrefix("/") ?? true) &&
+        parentPath.hasPrefix("/") && (payload.query.trashed || payload.sourcePath != parentPath)
+    }
+
+    func canRestoreDroppedPhotos(_ payload: PhotoDragPayload) -> Bool {
+        payload.query.trashed && canUsePhotoDrop(payload)
+    }
+
+    func restoreDroppedPhotos(_ payload: PhotoDragPayload) -> Bool {
+        guard canRestoreDroppedPhotos(payload) else { return false }
+        restorePhotos(Set(payload.assetIDs))
+        return true
     }
 
     func movePhotos(_ payload: PhotoDragPayload, to parentPath: String) async {
@@ -99,10 +119,11 @@ struct PendingPhotoMove: Codable {
                 let task: KeepsPhotoMoveTask
                 if shouldSubmit {
                     shouldSubmit = false
-                    task = try await client.startPhotoMove(assetIDs: pending.payload.assetIDs, sourcePath: pending.payload.sourcePath, parentPath: pending.parentPath, requestID: pending.id)
+                    task = try await client.startPhotoMove(assetIDs: pending.payload.assetIDs, sourcePath: pending.payload.sourcePath, parentPath: pending.parentPath, requestID: pending.id, fromTrash: pending.payload.query.trashed)
                 } else { task = try await client.photoMoveTask(id: pending.id) }
                 guard task.id == pending.id, task.sourcePath == pending.payload.sourcePath,
-                      task.parentPath == pending.parentPath, Set(task.assetIDs) == Set(pending.payload.assetIDs) else {
+                      task.parentPath == pending.parentPath, Set(task.assetIDs) == Set(pending.payload.assetIDs),
+                      (task.fromTrash ?? false) == pending.payload.query.trashed else {
                     finishPhotoMoveWithError("NAS 返回的移动任务与当前请求不一致，请在服务器核实。")
                     return
                 }
@@ -153,6 +174,54 @@ struct PendingPhotoMove: Codable {
         preferences.removeObject(forKey: Self.photoMoveKey)
         refreshNavigation()
         refresh(force: true)
+    }
+}
+
+struct RestorePhotosDropTarget<Content: View>: NSViewRepresentable {
+    let library: LibraryStore
+    @Binding var highlighted: Bool
+    @ViewBuilder var content: Content
+
+    func makeNSView(context: Context) -> TargetView {
+        let view = TargetView(rootView: content)
+        view.registerForDraggedTypes([.init(PhotoDragPayload.pasteboardType)])
+        return view
+    }
+
+    func updateNSView(_ view: TargetView, context: Context) {
+        view.rootView = content
+        view.library = library
+        view.highlight = { highlighted = $0 }
+    }
+
+    final class TargetView: NSHostingView<Content> {
+        weak var library: LibraryStore?
+        var highlight: ((Bool) -> Void)?
+
+        private func acceptedPayload(_ sender: NSDraggingInfo) -> PhotoDragPayload? {
+            guard let payload = PhotoDragPayload.read(from: sender),
+                  library?.canRestoreDroppedPhotos(payload) == true else { return nil }
+            return payload
+        }
+
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { draggingUpdated(sender) }
+
+        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+            let accepting = acceptedPayload(sender) != nil
+            highlight?(accepting)
+            return accepting ? .move : []
+        }
+
+        override func draggingExited(_ sender: NSDraggingInfo?) { highlight?(false) }
+        override func draggingEnded(_ sender: NSDraggingInfo) { highlight?(false) }
+
+        override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { acceptedPayload(sender) != nil }
+
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            highlight?(false)
+            guard let payload = acceptedPayload(sender) else { return false }
+            return library?.restoreDroppedPhotos(payload) == true
+        }
     }
 }
 

@@ -47,6 +47,7 @@ struct ContentView: View {
     @FocusState private var galleryFocused: Bool
 
     @State private var showsSidebar = true
+    @State private var restoreDropHighlighted = false
     @State private var showsInspector = false
     @State private var showsFilters = false
     @State private var thumbnailSize = 190.0
@@ -211,7 +212,15 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 0) {
             Text("资料库").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
                 .padding(.horizontal, 16).padding(.bottom, 8)
-            scopeButton("全部照片", count: library.counts?.all, trashed: false, picked: false)
+            RestorePhotosDropTarget(library: library, highlighted: $restoreDropHighlighted) {
+                scopeButton("全部照片", count: library.counts?.all, trashed: false, picked: false)
+                    .overlay {
+                        if restoreDropHighlighted {
+                            RoundedRectangle(cornerRadius: 4).strokeBorder(WorkspaceStyle.accent, lineWidth: 2)
+                                .padding(.horizontal, 8).allowsHitTesting(false)
+                        }
+                    }
+            }.frame(height: 36)
             scopeButton("精选", count: library.counts?.picked, trashed: false, picked: true)
             scopeButton("回收站", count: library.counts?.trashed, trashed: true, picked: false)
                 .contextMenu {
