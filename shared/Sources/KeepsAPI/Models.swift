@@ -395,6 +395,49 @@ public struct KeepsRejectedTrashTask: Codable, Equatable, Identifiable, Sendable
     public var finishedAt: Double?
 }
 
+public struct KeepsVersionRecyclePick: Encodable, Sendable {
+    public let assetID: String
+    public let keepPath: String
+    public let recyclePath: String
+
+    public init(assetID: UUID, keepPath: String, recyclePath: String) {
+        self.assetID = assetID.uuidString.lowercased()
+        self.keepPath = keepPath
+        self.recyclePath = recyclePath
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case assetID = "assetId"
+        case keepPath, recyclePath
+    }
+}
+
+public struct KeepsVersionRecycleTask: Decodable, Identifiable, Sendable {
+    public struct Selection: Decodable, Sendable {
+        public struct Pick: Decodable, Sendable {
+            public let keepPath: String
+            public let recyclePath: String
+        }
+        public struct RetainedFile: Decodable, Sendable {
+            public let path: String
+        }
+        public let pick: Pick
+        public let destination: String
+        public let retainedFiles: [RetainedFile]
+        public let recycleFiles: [String]
+        public let changesDefault: Bool
+        public let changesEditingNegative: Bool
+    }
+
+    public let id: UUID
+    public let count: Int
+    public let status: String
+    public let completedFiles: Int
+    public let totalFiles: Int
+    public let error: String?
+    public let versions: [Selection]
+}
+
 public struct KeepsTrashSettings: Codable, Equatable, Sendable {
     public var enabled: Bool
     public var retentionDays: Int

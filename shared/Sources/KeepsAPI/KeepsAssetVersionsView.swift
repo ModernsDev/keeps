@@ -13,6 +13,10 @@ public struct KeepsAssetVersionsView: View {
     @State private var error: String?
     @State private var negativeContentHash: String?
     @State private var hasLoaded = false
+    @State private var recycleTask: KeepsVersionRecycleTask?
+    @State private var showRecyclePreview = false
+    @State private var recycleCount = ""
+    @State private var recycleError: String?
 
     public init(assetID: UUID, revision: String, configuration: KeepsConfiguration,
                 onSetNegative: ((KeepsAssetVersion) -> Void)? = nil, negativeChangePending: Bool = false,
@@ -45,6 +49,19 @@ public struct KeepsAssetVersionsView: View {
                             .disabled(busy || !version.available)
                     }
                     if !version.available { Text("文件暂不可用").font(.caption).foregroundStyle(.secondary) }
+                    ForEach(version.paths.filter(\.available), id: \.path) { location in
+                        HStack {
+                            Text(location.path).font(.caption).textSelection(.enabled)
+                            if versions.contains(where: { $0.paths.contains { $0.available && $0.path != location.path } }) {
+                                Menu("回收此文件") {
+                                    ForEach(availablePaths.filter { $0 != location.path }, id: \.self) { keep in
+                                        Button("保留 \(keep)") { Task { await previewRecycle(keep: keep, recycle: location.path) } }
+                                    }
+                                }
+                                .disabled(busy)
+                            }
+                        }
+                    }
                 }
                 .contentShape(Rectangle())
                 .contextMenu {
@@ -53,6 +70,11 @@ public struct KeepsAssetVersionsView: View {
                             .disabled(busy || negativeChangePending || !version.available || version.contentHash == negativeContentHash)
                     }
                 }
+            }
+            if !versions.isEmpty {
+                Button("打开已有回收预览") { Task { await openExistingRecyclePreview() } }
+                    .font(.caption)
+                    .disabled(busy)
             }
             if !deprecatedFiles.isEmpty {
                 DisclosureGroup("已弃用的重复文件") {
@@ -77,6 +99,105 @@ public struct KeepsAssetVersionsView: View {
             if let error { Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
         }
         .task(id: assetID.uuidString + ":" + revision) { await load() }
+        .sheet(isPresented: $showRecyclePreview) { recyclePreview }
+    }
+
+    private var availablePaths: [String] {
+        Array(Set(versions.flatMap { $0.paths.filter(\.available).map(\.path) })).sorted()
+    }
+
+    private var recyclePreview: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("版本回收预览").font(.headline)
+            if let task = recycleTask {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(task.versions, id: \.pick.recyclePath) { row in
+                            Text("保留 \(row.pick.keepPath)")
+                            Text("归位到 \(row.destination)")
+                            if row.changesDefault {
+                                Text("将默认展示切换到保留版本")
+                            }
+                            if row.changesEditingNegative {
+                                Text("将编辑底片切换到保留版本")
+                            }
+                            ForEach(row.retainedFiles.dropFirst(), id: \.path) { file in
+                                Text("保留 XMP \(file.path)")
+                            }
+                            ForEach(row.recycleFiles, id: \.self) { file in
+                                Text("送入 NAS 回收站 \(file)")
+                            }
+                        }
+                    }
+                    .textSelection(.enabled)
+                }
+                if task.status == "draft" {
+                    TextField("输入照片数量 \(task.count)", text: $recycleCount)
+                    Button("确认回收", role: .destructive) {
+                        Task { await confirmRecycle(task) }
+                    }
+                    .disabled(busy || recycleCount != String(task.count))
+                } else if task.status == "pending" || task.status == "running" {
+                    ProgressView(value: Double(task.completedFiles), total: Double(task.totalFiles))
+                } else if task.status == "completed" {
+                    Text("版本回收和归位已完成")
+                }
+                if let message = recycleError ?? task.error {
+                    Text(message).foregroundStyle(.red).textSelection(.enabled)
+                }
+            }
+            Button("关闭") { showRecyclePreview = false }
+        }
+        .padding()
+        .frame(idealWidth: 560, minHeight: 330)
+    }
+
+    private func previewRecycle(keep: String, recycle: String) async {
+        busy = true; error = nil; recycleError = nil; recycleCount = ""
+        defer { busy = false }
+        do {
+            let pick = KeepsVersionRecyclePick(assetID: assetID, keepPath: keep, recyclePath: recycle)
+            recycleTask = try await KeepsClient(configuration: configuration).previewVersionRecycle([pick])
+            showRecyclePreview = true
+        } catch { if !Task.isCancelled { self.error = String(reflecting: error) } }
+    }
+
+    private func openExistingRecyclePreview() async {
+        busy = true; error = nil; recycleError = nil; recycleCount = ""
+        defer { busy = false }
+        do {
+            let client = KeepsClient(configuration: configuration)
+            let task = try await client.versionRecycleDraft(assetID: assetID)
+            recycleTask = task
+            showRecyclePreview = true
+            if task.status != "draft" { try await monitorRecycle(task, client: client) }
+        } catch { if !Task.isCancelled { self.error = String(reflecting: error) } }
+    }
+
+    private func monitorRecycle(_ initial: KeepsVersionRecycleTask, client: KeepsClient) async throws {
+        var task = initial
+        recycleTask = task
+        while task.status == "pending" || task.status == "running" {
+            try await Task.sleep(for: .seconds(1))
+            task = try await client.versionRecycleTask(id: initial.id)
+            recycleTask = task
+        }
+        if task.status == "completed" {
+            let updated = try await client.asset(id: assetID)
+            onSelection(updated)
+            await load()
+        }
+    }
+
+    private func confirmRecycle(_ preview: KeepsVersionRecycleTask) async {
+        guard !busy, recycleCount == String(preview.count) else { return }
+        busy = true; recycleError = nil
+        defer { busy = false }
+        do {
+            let client = KeepsClient(configuration: configuration)
+            let task = try await client.confirmVersionRecycle(id: preview.id, count: preview.count)
+            try await monitorRecycle(task, client: client)
+        } catch { if !Task.isCancelled { recycleError = String(reflecting: error) } }
     }
 
     private func load() async {

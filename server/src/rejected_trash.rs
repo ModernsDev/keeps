@@ -23,6 +23,8 @@ use std::{
     sync::Arc,
 };
 
+mod versions;
+
 fn error(status: u16, message: impl Into<String>) -> anyhow::Error {
     StoreError {
         status,
@@ -82,6 +84,8 @@ struct Plan {
     asset_files: BTreeMap<String, Vec<String>>,
     assets: Vec<String>,
     files: Vec<File>,
+    #[serde(default)]
+    versions: Vec<versions::Selection>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +100,8 @@ pub struct Task {
     created_at: i64,
     updated_at: i64,
     finished_at: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<versions::Selection>,
 }
 fn normalize_id(id: &str) -> Result<String> {
     Ok(uuid::Uuid::parse_str(id)
@@ -106,11 +112,12 @@ fn load(jobs: &Jobs, library: &str, id: &str) -> Result<(Task, Plan, bool)> {
     let id = normalize_id(id)?;
     let row = jobs.trash_db.lock().unwrap().query_row(
         "SELECT count,status,phase,completed_files,error,created_at,updated_at,finished_at,plan,inflight FROM rejected_trash_tasks WHERE id=?1 AND library_id=?2", params![id,library],
-        |r| Ok((Task { id: id.clone(),count:r.get::<_,i64>(0)? as usize,status:r.get(1)?,phase:r.get(2)?,completed_files:r.get::<_,i64>(3)? as usize,total_files:0,error:r.get(4)?,created_at:r.get(5)?,updated_at:r.get(6)?,finished_at:r.get(7)? },r.get::<_,String>(8)?,r.get::<_,bool>(9)?)))
+        |r| Ok((Task { id: id.clone(),count:r.get::<_,i64>(0)? as usize,status:r.get(1)?,phase:r.get(2)?,completed_files:r.get::<_,i64>(3)? as usize,total_files:0,versions:vec![],error:r.get(4)?,created_at:r.get(5)?,updated_at:r.get(6)?,finished_at:r.get(7)? },r.get::<_,String>(8)?,r.get::<_,bool>(9)?)))
         .optional()?.ok_or_else(||error(404,"找不到回收任务"))?;
     let plan: Plan = serde_json::from_str(&row.1)?;
     let mut task = row.0;
     task.total_files = plan.files.len();
+    task.versions.clone_from(&plan.versions);
     Ok((task, plan, row.2))
 }
 fn validate_paths(jobs: &Jobs, library: &str, paths: &BTreeSet<PathBuf>) -> Result<()> {
@@ -191,6 +198,7 @@ fn inventory_scope(
     validate_paths(jobs, library, &paths)?;
     validate_ownership(store, library, &assets, &paths)?;
     Ok(Plan {
+        versions: vec![],
         keeps_trash,
         soft_delete: false,
         cutoff,
@@ -282,7 +290,7 @@ fn submit(jobs: &Jobs, store: &Store, library: &str, id: &str, count: usize) -> 
         count > 0 && count == task.count,
         error(422, "输入的照片数量必须与确认窗口完全一致")
     );
-    if task.status == "failed" && task.phase != "failed" {
+    if task.status == "failed" && task.phase != "failed" && plan.versions.is_empty() {
         jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status='pending',finished_at=NULL,updated_at=unixepoch() WHERE id=?1", [&task.id])?;
         return Ok(load(jobs, library, &task.id)?.0);
     }
@@ -321,6 +329,9 @@ fn reconcile(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> Result<V
         if !Path::new(&path).try_exists()? {
             jobs.db.lock().unwrap().execute("DELETE FROM files WHERE path=?1 AND folder_id IN (SELECT id FROM folders WHERE library_id=?2)",params![path,library])?;
         }
+    }
+    if !plan.versions.is_empty() {
+        versions::reconcile_editing_negatives(store, library, &plan.versions)?;
     }
     store.reconcile_cache()?;
     let mut finished = Vec::new();
@@ -468,7 +479,7 @@ fn process(
         }
         // Metadata mutations use the same directory lock; recheck flags when resuming.
         let db = store.lock()?;
-        for asset in &plan.assets {
+        for asset in plan.assets.iter().filter(|_| plan.versions.is_empty()) {
             let rejected:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_assets WHERE library_id=?1 AND id=?2 AND ((?3=0 AND flag='rejected' AND trashed=0) OR (?3=1 AND trashed=1 AND (?4 IS NULL OR EXISTS(SELECT 1 FROM catalog_trash_entries t WHERE t.library_id=?1 AND t.asset_id=?2 AND t.trashed_at<=?4)))))",params![library,asset,plan.keeps_trash,plan.cutoff],|r|r.get(0))?;
             ensure!(rejected, error(409, "照片已不再是弃用状态，已停止回收"));
         }
@@ -483,15 +494,22 @@ fn process(
         native_started = true;
         recycle_plan(jobs, store, library, &task, &plan, &config, recycle)
     })();
-    let message = work
-        .err()
-        .map(|e| format!("{e:#}。部分文件可能已移入 NAS 回收站，请检查 File Station。"));
+    let message = work.err().map(|e| {
+        if native_started {
+            format!("{e:#}。部分文件可能已移入 NAS 回收站，请检查 File Station。")
+        } else {
+            format!("{e:#}")
+        }
+    });
     if plan.cutoff.is_some() && message.is_some() && native_started {
         jobs.trash_db.lock().unwrap().execute("INSERT INTO trash_cleanup_checks VALUES(?1,?2) ON CONFLICT(library_id) DO UPDATE SET next_check=excluded.next_check",params![library,i64::MAX])?;
     }
     transition(jobs, id, "reconciling", message.as_deref())?;
     for asset in reconcile(jobs, store, library, &plan)? {
         store.collect_asset_cache_garbage(previews, library, &asset)?;
+    }
+    if message.is_none() && !plan.versions.is_empty() {
+        versions::finish(jobs, store, library, &plan.versions)?;
     }
     transition(
         jobs,
@@ -536,15 +554,36 @@ pub(crate) fn process_next(
     let Some((id, library)) = next else {
         return Ok(false);
     };
-    if let Err(e) = process(
-        jobs,
-        store,
-        previews,
-        &library,
-        &id,
-        || fs::read_to_string("/etc/samba/smb.share.conf").context("无法读取 DSM 回收站配置"),
-        directory_trash::recycle_file,
-    ) {
+    let result = (|| -> Result<()> {
+        let plan = load(jobs, &library, &id)?.1;
+        let version_recycle = !plan.versions.is_empty();
+        process(
+            jobs,
+            store,
+            previews,
+            &library,
+            &id,
+            || {
+                let config = fs::read_to_string("/etc/samba/smb.share.conf")
+                    .context("无法读取 DSM 回收站配置")?;
+                if version_recycle {
+                    let paths: Vec<_> = plan
+                        .files
+                        .iter()
+                        .map(|file| Path::new(&file.path))
+                        .collect();
+                    directory_trash::preflight_version_recycle(&config, &paths)?;
+                }
+                Ok(config)
+            },
+            if version_recycle {
+                directory_trash::recycle_version_file
+            } else {
+                directory_trash::recycle_file
+            },
+        )
+    })();
+    if let Err(e) = result {
         tracing::error!(task=%id,error=%format!("{e:#}"),"Photo recycling reconciliation failed");
         jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status='failed',error=coalesce(error||char(10),'')||?2,finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", params![id,format!("{e:#}。索引协调失败，请手动重试。")])?;
     }
@@ -580,8 +619,16 @@ fn rejected_ids(store: &Store, library: &str) -> Result<Vec<String>> {
     Ok(store.lock()?.prepare("SELECT id FROM catalog_assets a WHERE library_id=? AND flag='rejected' AND trashed=0 AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id) ORDER BY id")?.query_map([library], |r|r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 fn current_inventory(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> Result<Plan> {
-    if plan.soft_delete {
+    if !plan.versions.is_empty() {
+        versions::inventory(
+            jobs,
+            store,
+            library,
+            plan.versions.iter().map(|s| s.pick.clone()).collect(),
+        )
+    } else if plan.soft_delete {
         Ok(Plan {
+            versions: vec![],
             keeps_trash: false,
             soft_delete: true,
             cutoff: None,
@@ -596,6 +643,7 @@ fn current_inventory(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> 
 fn soft_preview(jobs: &Jobs, store: &Store, library: &str) -> Result<Task> {
     let _guard = jobs.directory_mutation.read().unwrap();
     let plan = Plan {
+        versions: vec![],
         keeps_trash: false,
         soft_delete: true,
         cutoff: None,
@@ -695,6 +743,7 @@ pub(crate) fn cleanup_status(jobs: &Jobs, library: &str) -> Result<Option<serde_
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(versions::router())
         .route(
             "/libraries/{library}/trash/settings",
             get(settings_api).put(set_settings_api),
@@ -800,6 +849,141 @@ mod tests {
         fs::rename(path, target)?;
         Ok(())
     }
+    #[test]
+    fn confirmed_version_recycle_keeps_xmp_and_moves_exact_file_under_original_name() -> Result<()>
+    {
+        let (_tmp, jobs, store, config) = setup()?;
+        let keep = jobs.root().join("outside/photo.jpg");
+        let retire = jobs.root().join("gallery/photo.jpg");
+        let untouched = jobs.root().join("gallery/other.jpg");
+        let root = "12345678-1234-1234-1234-123456789012";
+        let winner = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"keep-jpg"));
+        let loser = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"lose-jpg"));
+        let id = photo(&store, &keep, &winner, Some(root))?;
+        assert_eq!(photo(&store, &retire, &loser, Some(root))?, id);
+        fs::write(&keep, b"keep-jpg")?;
+        fs::write(&retire, b"lose-jpg")?;
+        fs::write(&untouched, b"other")?;
+        store.choose_photo_location("lib", &id, retire.to_str().unwrap())?;
+        store.set_default_version("lib", &id, &loser)?;
+        store.lock()?.execute("UPDATE catalog_assets SET negative_hash=?1,negative_selected=1 WHERE library_id='lib' AND id=?2",params![loser,id])?;
+        let sidecar = crate::identity::ensure_known(&retire, root)?.path;
+        let xmp = fs::read(&sidecar)?;
+        let pick: versions::Pick = serde_json::from_value(json!({
+            "assetId":id, "keepPath":keep, "recyclePath":retire
+        }))?;
+        let draft = save_preview(
+            &jobs,
+            "lib",
+            &versions::inventory(&jobs, &store, "lib", vec![pick.clone()])?,
+        )?;
+        assert_eq!((draft.count, draft.total_files), (1, 1));
+        let preview = serde_json::to_value(&draft)?;
+        assert_eq!(preview["versions"][0]["changesEditingNegative"], true);
+        assert_eq!(preview["versions"][0]["changesDefault"], true);
+        assert!(submit(&jobs, &store, "lib", &draft.id, 2).is_err());
+        fs::write(&retire, b"modified")?;
+        assert!(submit(&jobs, &store, "lib", &draft.id, 1).is_err());
+        assert_eq!(fs::read(&keep)?, b"keep-jpg");
+        fs::write(&retire, b"lose-jpg")?;
+        let draft = save_preview(
+            &jobs,
+            "lib",
+            &versions::inventory(&jobs, &store, "lib", vec![pick])?,
+        )?;
+        assert_eq!(
+            submit(&jobs, &store, "lib", &draft.id, 1)?.status,
+            "pending"
+        );
+        process(
+            &jobs,
+            &store,
+            &preview_storage(&jobs)?,
+            "lib",
+            &draft.id,
+            || Ok(config),
+            |_, p| simulated_recycle(jobs.root(), p),
+        )?;
+        let finished = load(&jobs, "lib", &draft.id)?.0;
+        assert_eq!(finished.status, "completed", "{:?}", finished.error);
+        assert_eq!(
+            submit(&jobs, &store, "lib", &draft.id, 1)?.status,
+            "completed"
+        );
+        assert!(!keep.exists());
+        assert_eq!(fs::read(&retire)?, b"keep-jpg");
+        assert_eq!(
+            fs::read(jobs.root().join("#recycle/gallery/photo.jpg"))?,
+            b"lose-jpg"
+        );
+        assert_eq!(fs::read(&sidecar)?, xmp);
+        assert_eq!(fs::read(&untouched)?, b"other");
+        let versions = store.versions("lib", &id)?;
+        assert_eq!(versions["negativeContentHash"], winner);
+        let items = versions["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["contentHash"], winner);
+        assert_eq!(items[0]["isDefault"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn version_recycle_leaves_the_local_default_and_recycles_only_the_exclusive_sidecar()
+    -> Result<()> {
+        let (_tmp, jobs, store, config) = setup()?;
+        let keep = jobs.root().join("gallery/photo.heic");
+        let retire = jobs.root().join("outside/photo.heic");
+        let root = "12345678-1234-1234-1234-123456789012";
+        let winner = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"keep-one"));
+        let loser = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"lose-one"));
+        let id = photo(&store, &keep, &winner, Some(root))?;
+        assert_eq!(photo(&store, &retire, &loser, Some(root))?, id);
+        fs::write(&keep, b"keep-one")?;
+        fs::write(&retire, b"lose-one")?;
+        store.choose_photo_location("lib", &id, keep.to_str().unwrap())?;
+        store.set_default_version("lib", &id, &winner)?;
+        let kept_xmp = crate::identity::ensure_known(&keep, root)?.path;
+        let recycled_xmp = crate::identity::ensure_known(&retire, root)?.path;
+        let xmp = fs::read(&kept_xmp)?;
+        let outside_xmp = fs::read(&recycled_xmp)?;
+        let pick = serde_json::from_value(json!({
+            "assetId":id, "keepPath":keep, "recyclePath":retire
+        }))?;
+        let draft = save_preview(
+            &jobs,
+            "lib",
+            &versions::inventory(&jobs, &store, "lib", vec![pick])?,
+        )?;
+        assert_eq!((draft.count, draft.total_files), (1, 2));
+        submit(&jobs, &store, "lib", &draft.id, 1)?;
+        process(
+            &jobs,
+            &store,
+            &preview_storage(&jobs)?,
+            "lib",
+            &draft.id,
+            || Ok(config),
+            |_, p| simulated_recycle(jobs.root(), p),
+        )?;
+        let finished = load(&jobs, "lib", &draft.id)?.0;
+        assert_eq!(finished.status, "completed", "{:?}", finished.error);
+        assert_eq!(fs::read(&keep)?, b"keep-one");
+        assert_eq!(fs::read(&kept_xmp)?, xmp);
+        assert!(!retire.exists() && !recycled_xmp.exists());
+        assert_eq!(
+            fs::read(jobs.root().join("#recycle/outside/photo.heic.xmp"))?,
+            outside_xmp
+        );
+        let items = store.versions("lib", &id)?["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["contentHash"], winner);
+        assert_eq!(items[0]["isDefault"], true);
+        Ok(())
+    }
+
     #[test]
     fn startup_stops_confirmed_recycling_without_touching_originals() -> Result<()> {
         let (_tmp, jobs, store, _config) = setup()?;

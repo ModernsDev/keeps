@@ -156,8 +156,12 @@ pub fn standard_sidecar_photo_id(path: &Path) -> Result<Option<String>> {
     Ok(read_sidecar(&sidecar_path(path))?.and_then(|meta| standard_meta_photo_id(&meta)))
 }
 
+pub(crate) fn file_sidecar_photo_id(path: &Path) -> Result<Option<String>> {
+    Ok(read_sidecar(path)?.and_then(|meta| meta_photo_id(&meta)))
+}
+
 pub fn sidecar_photo_id(path: &Path) -> Result<Option<String>> {
-    Ok(read_sidecar(&sidecar_path(path))?.and_then(|meta| meta_photo_id(&meta)))
+    file_sidecar_photo_id(&sidecar_path(path))
 }
 
 fn update_meta(
