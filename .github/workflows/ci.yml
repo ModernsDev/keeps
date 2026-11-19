@@ -157,13 +157,28 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: |
-            ios/.build
-            .build/xcode-ios-ci
-          key: swift-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('ios/**/*.swift', 'ios/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'ios/**/*.pbxproj', 'ios/Version.xcconfig') }}
+          path: ios/.build
+          key: swift-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('ios/**/*.swift', 'ios/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved') }}
           restore-keys: |
             swift-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
       - run: swift test --package-path ios
+
+  ios_xcode:
+    name: iOS Simulator build
+    needs: scope
+    if: needs.scope.outputs.ios == 'true'
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/xcode-ios-ci
+          key: xcode-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('ios/**/*.swift', 'ios/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'ios/**/*.pbxproj', 'ios/Version.xcconfig') }}
+          restore-keys: |
+            xcode-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
       - name: Build iOS Simulator
         run: xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/xcode-ios-ci CODE_SIGNING_ALLOWED=NO build
 
@@ -207,7 +222,7 @@ jobs:
   keeps-ci-gate:
     name: keeps-ci-gate
     if: ${{ always() }}
-    needs: [scope, checks, server, shared, macos, macos_xcode, ios, python]
+    needs: [scope, checks, server, shared, macos, macos_xcode, ios, ios_xcode, python]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -227,8 +242,8 @@ jobs:
                   failures.append(f"{name}: expected success, got {result}")
 
           scope = jobs["scope"]["outputs"]
-          for name in ("server", "shared", "macos", "macos_xcode", "ios", "python"):
-              required = scope.get("macos" if name == "macos_xcode" else name)
+          for name in ("server", "shared", "macos", "macos_xcode", "ios", "ios_xcode", "python"):
+              required = scope.get(name.removesuffix("_xcode"))
               if required not in {"true", "false"}:
                   failures.append(f"{name}: invalid scope {required!r}")
                   continue
