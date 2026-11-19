@@ -352,8 +352,7 @@ struct DirectoryOutlineView: NSViewRepresentable {
 
         private func draggedPhotos(_ info: NSDraggingInfo, target: Any?) -> (PhotoDragPayload, String)? {
             guard let target = target as? Node,
-                  let data = info.draggingPasteboard.data(forType: NSPasteboard.PasteboardType(PhotoDragPayload.pasteboardType)),
-                  let payload = try? JSONDecoder().decode(PhotoDragPayload.self, from: data),
+                  let payload = PhotoDragPayload.read(from: info),
                   library.canMovePhotos(payload, to: target.path) else { return nil }
             return (payload, target.path)
         }

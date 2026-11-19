@@ -376,6 +376,7 @@ public struct KeepsPhotoMoveTask: Decodable, Sendable {
     public var assetIDs: [UUID]
     public var sourcePath: String?
     public var parentPath: String
+    public var fromTrash: Bool?
     public var status: String
     public var phase: String
     public var error: String?
