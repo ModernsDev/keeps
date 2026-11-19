@@ -25,7 +25,18 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 2
           persist-credentials: false
+      - name: Select CodeQL upload mode for pull requests
+        id: upload
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git cat-file -e "${BASE_SHA}^{commit}"
+          if ! git cat-file -e "$BASE_SHA:.github/workflows/codeql.yml" 2>/dev/null; then
+            echo 'mode=never' >> "$GITHUB_OUTPUT"
+          fi
       - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
           languages: ${{ matrix.language }}
@@ -33,3 +44,4 @@ jobs:
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
           category: /language:${{ matrix.language }}
+          upload: ${{ steps.upload.outputs.mode || 'always' }}
