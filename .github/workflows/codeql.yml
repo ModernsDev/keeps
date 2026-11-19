@@ -18,6 +18,8 @@ jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
     runs-on: ${{ matrix.runner }}
+    env:
+      CODEQL_ACTION_FILE_COVERAGE_ON_PRS: ${{ matrix.language == 'swift' }}
     strategy:
       fail-fast: false
       matrix:
@@ -48,13 +50,16 @@ jobs:
       - name: Build macOS, iOS Simulator and ColorTools for Swift extraction
         if: matrix.language == 'swift'
         run: |
-          xcodebuild -project macos/Keeps.xcodeproj -scheme Keeps -configuration Debug \
-            -destination 'generic/platform=macOS' -derivedDataPath .build/codeql-macos \
-            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO SWIFT_USE_INTEGRATED_DRIVER=NO build
+          (
+            swift build --package-path macos --arch arm64 --scratch-path .build/codeql-macos
+            swift build --package-path macos/ColorTools --arch arm64 --scratch-path .build/codeql-color
+          ) &
+          macos_build=$!
           xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -configuration Debug \
             -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/codeql-ios \
-            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO SWIFT_USE_INTEGRATED_DRIVER=NO build
-          swift build --package-path macos/ColorTools --arch arm64 --scratch-path .build/codeql-color
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO \
+            SWIFT_ENABLE_COMPILE_CACHE=NO SWIFT_USE_INTEGRATED_DRIVER=NO build
+          wait "$macos_build"
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
           category: /language:${{ matrix.language }}
