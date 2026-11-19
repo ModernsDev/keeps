@@ -1951,6 +1951,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mp4_upload_finishes_with_nas_previews_and_unchanged_source() -> Result<()> {
         let dir = tempfile::tempdir()?;

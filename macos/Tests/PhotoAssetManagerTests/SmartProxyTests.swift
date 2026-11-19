@@ -127,12 +127,13 @@ private final class ProxyDownloadProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.requests.withLock { $0 += 1 }
-        responseTask = Task {
+        responseTask = Task { @Sendable [weak self] in
             do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
-            client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: 200,
+            guard let self else { return }
+            self.client?.urlProtocol(self, didReceive: HTTPURLResponse(url: self.request.url!, statusCode: 200,
                 httpVersion: nil, headerFields: ["Content-Length": String(Self.bytes.count)])!, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Self.bytes)
-            client?.urlProtocolDidFinishLoading(self)
+            self.client?.urlProtocol(self, didLoad: Self.bytes)
+            self.client?.urlProtocolDidFinishLoading(self)
         }
     }
     override func stopLoading() { responseTask?.cancel() }

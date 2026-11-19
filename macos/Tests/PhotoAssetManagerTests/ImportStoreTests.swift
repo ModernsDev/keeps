@@ -306,7 +306,7 @@ import Testing
         #expect(fixture.store.job?.id == "import-job")
         let snapshot = fixture.state.snapshot()
         #expect(snapshot.manifests.first?.files.map(\.relativePath) == ["a.MP4", "nested/b.mov"])
-        #expect(snapshot.events == ["prepare", "upload:a.MP4", "upload:nested/b.mov", "finish", "status"])
+        #expect(snapshot.events == ["prepare", "match:a.MP4", "upload:a.MP4", "match:nested/b.mov", "upload:nested/b.mov", "finish", "status"])
     }
 
     private func waitForEvent(_ event: String, state: ImportScenario) async throws {

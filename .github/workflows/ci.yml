@@ -81,7 +81,7 @@ jobs:
             rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
       - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
       - run: cargo +stable clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
-      - name: Install video metadata test dependencies
+      - name: Install video import test dependencies
         timeout-minutes: 2
         env:
           FFMPEG_VERSION: 8.1.3-2
@@ -98,6 +98,10 @@ jobs:
           test -x "$bin_dir/ffmpeg"
           test -x "$bin_dir/ffprobe"
           echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Install HEIC test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends imagemagick libheif-examples libheif-plugin-libde265 libheif-plugin-x265
       - run: cargo +stable test --manifest-path server/Cargo.toml --locked
 
   shared:
