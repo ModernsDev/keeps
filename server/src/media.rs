@@ -538,6 +538,25 @@ fn image_dimension(tags: &Value, name: &str) -> i64 {
 }
 
 fn complete_capture_time(tags: &Value, path: &Path) -> Result<Option<String>> {
+    // An explicit capture offset is stronger evidence than the server's local timezone.
+    for key in [
+        "Composite:SubSecDateTimeOriginal",
+        "EXIF:DateTimeOriginal",
+        "XMP:DateTimeOriginal",
+    ] {
+        if let Some(value) = tags[key].as_str() {
+            let utc = value.strip_suffix('Z').map(|v| format!("{v}+00:00"));
+            let offset_date = DateTime::parse_from_rfc3339(value).or_else(|_| {
+                DateTime::parse_from_str(utc.as_deref().unwrap_or(value), "%Y:%m:%d %H:%M:%S%.f%:z")
+            });
+            if let Ok(date) = offset_date {
+                return Ok(Some(
+                    date.with_timezone(&Utc)
+                        .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+                ));
+            }
+        }
+    }
     for key in [
         "Composite:SubSecDateTimeOriginal",
         "EXIF:DateTimeOriginal",
@@ -743,6 +762,33 @@ mod tests {
         assert_eq!(
             complete_capture_time(&tags, Path::new("IMG_2724.HEIC"))?,
             Some("2026-05-31T03:09:23.488Z".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_xmp_offset_precedes_naive_exif_capture_time() -> Result<()> {
+        let tags = serde_json::json!({
+            "Composite:SubSecDateTimeOriginal": "2026:05:28 07:13:33",
+            "EXIF:DateTimeOriginal": "2026:05:28 07:13:33",
+            "XMP:DateTimeOriginal": "2026:05:28 07:13:33.000-10:00"
+        });
+        assert_eq!(
+            complete_capture_time(&tags, Path::new("IMG_2501.PNG"))?,
+            Some("2026-05-28T17:13:33Z".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_exif_offset_keeps_priority_over_xmp() -> Result<()> {
+        let tags = serde_json::json!({
+            "Composite:SubSecDateTimeOriginal": "2026:05:28 07:13:33.125-10:00",
+            "XMP:DateTimeOriginal": "2026:05:28 07:13:33-04:00"
+        });
+        assert_eq!(
+            complete_capture_time(&tags, Path::new("photo.jpg"))?,
+            Some("2026-05-28T17:13:33.125Z".to_owned())
         );
         Ok(())
     }

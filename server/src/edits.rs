@@ -13,7 +13,7 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 fn error(status: u16, message: &str) -> anyhow::Error {
     StoreError {
@@ -191,6 +191,7 @@ fn state(db: &Connection, lib: &str, id: &str) -> Result<Value> {
         if let Some(receipt) = receipt {
             let receipt: Value = serde_json::from_str(&receipt)?;
             for key in [
+                "instructionsXMP",
                 "versionID",
                 "previousVersionID",
                 "sourceContentHash",
@@ -354,6 +355,113 @@ fn validate_recipe(value: &Value) -> Result<Option<String>> {
     Ok(Some(value.to_string()))
 }
 
+fn validate_instructions(v: &Value, id: &str, root: &str) -> Result<Option<String>> {
+    let Some(value) = v.get("instructionsXMP").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let xml = value
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 24 * 1024 * 1024)
+        .ok_or_else(|| error(422, "invalid edit XMP size"))?;
+    let meta = xmp_toolkit::XmpMeta::from_str(xml).map_err(|_| error(422, "invalid edit XMP"))?;
+    let property = meta
+        .property("https://keeps.photos/ns/edit/1.0/", "Edit")
+        .ok_or_else(|| error(422, "missing Keeps edit instructions"))?;
+    let edit: Value = serde_json::from_str(&property.value)
+        .map_err(|_| error(422, "invalid edit instructions"))?;
+    let matches_id = |value: &Value, expected: &str| {
+        value.as_str().and_then(|s| uuid::Uuid::parse_str(s).ok())
+            == uuid::Uuid::parse_str(expected).ok()
+    };
+    if edit["schema"] != 1
+        || !matches_id(&edit["assetID"], id)
+        || !matches_id(&edit["rootID"], root)
+        || !matches_id(&edit["versionID"], v["requestID"].as_str().unwrap_or(""))
+        || edit["negativeHash"] != v["negativeContentHash"]
+        || !edit["sourceVersion"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.len() < 512)
+    {
+        return Err(error(422, "edit XMP identity does not match commit"));
+    }
+    match edit["operation"].as_str() {
+        Some("geometry") => {
+            if !edit["quarterTurns"]
+                .as_i64()
+                .is_some_and(|v| (-3..=3).contains(&v))
+            {
+                return Err(error(422, "invalid edit rotation"));
+            }
+            if !edit["crop"].is_null() {
+                let crop = &edit["crop"];
+                let values: Option<Vec<f64>> = [&crop[0][0], &crop[0][1], &crop[1][0], &crop[1][1]]
+                    .iter()
+                    .map(|v| v.as_f64())
+                    .collect();
+                let valid = values.is_some_and(|v| {
+                    v.iter().all(|v| v.is_finite())
+                        && v[0] >= 0.0
+                        && v[1] >= 0.0
+                        && v[2] > 0.0
+                        && v[3] > 0.0
+                        && v[0] + v[2] <= 1.0
+                        && v[1] + v[3] <= 1.0
+                });
+                if !valid {
+                    return Err(error(422, "invalid normalized crop"));
+                }
+            }
+        }
+        Some("exposure")
+            if edit["exposureEV"] == v["exposureEV"]
+                && edit["exposureEV"]
+                    .as_f64()
+                    .is_some_and(|e| e.is_finite() && (-2.0..=2.0).contains(&e)) => {}
+        Some("displayExposure")
+            if edit["exposureEV"]
+                .as_f64()
+                .is_some_and(|e| e.is_finite() && (-2.0..=2.0).contains(&e)) => {}
+        Some("color") if edit["recipe"] == v["recipe"] && !edit["recipe"].is_null() => {}
+        _ => return Err(error(422, "edit XMP parameters do not match commit")),
+    }
+    Ok(Some(xml.to_owned()))
+}
+
+fn persist_instructions(s: &AppState, lib: &str, id: &str, request: &str, xml: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let key = format!(
+        "edits/{:x}/{}/{}.xmp",
+        Sha256::digest(lib.as_bytes()),
+        uuid::Uuid::parse_str(id)?,
+        uuid::Uuid::parse_str(request)?
+    );
+    let path = s.previews.edit_instructions_path(&key)?;
+    match path.canonicalize() {
+        Ok(existing) => {
+            if !existing.starts_with(s.previews.keeps_root()) {
+                return Err(error(422, "edit instructions path outside storage root"));
+            }
+            ensure!(existing == path, "edit instructions path changed");
+            ensure!(
+                std::fs::read_to_string(existing)? == xml,
+                "edit XMP request identity conflict"
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let directory = path.parent().context("edit instructions parent missing")?;
+    std::fs::create_dir_all(directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(xml.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist_noclobber(&path).map_err(|e| e.error)?;
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<Value> {
     let _directory_guard = s.jobs.directory_mutation.read().unwrap();
     let (request, revision) = validate_request(&v)?;
@@ -408,6 +516,11 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
     if current["revision"] != revision {
         return Err(error(409, "照片调整已变化，请刷新后重试"));
     }
+    let instructions = if action == "commit" {
+        validate_instructions(&v, id, current["rootID"].as_str().unwrap_or(id))?
+    } else {
+        None
+    };
     let previous: Option<(String, String, String)> = tx
         .query_row(
             "SELECT standard,thumbnail,browse FROM photo_edits WHERE library_id=? AND asset_id=?",
@@ -493,6 +606,10 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
     )?;
     let mut response = state(&tx, lib, id)?;
     if action == "commit" {
+        if let Some(xml) = instructions {
+            persist_instructions(s, lib, id, request, &xml)?;
+            response["instructionsXMP"] = json!(xml);
+        }
         response["versionID"] = json!(request);
         response["previousVersionID"] = current["currentVersionID"].clone();
         response["sourceContentHash"] = v["negativeContentHash"].clone();
@@ -563,7 +680,7 @@ pub fn router() -> Router<Arc<AppState>> {
             get(get_edit)
                 .put(commit)
                 .delete(reset)
-                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route(
             "/libraries/{library}/assets/{asset}/negative-version",
@@ -606,7 +723,7 @@ fn edit_versions(s: &AppState, lib: &str, id: &str) -> Result<Value> {
         let payload: Value = serde_json::from_str(&payload)?;
         let response: Value = serde_json::from_str(&response)?;
         let body = &payload["body"];
-        let mut item = json!({"versionID":version,"previousVersionID":response["previousVersionID"],"sourceContentHash":body["negativeContentHash"],"sourceVersionID":response["sourceVersionID"],"createdAt":response["createdAt"],"recipe":body["recipe"],"exposureEV":body["exposureEV"],"available":true});
+        let mut item = json!({"versionID":version,"previousVersionID":response["previousVersionID"],"sourceContentHash":body["negativeContentHash"],"sourceVersionID":response["sourceVersionID"],"createdAt":response["createdAt"],"recipe":body["recipe"],"exposureEV":body["exposureEV"],"instructionsXMP":body["instructionsXMP"],"available":true});
         for role in ["standard", "thumbnail", "browse"] {
             let output = body["outputs"]
                 .as_array()
@@ -931,6 +1048,55 @@ mod tests {
             original_root_names: Default::default(),
         });
         Ok((dir, s, id))
+    }
+
+    pub(super) fn instructions_xml(edit: &Value) -> Result<String> {
+        xmp_toolkit::XmpMeta::register_namespace("https://keeps.photos/ns/edit/1.0/", "keeps")?;
+        let mut meta = xmp_toolkit::XmpMeta::new()?;
+        meta.set_property(
+            "https://keeps.photos/ns/edit/1.0/",
+            "Edit",
+            &xmp_toolkit::XmpValue::new(edit.to_string()),
+        )?;
+        Ok(meta.to_string())
+    }
+
+    #[test]
+    fn edit_xmp_binds_identity_and_keeps_immutable_version_sidecars() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        let request = uuid::Uuid::new_v4().to_string();
+        let mut edit = json!({"schema":1,"assetID":id,"rootID":id,"versionID":request,
+            "negativeHash":"hash","sourceVersion":"source","operation":"geometry",
+            "quarterTurns":1,"crop":[[0.125,0.25],[0.5,0.5]]});
+        let mut input = json!({"requestID":request,"negativeContentHash":"hash",
+            "instructionsXMP":instructions_xml(&edit)?});
+        let xml = validate_instructions(&input, &id, &id)?.unwrap();
+        persist_instructions(&s, "lib", &id, &request, &xml)?;
+        persist_instructions(&s, "lib", &id, &request, &xml)?;
+        assert!(persist_instructions(&s, "lib", &id, &request, "different").is_err());
+        assert_eq!(
+            std::fs::read(s.jobs.root().join("photo.jpg"))?,
+            b"unchanged original"
+        );
+        edit["crop"] = json!([[0.9, 0.25], [0.5, 0.5]]);
+        input["instructionsXMP"] = json!(instructions_xml(&edit)?);
+        assert!(validate_instructions(&input, &id, &id).is_err());
+        edit["crop"] = Value::Null;
+        edit["assetID"] = json!(uuid::Uuid::new_v4().to_string());
+        input["instructionsXMP"] = json!(instructions_xml(&edit)?);
+        assert!(validate_instructions(&input, &id, &id).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_xmp_rejects_redirect_into_originals() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        let request = uuid::Uuid::new_v4().to_string();
+        std::os::unix::fs::symlink(s.jobs.root(), s.previews.keeps_root().join("edits"))?;
+        assert!(persist_instructions(&s, "lib", &id, &request, "<xmp/>").is_err());
+        assert_eq!(std::fs::read_dir(s.jobs.root())?.count(), 1);
+        Ok(())
     }
     fn add_version(
         s: &AppState,
@@ -1370,6 +1536,12 @@ mod render_integration {
             input.as_object_mut().unwrap().remove("exposureEV");
             input["recipe"] = json!({"engine":"darktable","engineVersion":"5.6.2","recipeJSON":"{\"exposureEV\":0.5}","xmp":"<rdf:Description darktable:xmp_version=\"5\"/>"});
         }
+        let root_id = s.store.edit_state("lib", &id)?["rootID"].clone();
+        input["instructionsXMP"] = json!(super::tests::instructions_xml(&json!({
+            "schema":1,"assetID":id,"rootID":root_id,"versionID":request,"negativeHash":hash,
+            "sourceVersion":hash,"operation":if darktable {"color"} else {"exposure"},
+            "exposureEV":input["exposureEV"],"recipe":input["recipe"]
+        }))?);
         let mut invalid = input.clone();
         invalid["outputs"][0]["width"] = json!(1);
         assert_eq!(
@@ -1404,6 +1576,11 @@ mod render_integration {
         assert_eq!(response["hasEdit"], true);
         assert_eq!(response["currentVersionID"], request);
         assert_eq!(response["versionID"], request);
+        assert_eq!(response["instructionsXMP"], input["instructionsXMP"]);
+        assert_eq!(
+            s.store.edit_state("lib", &id)?["instructionsXMP"],
+            input["instructionsXMP"]
+        );
         assert!(response["previousVersionID"].is_null());
         assert_eq!(response["sourceContentHash"], hash);
         assert_eq!(

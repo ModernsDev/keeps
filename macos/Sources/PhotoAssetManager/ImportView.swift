@@ -26,8 +26,8 @@ struct ImportView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("导入照片到 NAS").font(.title2)
-            Text("递归读取来源中的 RAW、JPG/JPEG、HEIF/HEIC 及关联 XMP。原文件保留，同名文件自动另取名称。")
+            Text("导入照片和视频到 NAS").font(.title2)
+            Text("递归读取来源中的 RAW、JPG/JPEG、HEIF/HEIC、MP4/MOV/M4V、AVI/MKV/MTS/M2TS 及关联 XMP。来源原文件保留，同名文件自动另取名称。导入逐文件校验；解码失败且与来源不一致时，以来源修复，NAS 损坏副本进入回收站。")
                 .foregroundStyle(.secondary)
             HStack {
                 Text("来源：\(store.source?.path ?? "未选择")").lineLimit(2).textSelection(.enabled)
@@ -40,11 +40,13 @@ struct ImportView: View {
                 .disabled(store.isBusy || store.manifest != nil)
             Text(store.preserveStructure
                  ? "在目标目录中保留来源文件夹内的子目录层级，不额外创建来源文件夹本身。"
-                 : "默认关闭：所有照片及关联 XMP 平铺到同一个目标文件夹。")
+                 : "默认关闭：所有照片、视频及关联 XMP 平铺到同一个目标文件夹。")
                 .font(.caption).foregroundStyle(.secondary)
             Toggle("跳过重复照片", isOn: $store.deduplicate)
                 .disabled(store.isBusy || store.manifest != nil)
-            Text("检查目标文件夹和资料库中已索引的照片。跨目录命中时跳过整组文件，并显示已有位置。")
+            Text(store.deduplicate
+                 ? "检查目标文件夹和资料库中已索引的照片和视频。跨目录命中时跳过整组文件，并显示已有位置。"
+                 : "照片、视频和 XMP 保持配对，同名冲突整组改名。")
                 .font(.caption).foregroundStyle(.secondary)
             Divider()
             Text(store.message).textSelection(.enabled)
@@ -66,11 +68,11 @@ struct ImportView: View {
                 ProgressView("NAS 保存文件", value: Double(store.publishedFiles), total: Double(max(1, store.fileCount)))
                 ProgressView("元数据", value: Double(store.indexedFiles), total: Double(max(1, store.indexTotal)))
                     .progressViewStyle(.linear)
-                Text("\(store.indexedFiles) / \(store.indexTotal) 张照片")
+                Text("\(store.indexedFiles) / \(store.indexTotal) 项媒体")
                     .font(.caption).foregroundStyle(.secondary)
                 ProgressView("缩略图", value: Double(store.thumbnailCompleted), total: Double(max(1, store.thumbnailTotal)))
                     .progressViewStyle(.linear)
-                Text("\(store.thumbnailCompleted) / \(store.thumbnailTotal) 张照片")
+                Text("\(store.thumbnailCompleted) / \(store.thumbnailTotal) 项媒体")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if store.fileCount > 0 {
@@ -83,7 +85,7 @@ struct ImportView: View {
                 ScrollView { Text(error).foregroundStyle(.red).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
                     .frame(maxHeight: 100)
             }
-            Text("导入进度自动保存。断网、退出或休眠后可继续同一批次；Mac 失联一小时后 NAS 接手缩略图。")
+            Text("导入进度自动保存。断网、退出或休眠后可继续同一批次；视频缩略图由 NAS 生成；照片由 Mac 处理，失联一小时后 NAS 接手。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 if !importInProgress {

@@ -125,6 +125,28 @@ struct AICullingTests {
         #expect(restored.session == nil)
     }
 
+    @MainActor @Test func startsAtSelectedPhotoAndResetsSession() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = KeepsConfiguration(baseURL: URL(string: "https://directory.invalid")!, libraryID: "test")
+        let transport = URLSessionConfiguration.ephemeral
+        transport.protocolClasses = [DirectoryCullingProtocol.self]
+        let network = URLSession(configuration: transport)
+        defer { network.invalidateAndCancel() }
+        let store = AICullingStore(root: root)
+        store.configure(configuration)
+        store.startDirectory(client: KeepsClient(configuration: configuration, session: network),
+            path: "/photos/direct", recursive: false, instruction: "", showHidden: true,
+            startingAt: UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+        for _ in 0..<200 where store.busy { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(store.error == nil)
+        #expect(store.session?.assets.map(\.originalFilename) == ["second.jpg"])
+        store.reset()
+        let reopened = AICullingStore(root: root)
+        reopened.configure(configuration)
+        #expect(reopened.session == nil)
+    }
+
     @MainActor @Test func resumesFullySavedKeepAllDecisionWithoutRepeatingMutations() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

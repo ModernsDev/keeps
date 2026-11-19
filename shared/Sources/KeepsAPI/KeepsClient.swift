@@ -283,11 +283,24 @@ public final class KeepsClient: Sendable {
         let (data, response) = try await session.data(for: request)
         return try JSONDecoder().decode(KeepsImportBatch.self, from: checkedData(data, response))
     }
-    public func uploadImportFile(batchID: UUID, fileID: UUID, source: URL, progress: @escaping @Sendable (Int64) -> Void) async throws {
+    public func uploadImportFile(batchID: UUID, fileID: UUID, source: URL, sha256: String? = nil, progress: @escaping @Sendable (Int64) -> Void) async throws {
         var request = try makeRequest("PUT", library + ["imports", batchID.uuidString, "files", fileID.uuidString])
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(sha256, forHTTPHeaderField: "X-Keeps-Source-SHA256")
         request.timeoutInterval = 3600
         let (data, response) = try await session.upload(for: request, fromFile: source, delegate: KeepsUploadProgress(progress))
+        _ = try checkedData(data, response)
+    }
+    public func importRepairSource(batchID: UUID, taskID: String) async throws -> KeepsImportRepairSource {
+        try await request("GET", library + ["imports", batchID.uuidString, "repair-source", taskID])
+    }
+    public func repairImportFile(batchID: UUID, fileID: UUID, source: URL, sha256: String, replacedSHA256: String) async throws {
+        var request = try makeRequest("PUT", library + ["imports", batchID.uuidString, "files", fileID.uuidString, "repair"])
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(sha256, forHTTPHeaderField: "X-Keeps-Source-SHA256")
+        request.setValue(replacedSHA256, forHTTPHeaderField: "X-Keeps-Replaced-SHA256")
+        request.timeoutInterval = 3600
+        let (data, response) = try await session.upload(for: request, fromFile: source)
         _ = try checkedData(data, response)
     }
     public func finishImport(id: UUID) async throws -> KeepsImportFinish {

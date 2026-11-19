@@ -45,6 +45,7 @@ struct AICullingView: View {
         }
         .task {
             if let configuration = library.configuration { store.configure(configuration) }
+            store.reset()
             preferences = store.preferences
             instruction = store.session?.instruction ?? ""
             library.isCullingActive = true
@@ -54,7 +55,7 @@ struct AICullingView: View {
             await CullingFullSizeCache.shared.prefetch(assets: preloadAssets, configuration: configuration)
         }
         .onDisappear {
-            store.cancel(); library.isCullingActive = false; library.refresh(force: true)
+            store.reset(); library.isCullingActive = false; library.refresh(force: true)
             Task { await CullingFullSizeCache.shared.cancel() }
         }
     }
@@ -82,7 +83,7 @@ struct AICullingView: View {
                 if let session = store.session {
                     Text("\(session.completed)/\(session.assets.count)").foregroundStyle(.secondary).monospacedDigit()
                 }
-                Button("稍后继续") { returnToLibrary() }.disabled(store.busy)
+                Button("关闭") { returnToLibrary() }.disabled(store.busy)
             }.controlSize(.small)
             if store.session == nil {
                 setup
@@ -101,7 +102,7 @@ struct AICullingView: View {
                 reviewActions.disabled(store.loadFailed)
             } else {
                 Spacer()
-                Text(store.paused ? "已保存进度，继续后 AI 会带你看下一组。" : "AI 将继续整理目录中的下一组照片。")
+                Text(store.paused ? "继续后 AI 会带你看下一组。" : "AI 将继续整理目录中的下一组照片。")
                     .foregroundStyle(.secondary)
                 Button(store.error == nil ? "继续筛片" : "重试分析") { analyze() }
                     .disabled(store.busy)
@@ -216,14 +217,15 @@ struct AICullingView: View {
                 Toggle("包含子目录", isOn: $includeSubdirectories)
                 if let preferenceError { Text(preferenceError).foregroundStyle(.red).textSelection(.enabled) }
                 Button("保存偏好并开始此目录") {
-                    guard let client = library.client, let path = library.query.directory else { return }
+                    guard let client = library.client, let path = library.cullingDirectory else { return }
                     do {
                         try store.savePreferences(preferences)
                         preferenceError = nil
                         store.startDirectory(client: client, path: path, recursive: includeSubdirectories,
-                            instruction: instruction, showHidden: !library.hiddenDirectoryFilterEnabled)
+                            instruction: instruction, showHidden: !library.hiddenDirectoryFilterEnabled,
+                            startingAt: library.selectedAsset?.id)
                     } catch { preferenceError = String(reflecting: error) }
-                }.disabled(library.query.directory == nil || store.busy || store.loadFailed)
+                }.disabled(library.cullingDirectory == nil || store.busy || store.loadFailed)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(2)

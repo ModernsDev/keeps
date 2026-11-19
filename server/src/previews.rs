@@ -209,13 +209,14 @@ impl PreviewStorage {
             let message = error.to_string();
             error.context(PreviewError::input(message))
         })?;
-        let mut path = self.root.clone();
-        reject_symlink(&path)?;
-        for part in Path::new(key).components() {
-            path.push(part);
-            reject_symlink(&path)?;
+        path_without_symlinks(&self.root, key)
+    }
+
+    pub(crate) fn edit_instructions_path(&self, key: &str) -> Result<PathBuf> {
+        if key.contains("..") || Path::new(key).is_absolute() {
+            bail!("invalid edit instructions path");
         }
-        Ok(path)
+        path_without_symlinks(self.keeps_root(), key)
     }
 
     pub(crate) fn signed_url(&self, object: &Value, operation: &str) -> Result<String> {
@@ -379,6 +380,16 @@ fn reject_symlink(path: &Path) -> Result<()> {
         Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
     }
     Ok(())
+}
+
+fn path_without_symlinks(root: &Path, key: &str) -> Result<PathBuf> {
+    let mut path = root.to_path_buf();
+    reject_symlink(&path)?;
+    for part in Path::new(key).components() {
+        path.push(part);
+        reject_symlink(&path)?;
+    }
+    Ok(path)
 }
 
 fn resolve_future_path(path: &Path) -> Result<PathBuf> {

@@ -9,10 +9,11 @@ struct ImportSourceFile: Codable, Sendable {
 }
 
 enum ImportSource {
-    private static let photoExtensions: Set<String> = [
+    private static let mediaExtensions: Set<String> = [
         "3fr", "ari", "arw", "bay", "cr2", "cr3", "crw", "dcr", "dng", "erf", "fff", "iiq", "k25",
         "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "raf", "raw", "rw2", "rwl", "sr2",
         "srf", "srw", "heif", "heic", "hif", "jpg", "jpeg",
+        "mov", "mp4", "m4v", "avi", "mkv", "mts", "m2ts",
     ]
 
     static func scan(_ root: URL) throws -> [ImportSourceFile] {
@@ -44,11 +45,11 @@ enum ImportSource {
                 regularFiles.append(child)
             }
         }
-        let photos = regularFiles.filter { photoExtensions.contains($0.pathExtension.lowercased()) }
-        let sidecarNames = Set(photos.flatMap {
+        let media = regularFiles.filter { mediaExtensions.contains($0.pathExtension.lowercased()) }
+        let sidecarNames = Set(media.flatMap {
             [$0.deletingPathExtension().lastPathComponent.lowercased() + ".xmp", $0.lastPathComponent.lowercased() + ".xmp"]
         })
-        for file in regularFiles where photoExtensions.contains(file.pathExtension.lowercased()) || sidecarNames.contains(file.lastPathComponent.lowercased()) {
+        for file in regularFiles where mediaExtensions.contains(file.pathExtension.lowercased()) || sidecarNames.contains(file.lastPathComponent.lowercased()) {
             let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
             guard let size = attributes[.size] as? NSNumber,
                   let modifiedAt = attributes[.modificationDate] as? Date else {
@@ -63,7 +64,7 @@ enum ImportSource {
         var path = URL(fileURLWithPath: relativePath)
         if path.pathExtension.lowercased() == "xmp" {
             path.deletePathExtension()
-            if photoExtensions.contains(path.pathExtension.lowercased()) { path.deletePathExtension() }
+            if mediaExtensions.contains(path.pathExtension.lowercased()) { path.deletePathExtension() }
         } else {
             path.deletePathExtension()
         }

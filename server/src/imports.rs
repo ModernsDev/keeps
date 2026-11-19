@@ -22,6 +22,7 @@ use std::{
     sync::Arc,
 };
 use tokio::io::AsyncWriteExt;
+mod repair;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +52,8 @@ struct File {
     file_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     received_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repair: Option<repair::Repair>,
     #[serde(default)]
     skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,8 +225,9 @@ fn group(file: &InputFile) -> Result<(String, String, String)> {
         .to_ascii_lowercase();
     ensure!(
         crate::media::is_raw(path)
+            || crate::media::is_video(path)
             || ["jpg", "jpeg", "heif", "heic", "hif", "xmp"].contains(&ext.as_str()),
-        invalid("only RAW, JPEG, HEIF and associated XMP are supported")
+        invalid("only RAW, JPEG, HEIF, video and associated XMP are supported")
     );
     let mut stem = path
         .file_stem()
@@ -232,6 +236,7 @@ fn group(file: &InputFile) -> Result<(String, String, String)> {
     if ext == "xmp" {
         let p = FsPath::new(stem);
         if crate::media::is_raw(p)
+            || crate::media::is_video(p)
             || p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
                 ["jpg", "jpeg", "heif", "heic", "hif"].contains(&e.to_ascii_lowercase().as_str())
             })
@@ -440,7 +445,7 @@ fn plan_files(
             entries
                 .iter()
                 .any(|e| !e.2.to_ascii_lowercase().ends_with(".xmp")),
-            invalid("XMP must accompany a RAW, JPEG or HEIF file with the same source stem")
+            invalid("XMP must accompany a photo or video file with the same source stem")
         );
         let stem = &entries
             .iter()
@@ -485,6 +490,7 @@ fn plan_files(
                     pending_names.insert(name.to_lowercase());
                     occupied_stems.insert(destination_stem(&name));
                     files.push(File {
+                        repair: None,
                         input: input.clone(),
                         file_name: name,
                         received_sha256: if skipped { input.sha256.clone() } else { None },
@@ -532,6 +538,7 @@ fn plan_files(
                 reserved.insert(name.to_lowercase());
                 pending_names.insert(name.to_lowercase());
                 files.push(File {
+                    repair: None,
                     input: input.clone(),
                     file_name: name,
                     received_sha256: None,
@@ -688,6 +695,7 @@ fn matching_existing_group(
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(repair::router())
         .route(
             "/libraries/{library}/imports",
             post(prepare_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
@@ -1086,6 +1094,9 @@ fn reserve_compute(state: &AppState, library: &str, batch: &Batch, worker: &str)
         .iter()
         .filter(|file| file.duplicate_path.is_none())
     {
+        if !crate::media::is_photo(FsPath::new(&file.file_name)) {
+            continue;
+        }
         let path = FsPath::new(&batch.target_path)
             .join(&file.file_name)
             .to_string_lossy()
@@ -1121,8 +1132,10 @@ async fn compute_heartbeat(
 async fn upload(
     State(state): State<Arc<AppState>>,
     Path((library, id, file_id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
     mut body: Body,
 ) -> Result<Json<Value>, ApiError> {
+    let source_hash = repair::optional_hash(&headers, "x-keeps-source-sha256")?;
     let id = uuid(&id)?;
     let file_id = uuid(&file_id)?;
     let jobs = state.jobs.clone();
@@ -1147,6 +1160,12 @@ async fn upload(
     .await
     .map_err(anyhow::Error::from)??;
     if file.uploaded {
+        if source_hash
+            .as_ref()
+            .is_some_and(|hash| file.received_sha256.as_ref() != Some(hash))
+        {
+            return Err(conflict("uploaded source checksum differs; repair required").into());
+        }
         return Ok(Json(json!({"uploaded":true})));
     }
     let temporary = tempfile::Builder::new()
@@ -1170,6 +1189,9 @@ async fn upload(
     }
     let received_sha256 = format!("{:x}", hash.finalize());
     if size != file.input.size
+        || source_hash
+            .as_ref()
+            .is_some_and(|expected| expected != &received_sha256)
         || file
             .received_sha256
             .as_ref()
@@ -1181,6 +1203,11 @@ async fn upload(
     writer.sync_all().await.map_err(anyhow::Error::from)?;
     drop(writer);
     tokio::task::spawn_blocking(move || -> Result<()> {
+        ensure!(
+            crate::media::sha256_file(temporary.path())? == received_sha256,
+            invalid("uploaded file failed disk SHA256 verification")
+        );
+        let _import = state.jobs.import_mutation.lock().unwrap();
         let destination = target(&state.jobs, &library, &batch.target_path)?;
         let db = state.jobs.db.lock().unwrap();
         let mut current = load(&db, &library, &id)?;
@@ -1263,6 +1290,12 @@ fn status(jobs: &Jobs, library: &str, id: &str) -> Result<Value> {
 fn pipeline_status(state: &AppState, library: &str, id: &str) -> Result<Value> {
     let mut response = status(&state.jobs, library, id)?;
     let batch = load(&state.jobs.db.lock().unwrap(), library, id)?;
+    if batch.files.iter().any(|file| file.repair.is_some()) {
+        if batch.finish_error.is_none() {
+            response["status"] = json!("repairing");
+        }
+        return Ok(response);
+    }
     let db = state.store.read()?;
     let paths: Vec<String> = batch
         .files
@@ -1405,6 +1438,7 @@ async fn finish(
     let retry_library = library.clone();
     let retry_id = id.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
+        let _import = retry_state.jobs.import_mutation.lock().unwrap();
         if pipeline_status(&retry_state,&retry_library,&retry_id)?["status"] != "failed" { return Ok(()); }
         let mut batch = load(&retry_state.jobs.db.lock().unwrap(),&retry_library,&retry_id)?;
         if !batch.finished { return Ok(()); }
@@ -1420,6 +1454,7 @@ async fn finish(
     }).await.map_err(anyhow::Error::from)??;
     let (jobs, lib, batch_id) = (state.jobs.clone(), library.clone(), id.clone());
     tokio::task::spawn_blocking(move || -> Result<()> {
+        let _import = jobs.import_mutation.lock().unwrap();
         let db = jobs.db.lock().unwrap();
         let mut batch = load(&db, &lib, &batch_id)?;
         ensure!(
@@ -1449,11 +1484,15 @@ async fn finish(
 }
 
 pub fn interrupt_pending(jobs: &Jobs) -> Result<()> {
-    jobs.db.lock().unwrap().execute("UPDATE imports SET manifest=json_set(manifest,'$.finishError','服务已重启，导入已中断；请在客户端手动继续导入。') WHERE json_extract(manifest,'$.finished')=0 AND json_extract(manifest,'$.finishError') IS NULL", [])?;
+    jobs.db.lock().unwrap().execute("UPDATE imports SET manifest=json_set(manifest,'$.finishError','服务已重启，导入已中断；请在客户端手动继续导入。') WHERE json_extract(manifest,'$.finished')=0 AND json_extract(manifest,'$.finishError') IS NULL AND NOT EXISTS(SELECT 1 FROM json_each(manifest,'$.files') WHERE json_extract(value,'$.repair') IS NOT NULL)", [])?;
     Ok(())
 }
 
-pub fn run(jobs: Arc<Jobs>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+pub fn run(
+    jobs: Arc<Jobs>,
+    store: Arc<crate::store::Store>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
         let pending = {
@@ -1475,7 +1514,13 @@ pub fn run(jobs: Arc<Jobs>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<
             if current.finished || current.finish_error.is_some() {
                 continue;
             }
-            if let Err(error) = execute_finish(&jobs, &library, &id, Some(&stop)) {
+            let result = repair::execute(&jobs, &store, &library, &id)
+                .and_then(|_| execute_finish(&jobs, &library, &id, Some(&stop)));
+            if let Err(error) = result {
+                let db = jobs.db.lock().unwrap();
+                let mut failed = load(&db, &library, &id)?;
+                failed.finish_error = Some(format!("{error:#}"));
+                save(&db, &library, &failed)?;
                 tracing::error!(batch = %id, error = %format!("{error:#}"), "Import publishing failed");
             }
         }
@@ -1601,6 +1646,9 @@ fn finish_batch(
     let _directory_guard = jobs.directory_mutation.read().unwrap();
     crate::directory_move::ensure_reconciled(jobs)?;
     let batch = load(&jobs.db.lock().unwrap(), library, id)?;
+    if batch.files.iter().any(|file| file.repair.is_some()) {
+        return Ok(json!({"status":"repairing"}));
+    }
     if let Some(job_id) = batch.job_id {
         return Ok(json!({"job":jobs.job(&job_id)?}));
     }
@@ -1827,7 +1875,7 @@ fn destination_stem(name: &str) -> String {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("xmp"))
-        && crate::media::is_photo(FsPath::new(stem))
+        && (crate::media::is_photo(FsPath::new(stem)) || crate::media::is_video(FsPath::new(stem)))
     {
         FsPath::new(stem)
             .file_stem()
@@ -1865,6 +1913,153 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn video_formats_keep_sidecars_together_on_collision() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), dir.path())?;
+        jobs.add_folder("lib", ".")?;
+        for ext in ["MP4", "mov", "m4v", "avi", "mkv", "mts", "m2ts"] {
+            let name = format!("clip.{ext}");
+            let sidecar = format!("{name}.xmp");
+            let batch = prepare(
+                &jobs,
+                "lib",
+                structure_input(jobs.root(), &[&name, &sidecar, "clip.xmp"], false),
+            )?;
+            assert_eq!(batch.files.len(), 3);
+            let stems: HashSet<_> = batch
+                .files
+                .iter()
+                .map(|f| destination_stem(&f.file_name))
+                .collect();
+            assert_eq!(stems.len(), 1);
+            assert_eq!(
+                group(&batch.files[0].input)?.0,
+                group(&batch.files[1].input)?.0
+            );
+        }
+        assert!(
+            prepare(
+                &jobs,
+                "lib",
+                structure_input(jobs.root(), &["orphan.mp4.xmp"], false)
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mp4_upload_finishes_with_nas_previews_and_unchanged_source() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let originals = dir.path().join("photos");
+        std::fs::create_dir(&originals)?;
+        let source = dir.path().join("source.mp4");
+        let generated = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=96x64:d=0.2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .status()?;
+        ensure!(generated.success(), "generate test MP4");
+        let bytes = std::fs::read(&source)?;
+        let keeps = dir.path().join("keeps");
+        let state = Arc::new(AppState {
+            previews: Arc::new(crate::previews::PreviewStorage::new(
+                &keeps,
+                Some(&originals),
+                "http://localhost",
+                "test",
+            )?),
+            store: Arc::new(crate::store::Store::open(
+                &keeps.join("db/control.sqlite"),
+                true,
+            )?),
+            jobs: Arc::new(Jobs::open(&keeps.join("db/jobs.sqlite"), &originals)?),
+            access_token: String::new(),
+            library_id: "lib".into(),
+            original_root_names: Default::default(),
+        });
+        state.jobs.add_folder("lib", ".")?;
+        let mut input = structure_input(state.jobs.root(), &["clip.MP4"], false);
+        input.files[0].size = bytes.len() as u64;
+        input.files[0].sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+        let batch = prepare(&state.jobs, "lib", input)?;
+        reserve_compute(&state, "lib", &batch, "mac")?;
+        let leases: i64 = state.store.lock()?.query_row(
+            "SELECT count(*) FROM import_compute_leases",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(leases, 0);
+        let _ = upload(
+            State(state.clone()),
+            Path((
+                "lib".into(),
+                batch.id.clone(),
+                batch.files[0].input.id.clone(),
+            )),
+            axum::http::HeaderMap::new(),
+            Body::from(bytes.clone()),
+        )
+        .await
+        .ok()
+        .context("upload test MP4")?;
+        let _ = finish(
+            State(state.clone()),
+            Path(("lib".into(), batch.id.clone())),
+            Query(FinishQuery {
+                asynchronous: false,
+            }),
+        )
+        .await
+        .ok()
+        .context("finish test MP4")?;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        while let Some(job) = state.jobs.claim_next()? {
+            assert!(crate::worker::run_one(
+                &state.store,
+                &state.jobs,
+                &state.previews,
+                &job,
+                &stop
+            )?);
+            state.store.finish_revision_batch(&job.id, false)?;
+            state.jobs.finish(&job.id, None)?;
+        }
+        let asset: String = state.store.lock()?.query_row(
+            "SELECT asset_id FROM catalog_paths WHERE path=?",
+            [state.jobs.root().join("clip.MP4").to_str().unwrap()],
+            |r| r.get(0),
+        )?;
+        crate::cache_pipeline::process_asset(
+            &state.store,
+            &state.jobs,
+            &state.previews,
+            "lib",
+            &asset,
+        )?;
+        crate::browse_cache::process_asset(&state.store, &state.previews, "lib", &asset)?;
+        let progress = pipeline_status(&state, "lib", &batch.id)?;
+        assert_eq!(progress["status"], "finished", "{progress}");
+        assert_eq!(progress["thumbnailCompleted"], 1);
+        assert!(crate::identity::standard_sidecar_photo_id(&originals.join("clip.MP4"))?.is_some());
+        assert_eq!(std::fs::read(&source)?, bytes);
+        assert_eq!(std::fs::read(originals.join("clip.MP4"))?, bytes);
+        Ok(())
     }
 
     #[test]
@@ -2212,6 +2407,7 @@ mod tests {
                 upload(
                     State(state.clone()),
                     Path(("lib".into(), batch.id.clone(), file.input.id.clone())),
+                    axum::http::HeaderMap::new(),
                     Body::from("original")
                 )
                 .await
@@ -2263,8 +2459,8 @@ mod tests {
         let recovered = Arc::new(Jobs::open(&keeps.join("db/jobs.sqlite"), &root).unwrap());
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = std::thread::spawn({
-            let (jobs, stop) = (recovered.clone(), stop.clone());
-            move || run(jobs, stop)
+            let (jobs, store, stop) = (recovered.clone(), state.store.clone(), stop.clone());
+            move || run(jobs, store, stop)
         });
         let started = std::time::Instant::now();
         let result = loop {

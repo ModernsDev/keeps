@@ -58,13 +58,15 @@ Rust 主要模块：
 
 macOS 使用标准 Settings scene（⌘,）配置 Keeps Server 的服务地址、资料库和访问令牌；先验证服务鉴权与资产查询，成功后才持久化并切换连接。设置的“来源”页管理服务器目录追踪和手动扫描；主界面顶部的紧凑任务栏每 5 秒读取 `/libraries/{library}/task-status`，仅在后台任务等待、执行或失败时显示；可在主界面展开详情，并一键复制完整错误。任务状态只查询已提交作业，不将缓存、身份或 GC 积压视为后台任务。显示当前步骤，失败扫描可在任务栏明确重试；未发现的文件不虚构总数。任务完成且无错误后自动隐藏。设置不管理 NAS 设备、SMB 挂载或 SSH 登录。
 
-macOS 查询、两端修改及 iOS 修订号检查经过 `shared/Sources/KeepsAPI/KeepsClient.swift`；iOS 离线包任务、下载与导入由共享包的 `KeepsOfflineRebuild` 执行。iOS 浏览查询经过 `KeepsLibraryDatabase`，在 Application Support/Keeps/Catalogs 保存本地 SQLite，服务器、图库及凭据摘要决定文件身份。客户端不生成、上传或回放 ledger，不扫描原片资料库。macOS 显式导入时枚举所选文件夹并上传文件，随后通过批次范围的媒体任务 API 生成并上传两级缩略图及必要标准图；用户发起曝光调整时通过 API 下载指定底片，在客户端解码、测光和生成展示图。
+macOS 查询、两端修改及 iOS 修订号检查经过 `shared/Sources/KeepsAPI/KeepsClient.swift`；iOS 离线包任务、下载与导入由共享包的 `KeepsOfflineRebuild` 执行。iOS 浏览查询经过 `KeepsLibraryDatabase`，在 Application Support/Keeps/Catalogs 保存本地 SQLite，服务器、图库及凭据摘要决定文件身份。客户端不生成、上传或回放 ledger，不扫描原片资料库。macOS 显式导入时枚举所选文件夹并上传照片、视频及关联 XMP；照片通过批次范围的媒体任务 API 生成并上传两级缩略图及必要标准图，视频由 NAS 生成两级缩略图，不占用 Mac 计算租约；用户发起曝光调整时通过 API 下载指定底片，在客户端解码、测光和生成展示图。
 
 ### macOS 无损曝光
 
 每张照片在 NAS 保存独立底片内容版本引用。默认 Sony ARW 使用 RAW，3FR 优先使用同照片可用且非 Keeps 生成的 HEIF，没有此类 HEIF 时使用 3FR，其余选择像素数最大的有效版本；照片组完成索引后绑定，之后扫描不自动换底片。信息界面文件版本右键可更换。底片及原文件不改写；曝光记录和 standard、512px thumbnail、64px browse 保存为独立编辑结果，不占用 NAS 自动生成的原版媒体记录。
 
-Mac 使用 Core Image，仅调整曝光；下载、渲染、上传、提交阶段持久保存在 Application Support/Keeps/ExposureTasks，断网重试和重启均继续同一 requestID。服务端检查 expectedRevision，三个展示对象齐全后原子切换底片、曝光记录与图片描述，更新库及目录修订。已有调整的底片更换在 Mac 重新计算完成后一起提交；冲突保留旧展示，需用户核实后重新操作。还原只清除曝光记录，保留底片。在线图片与 iOS 离线包统一优先使用已提交编辑结果，NAS 不为曝光结果重新编码。任务完成后清理私有下载及渲染文件；跨任务底片缓存尚未实现，渲染器只接收本地文件 URL。
+Mac 使用 Core Image，仅调整曝光；下载、渲染、上传、提交阶段持久保存在 Application Support/Keeps/ExposureTasks，断网重试和重启均继续同一 requestID。服务端检查 expectedRevision，三个展示对象齐全后原子切换底片、曝光记录与图片描述，更新库及目录修订。已有调整的底片更换在 Mac 重新计算完成后一起提交；冲突保留旧展示，需用户核实后重新操作。还原只清除曝光记录，保留底片。在线图片与 iOS 离线包统一优先使用已提交编辑结果，NAS 不为曝光结果重新编码。任务完成后清理私有下载及渲染文件；曝光与 AI 调色复用 SmartProxyCache 的已校验底片，渲染器只接收本地文件 URL。
+
+macOS 单图进入后优先生成当前照片的最长边 2560px、半浮点线性 TIFF 代理，并按距离预载前后各 3 张照片和底片；离开单图或翻页取消旧窗口请求，共享下载仅在最后一个使用者取消后停止。缓存按连接、凭据、照片和源版本隔离。日常浏览、裁剪与成片曝光预览使用代理，放大检查载入完整成片并保持原图像素坐标；AI 观察 darktable 的低分辨率预览，参数仍由同一 RAW 管线应用到本机完整底片。成片曝光在当前展示版本上追加 EV，保留已有裁剪及调色；自动曝光仍从底片计算。编辑提交携带 `instructionsXMP`，Keeps XMP 命名空间保存照片根身份、编辑版本、底片摘要、精确来源版本和归一化几何／曝光／darktable 配方。NAS 在独立 `keeps/edits` 目录保留不可覆盖的版本 sidecar，并通过编辑状态与版本接口回读；不覆盖原片或其已有 sidecar。这是 Keeps 的重放契约，不声明 Adobe Camera Raw 配方兼容。裁剪再次打开优先恢复 XMP 中的完整来源与选框；本机完整来源仍须可用。
 
 长任务必须显示进度条：有可靠总量时显示真实完成量，无总量时使用线性不定进度并显示当前阶段。移动同时显示用时；导入保留文件及字节进度，后台更新、扫描和目录回收不虚构百分比。
 
@@ -366,7 +368,7 @@ Release 归档要求显式 `KEEPS_CODEX_BINARY` 与 `KEEPS_DARKTABLE_APP`，固�
 
 运行验证使用安装包内置的公开 CC0 风景 JPEG（Nick West，Landscape），许可与来源随图打包。设置流程只读取该资源，不访问用户照片库，不依赖 NAS 或样片下载缓存。资料库版本下载接口保留为受鉴权的通用只读 API，校验资产归属、追踪路径与文件状态。
 
-macOS 单图工具栏提供裁剪与 90°／180°旋转，图库右键旋转针对点击目标。几何调整使用当前完整 standard 成片，不从底片重新测光，保留现有 AI 配方或曝光值；复用三种 HEIF 展示图生成及现行编辑提交接口，不改变 schema 13。任务阶段和修订快照保存在本机 Application Support/Keeps/GeometryTasks，断线或重启继续同一 requestID，裁剪加载前后核对修订并在保存时检查版本。每次操作作用于当前展示图并重新编码 HEIF；原片不改写，已有调色配方不增加几何参数。底片引用及原片仍须可用，以满足服务器提交校验。
+macOS 单图工具栏提供原位裁剪与 90°／180°旋转，图库右键旋转针对点击目标。裁剪编辑器直接替换单图画布，不使用弹窗；首次裁剪保存完整 standard 成片至本机 GeometryTasks/CropSources，任务记录其版本、比例、方向和归一化裁剪框。再次裁剪从服务端 lastRequestID 沿本机 sourceVersion 追溯裁剪与旋转链，恢复完整源，并将裁剪框转换到当前方向；旧任务可从完整预览缓存恢复，源图缺失报错。旋转仍使用当前展示图。几何调整不从底片重新测光，保留现有 AI 配方或曝光值；复用三种 HEIF 展示图生成及现行编辑提交接口，不改变 schema 13。任务阶段和修订快照保存在本机 Application Support/Keeps/GeometryTasks，断线或重启继续同一 requestID，裁剪加载前后核对修订并在保存时检查版本。原片不改写，已有调色配方不增加几何参数。底片引用及原片仍须可用，以满足服务器提交校验。
 
 
 文件版本在既有 evidence 中保存独立 `versionID` UUID，重扫保留；生成标准图记录 `sourceVersionID`。历史记录在下一次显式处理时补齐，未处理时返回 null，读取 API 不改库。旧 contentHash 参数继续作为文件校验引用。已发布调色版本复用 `photo_edit_requests` 的提交 UUID 作为独立版本 ID；照片 UUID 固定，当前 `photo_edits` 仅是展示指针。提交回执保存版本 ID、前次发布版本 ID、底片文件摘要与时间，前次发布关系不冒充实际像素来源。替换或重置当前调色不回收历史成片，缓存 GC 保护成功提交回执中的媒体引用。旧版已被回收的文件保留记录并报告 unavailable，不伪造恢复。Mac 在生成的成片及缩略图计算摘要和上传之前，写入 XMP `OriginalDocumentID`（照片根 ID）和 `DocumentID`（此次发布 UUID），无损复制编码图像；重试相同 metadata 不改写文件。SHA-256 继续校验实际上传字节，版本缓存描述保持现有格式。

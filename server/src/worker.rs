@@ -504,9 +504,16 @@ fn process_file(
         && previous.error.is_none()
         && !previous.asset_id.is_empty()
         && store.original_is_online(&job.library_id, text, &previous.version)?
+        && let Some(current_asset_id) = store.existing_asset_for_path(&job.library_id, text)?
         && crate::identity::standard_sidecar_photo_id(path)?.as_deref()
-            == Some(store.root_id(&job.library_id, &previous.asset_id)?.as_str())
+            == Some(store.root_id(&job.library_id, &current_asset_id)?.as_str())
     {
+        // Identity merges can replace the asset without changing the indexed file.
+        if previous.asset_id != current_asset_id {
+            let mut checkpoint = previous.clone();
+            checkpoint.asset_id = current_asset_id;
+            jobs.record_metadata_result(&job.folder_id, text, &checkpoint)?;
+        }
         return Ok(false);
     }
     let mut identity_checked = false;
@@ -702,6 +709,23 @@ mod tests {
         let mut job = jobs.enqueue_manual_file(&folder.id, &path)?;
         let stop = AtomicBool::new(false);
         assert!(!process_file(&store, &jobs, &previews, &job, &path, &stop)?);
+        let mut checkpoint = jobs
+            .file_state(&folder.id, path.to_str().unwrap())?
+            .unwrap();
+        checkpoint.asset_id = "merged-away-asset".to_owned();
+        checkpoint.metadata_operation_id = Some("completed-operation".to_owned());
+        jobs.record_metadata_result(&folder.id, path.to_str().unwrap(), &checkpoint)?;
+        assert!(!process_file(&store, &jobs, &previews, &job, &path, &stop)?);
+        let refreshed = jobs
+            .file_state(&folder.id, path.to_str().unwrap())?
+            .unwrap();
+        assert_eq!(refreshed.asset_id, id);
+        assert_eq!(
+            refreshed.metadata_operation_id,
+            checkpoint.metadata_operation_id
+        );
+        assert_eq!(refreshed.version, checkpoint.version);
+        assert_eq!(refreshed.metadata_stamp, checkpoint.metadata_stamp);
         job.rebuild_media = true;
         assert!(!process_file(&store, &jobs, &previews, &job, &path, &stop)?);
         job.refresh_metadata = true;

@@ -13,7 +13,7 @@ struct GeometryTaskStatusView: View {
             ForEach(store.tasks.filter { $0.phase != .completed && $0.baseURL == configuration?.baseURL.absoluteString && $0.libraryID == configuration?.libraryID }) { task in
                 HStack {
                     if !task.failed { ProgressView().controlSize(.small) }
-                    Text(task.operation == .rotate ? "旋转照片" : "裁剪照片")
+                    Text(task.operation == .rotate ? "旋转照片" : task.operation == .exposure ? "调整曝光" : "裁剪照片")
                     Text(task.waitingForConnection ? "等待连接" : Self.label(task.phase))
                         .foregroundStyle(.secondary)
                     Spacer()

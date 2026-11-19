@@ -62,6 +62,7 @@ jobs:
     needs: scope
     if: needs.scope.outputs.server == 'true'
     runs-on: ubuntu-24.04
+    container: rust:1.94-trixie
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -73,15 +74,15 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
             server/target
-          key: rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ hashFiles('server/Cargo.toml', 'server/src/**', 'server/tests/**') }}
+          key: rust-${{ github.job }}-trixie-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ hashFiles('server/Cargo.toml', 'server/src/**', 'server/tests/**') }}
           restore-keys: |
-            rust-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
+            rust-${{ github.job }}-trixie-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
       - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
       - run: cargo +stable clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
-      - name: Install video metadata test dependencies
+      - name: Install video import test dependencies
         timeout-minutes: 2
         env:
           FFMPEG_VERSION: 8.1.3-2
@@ -98,6 +99,10 @@ jobs:
           test -x "$bin_dir/ffmpeg"
           test -x "$bin_dir/ffprobe"
           echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Install HEIC test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends imagemagick libheif-examples libheif-plugin-libde265 libheif-plugin-x265 util-linux
       - run: cargo +stable test --manifest-path server/Cargo.toml --locked
 
   shared:

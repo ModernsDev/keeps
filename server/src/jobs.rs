@@ -337,17 +337,17 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
                         bail!("excluded folder component");
                     }
                     cursor.push(name);
-                    if std::fs::symlink_metadata(&cursor)?.file_type().is_symlink() {
-                        bail!("symlinks are not allowed");
-                    }
                 }
                 Component::CurDir => {}
                 _ => bail!("invalid folder component"),
             }
         }
-        let resolved = absolute.canonicalize()?;
+        let resolved = cursor.canonicalize()?;
         if !resolved.starts_with(&self.root) || !resolved.is_dir() {
             bail!("folder must be a directory under originals root");
+        }
+        if resolved != cursor {
+            bail!("symlinks are not allowed");
         }
         Ok(resolved)
     }
@@ -514,6 +514,11 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
     pub fn enqueue_manual_file(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(
             folder_id, path, 0, false, false, false, true, "file", "manual",
+        )
+    }
+    pub(crate) fn enqueue_import_repair(&self, folder_id: &str, path: &Path) -> Result<Job> {
+        self.enqueue_scope(
+            folder_id, path, 0, true, false, false, true, "file", "manual",
         )
     }
     pub fn enqueue_manual_media_rebuild(&self, folder_id: &str, path: &Path) -> Result<Job> {
@@ -2145,6 +2150,14 @@ mod tests {
         {
             std::os::unix::fs::symlink(dir.path(), dir.path().join("originals/link")).unwrap();
             assert!(jobs.add_folder("library", "link").is_err());
+            std::fs::create_dir_all(jobs.root().join("album..archive/child")).unwrap();
+            std::os::unix::fs::symlink(
+                jobs.root().join("album..archive"),
+                jobs.root().join("alias"),
+            )
+            .unwrap();
+            assert!(jobs.add_folder("library", "alias/child").is_err());
+            assert!(jobs.add_folder("library", "album..archive/child").is_ok());
         }
     }
 }

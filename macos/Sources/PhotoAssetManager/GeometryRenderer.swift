@@ -11,10 +11,18 @@ struct GeometryRender: Codable, Sendable {
 }
 
 struct GeometryRenderer: Sendable {
-    func render(sourceURL: URL, outputDirectory: URL, quarterTurns: Int, crop: CGRect?) async throws -> GeometryRender {
+    static func rotatedCrop(_ crop: CGRect, quarterTurns: Int) -> CGRect {
+        var result = crop
+        for _ in 0..<((quarterTurns % 4 + 4) % 4) {
+            result = CGRect(x: result.minY, y: 1 - result.maxX, width: result.height, height: result.width)
+        }
+        return result
+    }
+
+    func render(sourceURL: URL, outputDirectory: URL, quarterTurns: Int, crop: CGRect?, exposureEV: Double = 0) async throws -> GeometryRender {
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let files = try await AIEditingImages.derivatives(from: sourceURL, directory: outputDirectory,
-                                                        quarterTurns: quarterTurns, crop: crop)
+                                                        quarterTurns: quarterTurns, crop: crop, exposureEV: exposureEV)
         let info = try await AIEditingImages.inspect(files["standard"]!, image: true)
         return GeometryRender(width: info.width, height: info.height, standard: files["standard"]!,
                               thumbnail: files["thumbnail"]!, browse: files["browse"]!)

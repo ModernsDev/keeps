@@ -4,6 +4,9 @@
 
 NAS 保存数据库、租约与文件发布权。Linux 主动通过 HTTPS 领取任务、下载输入、生成 HEIF，再上传 NAS；无需挂载照片目录或开放端口。已有 JPEG/HEIF 只生成缩略图，3FR 不生成标准图。编解码复用 `keeps-render` 与服务端相同的 MediaProcessor。
 
+worker 每次启动先用临时生成的 10-bit HEIF 检查实际 `keeps-render` 的缩略图像素，再开始领取任务。旧镜像的高位深 TIFF 条纹、编码器失败或异常尺寸会使启动失败；须重新构建并重建容器，不能仅重启旧容器。自检不读取图库照片。
+独立批处理入口须先在同一镜像执行 `python3 /usr/local/bin/linux_cache_worker.py --check-renderer-only`，成功后才能领取任务；此命令不需要 NAS 凭据。
+
 先显式将 NAS 的 `KEEPS_REMOTE_WORKER_ENABLED` 设为 `1` 并重启服务；未设置或为 `0` 时，服务器不向远端派发新任务。NAS 本地编码保持默认开启，两端通过同一租约避免重复处理。
 
 准备只读 token 文件（权限 0600），设置 `KEEPS_TOKEN_PATH`、`KEEPS_LIBRARY_ID`，运行：
