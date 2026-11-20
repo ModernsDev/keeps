@@ -53,6 +53,7 @@ impl Store {
         let mut connection = Connection::open_with_flags(path, flags)?;
         connection.busy_timeout(Duration::from_secs(30))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "foreign_keys", true)?;
         crate::catalog::ensure_schema(&mut connection, auto_create)?;
         // Offline maintenance SQL is captured by persistent triggers; publish before serving.
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -206,7 +207,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                24
+                25
             );
             let legacy_count: i64 = db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('ledger_events','ledger_sequence_counters','device_states','archive_receipts','sync_conflicts')", [], |r| r.get(0))?;
             assert_eq!(legacy_count, 0);

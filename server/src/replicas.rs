@@ -286,7 +286,7 @@ mod tests {
         let store = Store::open(&path, true)?;
         {
             let db = store.lock()?;
-            db.execute_batch("INSERT INTO catalog_version_revision VALUES('lib',8); INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','hash','hash','','a.jpg',0,'none',NULL,0); INSERT INTO catalog_paths VALUES('lib','/a.jpg','asset','hash','jpeg_original'); DELETE FROM catalog_revision_dirty; DROP TABLE catalog_sync_state; DROP TABLE catalog_sync_assets; DROP TABLE catalog_replicas; DROP TABLE catalog_sync_navigation; PRAGMA user_version=18;")?;
+            db.execute_batch("INSERT INTO catalog_version_revision VALUES('lib',8); INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','hash','hash','','a.jpg',0,'none',NULL,0); INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib','/a.jpg','asset','hash','jpeg_original'); DELETE FROM catalog_revision_dirty; DROP TABLE catalog_sync_state; DROP TABLE catalog_sync_assets; DROP TABLE catalog_replicas; DROP TABLE catalog_sync_navigation; PRAGMA user_version=18;")?;
         }
         drop(store);
         assert!(Store::open(&path, false).is_err());

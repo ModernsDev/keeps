@@ -8,6 +8,7 @@ pub mod media;
 mod native_metadata;
 pub mod navigation;
 mod photo_relations;
+mod physical_files;
 pub mod previews;
 mod replicas;
 pub mod revisions;

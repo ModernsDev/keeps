@@ -530,17 +530,16 @@ async fn navigation_photo_counts_are_distinct_recursive_live_catalog_counts() {
     let trashed = seed(&state, dir.path(), "trashed.jpg");
     state.store.set_trashed("photos", &trashed, true).unwrap();
     let db = rusqlite::Connection::open(dir.path().join("keeps/db/control_plane.sqlite")).unwrap();
-    db.execute("DELETE FROM catalog_paths", []).unwrap();
+    db.pragma_update(None, "foreign_keys", true).unwrap();
+    db.execute_batch("DELETE FROM catalog_physical_files; DELETE FROM catalog_asset_directories;")
+        .unwrap();
     for (relative, asset) in [
         ("foo/first.jpg", &first),
-        ("foo/年份/duplicate.jpg", &first),
+        ("foo/first.3FR", &first),
         ("foo/年份/second.jpg", &second),
         ("foo/trashed.jpg", &trashed),
-        ("foobar/first.jpg", &first),
-        ("Foo/second.jpg", &second),
-        ("旅行_%/second.jpg", &second),
     ] {
-        db.execute("INSERT INTO catalog_paths(library_id,path,asset_id,content_hash,role) VALUES('photos',?1,?2,'fixture','jpeg_original')", rusqlite::params![root.join(relative).to_str().unwrap(), asset]).unwrap();
+        db.execute("INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('photos',?1,?2,'fixture','jpeg_original')", rusqlite::params![root.join(relative).to_str().unwrap(), asset]).unwrap();
     }
     let app = router(state.clone());
     let (status, page) = call(
@@ -1899,7 +1898,74 @@ async fn cross_directory_import_skip_reports_existing_path_and_needs_no_index_jo
 }
 
 #[tokio::test]
-async fn choosing_a_legacy_location_updates_gallery_without_touching_either_file() {
+async fn disabling_import_dedup_does_not_publish_a_known_photo_in_another_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    state.jobs.add_folder("photos", ".").unwrap();
+    let root = state.jobs.root();
+    std::fs::create_dir(root.join("existing")).unwrap();
+    std::fs::create_dir(root.join("target")).unwrap();
+    let original = root.join("existing/photo.jpg");
+    std::fs::write(&original, b"original").unwrap();
+    let identity = uuid::Uuid::new_v4();
+    state.store.ingest_original("photos",original.to_str().unwrap(),
+        &json!({"contentHash":"known","sizeBytes":8,"role":"jpeg_original"}),
+        &json!({"photoID":identity,"originalFilename":"photo.jpg","contentFingerprint":"known","metadataFingerprint":"meta","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
+    ).unwrap();
+    let app = router(state.clone());
+    let batch = uuid::Uuid::new_v4();
+    let original_id = uuid::Uuid::new_v4();
+    let sidecar_id = uuid::Uuid::new_v4();
+    let sidecar = format!(
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="https://keeps.photos/photo/{identity}" /></rdf:RDF></x:xmpmeta>"#
+    );
+    let files = [
+        (original_id, "photo.jpg", b"different bytes".to_vec()),
+        (sidecar_id, "photo.jpg.xmp", sidecar.into_bytes()),
+    ];
+    let manifest = files
+        .iter()
+        .map(|(id, name, bytes)| json!({"id":id,"relativePath":name,"size":bytes.len()}))
+        .collect::<Vec<_>>();
+    let (status, prepared) = call(
+        app.clone(),
+        "POST",
+        "/libraries/photos/imports",
+        json!({"id":batch,"targetPath":root.join("target"),"deduplicate":false,"files":manifest}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{prepared}");
+    for (id, _, bytes) in files {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/libraries/photos/imports/{batch}/files/{id}"))
+                    .header("authorization", format!("Bearer {SIGNING_KEY}"))
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let (status, body) = call(
+        app,
+        "POST",
+        &format!("/libraries/photos/imports/{batch}/finish"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("照片已归属其他目录"), "{body}");
+    assert!(!root.join("target/photo.jpg").exists());
+    assert!(!root.join("target/photo.jpg.xmp").exists());
+    assert_eq!(std::fs::read(&original).unwrap(), b"original");
+}
+
+#[tokio::test]
+async fn legacy_location_endpoint_cannot_publish_an_unregistered_path() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     let root = state.jobs.root();
@@ -1911,18 +1977,16 @@ async fn choosing_a_legacy_location_updates_gallery_without_touching_either_file
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"original").unwrap();
         std::fs::write(path.with_extension("jpg.xmp"), b"xmp preserved").unwrap();
-        state.store.ingest_original("photos",path.to_str().unwrap(),
-            &json!({"contentHash":"hash","sizeBytes":8,"role":"jpeg_original"}),
-            &json!({"photoID":id,"originalFilename":"photo.jpg","contentFingerprint":"hash","metadataFingerprint":"meta","rating":3,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
-        ).unwrap();
     }
+    state.store.ingest_original("photos",first.to_str().unwrap(),
+        &json!({"contentHash":"hash","sizeBytes":8,"role":"jpeg_original"}),
+        &json!({"photoID":id,"originalFilename":"photo.jpg","contentFingerprint":"hash","metadataFingerprint":"meta","rating":3,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
+    ).unwrap();
     let app = router(state.clone());
     let route = "/libraries/photos/assets/duplicate-locations";
     let (status, body) = call(app.clone(), "GET", route, Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["items"][0]["locations"][0]["paths"], json!([first]));
-    assert_eq!(body["items"][0]["locations"][1]["paths"], json!([second]));
-    assert!(body["items"][0]["selectedPath"].is_null());
+    assert_eq!(body["items"], json!([]));
     let (status, body) = call(
         app.clone(),
         "POST",
@@ -1930,9 +1994,7 @@ async fn choosing_a_legacy_location_updates_gallery_without_touching_either_file
         json!({"path":second}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (_, body) = call(app.clone(), "GET", route, Value::Null).await;
-    assert_eq!(body["items"][0]["selectedPath"], json!(second));
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let (_, asset) = call(
         app,
         "GET",
@@ -1940,7 +2002,7 @@ async fn choosing_a_legacy_location_updates_gallery_without_touching_either_file
         Value::Null,
     )
     .await;
-    assert_eq!(asset["paths"], json!([second]));
+    assert_eq!(asset["paths"], json!([first]));
     assert_eq!(asset["rating"], 3);
     for path in [&first, &second] {
         assert_eq!(std::fs::read(path).unwrap(), b"original");
@@ -1959,7 +2021,13 @@ async fn imports_deduplicate_skips_existing_group_and_rechecks_before_finish() {
         let state = state(dir.path());
         state.jobs.add_folder("photos", ".").unwrap();
         let root = state.jobs.root().to_path_buf();
-        std::fs::write(root.join("existing.CR3"), b"original").unwrap();
+        let original = root.join("existing.CR3");
+        std::fs::write(&original, b"original").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"original"));
+        state.store.ingest_original("photos", original.to_str().unwrap(),
+            &json!({"contentHash":hash,"sizeBytes":8,"role":"raw_original"}),
+            &json!({"originalFilename":"existing.CR3","contentFingerprint":hash,"metadataFingerprint":"test","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
+        ).unwrap();
         let app = router(state.clone());
         let batch = uuid::Uuid::new_v4().to_string();
         let file = uuid::Uuid::new_v4().to_string();

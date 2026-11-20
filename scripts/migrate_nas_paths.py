@@ -98,6 +98,8 @@ def run(catalog, jobs, manifest, apply=False, backup_dir=None):
     try:
         for source in sources:
             integrity(source)
+        if sources[0].execute('PRAGMA user_version').fetchone()[0] >= 25:
+            raise ValueError('Use audit_photo_placement.py to audit schema 25 or newer; use the Keeps API to modify media')
         if apply:
             if backup_dir is None:
                 raise ValueError('--backup-dir is required with --apply')

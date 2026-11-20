@@ -886,7 +886,7 @@ mod tests {
         let id = "00000000-0000-0000-0000-000000000000";
         let path = dir.path().join("photo.jpg").to_string_lossy().into_owned();
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,?,'hash0','jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,?,'hash0','jpeg_original')",
             params![path, id],
         )?;
         store.lock()?.execute(
@@ -954,7 +954,7 @@ mod tests {
         store.cache_publish(&lib, &id, &hash, &json!({}), &json!({}))?;
         assert_eq!(store.cache_status(&lib)?["counts"]["cancelled"], 1);
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib','/photos/restored.jpg',?,?,'jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib','/photos/restored.jpg',?,?,'jpeg_original')",
             params![id, hash],
         )?;
         store.reconcile_cache()?;
@@ -973,7 +973,7 @@ mod tests {
             .lock()?
             .execute("UPDATE catalog_assets SET content_hash='new'", [])?;
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib','/photos/current.jpg',?,'new','jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib','/photos/current.jpg',?,'new','jpeg_original')",
             [&id],
         )?;
         assert!(!store.cache_failed(&lib, &id, &old, "old generation failed")?);
@@ -1018,7 +1018,7 @@ mod tests {
             .enumerate()
         {
             store.lock()?.execute(
-                "INSERT INTO catalog_paths VALUES('lib',?,?,?,'jpeg_original')",
+                "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,?,?,'jpeg_original')",
                 params![
                     path.to_str().unwrap(),
                     format!("00000000-0000-0000-0000-{index:012}"),
@@ -1109,7 +1109,7 @@ mod tests {
         store.reconcile_cache()?;
         let (lib, id, hash) = store.claim_cache()?.unwrap();
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib','/photos/live.jpg',?,?,'jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib','/photos/live.jpg',?,?,'jpeg_original')",
             params![id, hash],
         )?;
         drop(store);
@@ -1183,7 +1183,7 @@ mod tests {
             let path = originals.join(format!("{index}.jpg"));
             fs::write(&path, b"original fixture")?;
             store.lock()?.execute(
-                "INSERT INTO catalog_paths VALUES('lib',?1,?2,?3,'jpeg_original')",
+                "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?1,?2,?3,'jpeg_original')",
                 params![
                     path.to_str(),
                     format!("00000000-0000-0000-0000-{index:012}"),
@@ -1210,7 +1210,7 @@ mod tests {
                 "UPDATE media_cache SET status='processing' WHERE source_hash='hash29'",
                 [],
             )?;
-            db.execute("INSERT INTO catalog_paths VALUES('lib',?1,'00000000-0000-0000-0000-000000000026','hash26','jpeg_original')",[originals.join("deprecated.jpg").to_str()])?;
+            db.execute("INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?1,'00000000-0000-0000-0000-000000000026','hash26','jpeg_original')",[originals.join("deprecated.jpg").to_str()])?;
             db.execute("INSERT INTO catalog_deprecated_files VALUES('lib',?1,'retained','identity','duplicate')",[originals.join("deprecated.jpg").to_str()])?;
             db.execute(
                 "UPDATE catalog_assets SET trashed=1 WHERE content_hash='hash27'",
@@ -1279,7 +1279,7 @@ mod tests {
             let path = parent.join(format!("{index}.jpg"));
             fs::write(&path, b"original fixture")?;
             store.lock()?.execute(
-                "INSERT INTO catalog_paths VALUES('lib',?1,?2,?3,'jpeg_original')",
+                "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?1,?2,?3,'jpeg_original')",
                 params![
                     path.to_str(),
                     format!("00000000-0000-0000-0000-{index:012}"),
@@ -1348,7 +1348,7 @@ mod tests {
         let jpeg = dir.path().join("confirmed.jpg");
         fs::write(&jpeg, b"jpeg")?;
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,?,'jpeghash','jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,?,'jpeghash','jpeg_original')",
             params![jpeg.to_str(), id],
         )?;
         assert_eq!(

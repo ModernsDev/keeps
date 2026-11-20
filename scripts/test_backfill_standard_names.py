@@ -52,24 +52,24 @@ class BackfillTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'changed since indexing'):
                 plan(db, root)
 
-    def test_real_schema_hash_update_preserves_ready_and_dirty_revisions(self):
+    def test_managed_catalog_rejects_legacy_apply_before_publication(self):
         with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
             subprocess.run(['server/target/debug/keeps-server', 'migrate'], env={**os.environ, 'KEEPS_ROOT': temp}, check=True, capture_output=True)
-            db = sqlite3.connect(Path(temp) / 'db/control_plane.sqlite')
-            item = dict(old='/photo/old.heic', new='/photo/new.heic', oldHash='oldhash', newHash='newhash', size=123, mtimeNs=456)
-            db.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','rawhash','fp','now','RAW.ARW',0,'none',NULL,0)")
-            db.execute("INSERT INTO catalog_files VALUES('lib','asset','oldhash',1,'jpeg_original','keeps-nas','online')")
-            db.execute("INSERT INTO catalog_paths VALUES('lib','/photo/old.heic','asset','oldhash','jpeg_original')")
-            db.execute("INSERT INTO catalog_versions VALUES('lib','asset','oldhash',NULL,NULL,100,100,1,?)", [json.dumps({'generatedFrom': 'rawhash'})])
-            db.execute("INSERT INTO catalog_version_paths VALUES('lib','/photo/old.heic','asset','oldhash',1)")
-            db.execute("INSERT INTO media_cache(library_id,asset_id,source_hash,spec,status,standard) VALUES('lib','asset','rawhash','spec','ready',?)", [json.dumps({'path': item['old'], 'sizeBytes': 1, 'mtimeNs': '2'})])
-            update_database(db, 'main', [item])
-            self.assertEqual(db.execute('SELECT content_hash,size FROM catalog_files').fetchone(), ('newhash', 123))
-            status, standard = db.execute('SELECT status,standard FROM media_cache').fetchone()
-            self.assertEqual(status, 'ready')
-            self.assertEqual(json.loads(standard), {'path': item['new'], 'sizeBytes': 123, 'mtimeNs': '456'})
-            self.assertEqual(db.execute('SELECT id,content_hash,filename FROM catalog_assets').fetchone(), ('asset','rawhash','RAW.ARW'))
-            self.assertGreater(db.execute('SELECT count(*) FROM catalog_revision_dirty').fetchone()[0], 0)
+            catalog = root / 'db/control_plane.sqlite'
+            original = root / 'photo.heic'
+            original.write_bytes(b'original')
+            result = subprocess.run([
+                'python3', 'scripts/backfill_standard_names.py', '--control-db', str(catalog),
+                '--jobs-db', str(root / 'db/jobs.sqlite'), '--photo-root', temp,
+                '--plan', str(root / 'plan.json'), '--backup', str(root / 'backup'),
+                '--apply', '--service-stopped',
+            ], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Use the Keeps API', result.stderr)
+            self.assertEqual(original.read_bytes(), b'original')
+            self.assertFalse((root / 'backup').exists())
+            self.assertFalse((root / 'plan.json').exists())
 
     def test_identical_content_keeps_distinct_paths_and_asset_metadata(self):
         with tempfile.TemporaryDirectory() as temp:

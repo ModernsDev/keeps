@@ -219,6 +219,9 @@ impl Jobs {
 CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS import_file_digests(library_id TEXT NOT NULL,path TEXT NOT NULL,sha256 TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(library_id,path));
           CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,manifest TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS file_publications(library_id TEXT NOT NULL,path TEXT NOT NULL,sha256 TEXT NOT NULL,batch_id TEXT,PRIMARY KEY(library_id,path));
+          CREATE TABLE IF NOT EXISTS import_match_claims(library_id TEXT NOT NULL,kind TEXT NOT NULL,value TEXT NOT NULL,batch_id TEXT NOT NULL REFERENCES imports(id),group_id TEXT NOT NULL,path TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(library_id,kind,value));
+          CREATE INDEX IF NOT EXISTS import_match_claims_publication ON import_match_claims(library_id,path,sha256);
           CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,path TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,UNIQUE(library_id,path));
           CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,folder_id TEXT NOT NULL REFERENCES folders(id),status TEXT NOT NULL,error TEXT,processed INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,current_path TEXT,started_at INTEGER,finished_at INTEGER,created_at INTEGER NOT NULL DEFAULT(unixepoch()),updated_at INTEGER NOT NULL DEFAULT(unixepoch()));
           CREATE TABLE IF NOT EXISTS files(folder_id TEXT NOT NULL REFERENCES folders(id),path TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,asset_id TEXT NOT NULL,version TEXT NOT NULL,error TEXT,PRIMARY KEY(folder_id,path));
@@ -516,6 +519,56 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             folder_id, path, 0, false, false, false, true, "file", "manual",
         )
     }
+    pub(crate) fn permit_file(
+        db: &Connection,
+        library: &str,
+        path: &Path,
+        sha256: &str,
+        batch: Option<&str>,
+    ) -> Result<()> {
+        let path = path.to_str().context("publication path must be UTF-8")?;
+        db.execute("INSERT INTO file_publications(library_id,path,sha256,batch_id) VALUES(?,?,?,?) ON CONFLICT(library_id,path) DO UPDATE SET sha256=excluded.sha256,batch_id=excluded.batch_id", params![library,path,sha256,batch])?;
+        Ok(())
+    }
+
+    pub(crate) fn file_publication(
+        &self,
+        library: &str,
+        path: &Path,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let path = path.to_str().context("publication path must be UTF-8")?;
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT sha256,batch_id FROM file_publications WHERE library_id=? AND path=?",
+                params![library, path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn complete_file_publication(
+        &self,
+        library: &str,
+        path: &str,
+        sha256: &str,
+    ) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "DELETE FROM file_publications WHERE library_id=? AND path=? AND sha256=?",
+            params![library, path, sha256],
+        )?;
+        tx.execute(
+            "DELETE FROM import_match_claims WHERE library_id=? AND path=? AND sha256=?",
+            params![library, path, sha256],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn enqueue_import_repair(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(
             folder_id, path, 0, true, false, false, true, "file", "manual",

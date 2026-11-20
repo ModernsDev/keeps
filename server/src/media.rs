@@ -150,13 +150,21 @@ impl MediaProcessor {
         let path = path
             .canonicalize()
             .with_context(|| format!("resolving {}", path.display()))?;
-        let tags = read_tags(&path)?;
+        self.extract_with_sidecars(&path, &sidecars(&path)?)
+    }
+
+    pub(crate) fn extract_with_sidecars(
+        &self,
+        path: &Path,
+        sidecars: &[PathBuf],
+    ) -> Result<Metadata> {
+        let tags = crate::native_metadata::read_tags(path, sidecars)?;
         let text = |key: &str| tags[key].as_str().unwrap_or_default().to_owned();
         let capture_original = tags["Composite:SubSecDateTimeOriginal"]
             .as_str()
             .or_else(|| tags["EXIF:DateTimeOriginal"].as_str())
             .unwrap_or_default();
-        let capture_time = complete_capture_time(&tags, &path)?;
+        let capture_time = complete_capture_time(&tags, path)?;
         let optional_text = |keys: &[&str]| {
             keys.iter().find_map(|key| {
                 tags[*key]
@@ -471,10 +479,6 @@ fn run_with_timeout(command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn read_tags(path: &Path) -> Result<Value> {
-    crate::native_metadata::read_tags(path)
-}
-
 fn rating(tags: &Value) -> Option<i64> {
     [
         "XMP:Rating",
@@ -514,9 +518,13 @@ pub(crate) fn sidecars(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn sidecar_stamp(path: &Path) -> Result<String> {
+    sidecar_paths_stamp(&sidecars(path)?)
+}
+
+pub(crate) fn sidecar_paths_stamp(sidecars: &[PathBuf]) -> Result<String> {
     let mut entries = Vec::new();
-    for candidate in sidecars(path)? {
-        let info = std::fs::symlink_metadata(&candidate)
+    for candidate in sidecars {
+        let info = std::fs::symlink_metadata(candidate)
             .with_context(|| format!("stat sidecar {}", candidate.display()))?;
         entries.push(format!(
             "{}:{}:{}",

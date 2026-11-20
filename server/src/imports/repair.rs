@@ -302,6 +302,13 @@ fn execute_with(
             .filter(|f| f.active && f.library_id == library && output.starts_with(&f.path))
             .max_by_key(|f| f.path.len())
             .context("tracked folder disappeared")?;
+        Jobs::permit_file(
+            &jobs.db.lock().unwrap(),
+            library,
+            &output,
+            &repair.source_hash,
+            Some(&batch.id),
+        )?;
         let job = jobs.enqueue_import_repair(&folder.id, &output)?;
         let key = format!(
             "{}/{}",

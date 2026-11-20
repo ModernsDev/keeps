@@ -1124,7 +1124,7 @@ mod tests {
             ],
         )?;
         db.execute(
-            "INSERT INTO catalog_version_paths VALUES('lib',?,?,?,1)",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role,versioned) VALUES('lib',?,?,?,'jpeg_original',1)",
             params![path.to_str(), id, hash],
         )?;
         Ok(hash)
@@ -1195,10 +1195,14 @@ mod tests {
         let raw = add_version(&s, &id, "photo.3FR", 100, false)?;
         add_version(&s, &id, "photo-generated.heic", 1000, true)?;
         let missing = add_version(&s, &id, "photo-missing.HIF", 200, false)?;
-        s.store.lock()?.execute(
-            "UPDATE catalog_version_paths SET available=0 WHERE content_hash=?",
-            params![missing],
+        let db = s.store.lock()?;
+        let path = db.query_row(
+            "SELECT path FROM catalog_physical_files WHERE content_hash=?",
+            [&missing],
+            |row| row.get::<_, String>(0),
         )?;
+        crate::physical_files::withdraw(&db, "lib", &path)?;
+        drop(db);
         // Old selection left RAW-only Hasselblad groups unbound; normal indexing repairs them.
         assert!(s.store.edit_state("lib", &id)?["negativeContentHash"].is_null());
         s.store.initialize_negative("lib", &id)?;

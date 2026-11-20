@@ -121,11 +121,31 @@ fn selection(
     };
     ensure!(!sidecars_to_keep.is_empty(), error(409, "保留版本缺少 XMP"));
     for path in sidecars_to_keep.iter().chain(&sidecars_to_recycle) {
+        let identity = crate::identity::file_sidecar_photo_id(path)?;
+        let registered: Option<String> = db.query_row(
+            "SELECT content_hash FROM catalog_physical_files WHERE library_id=? AND asset_id=? AND path=? AND role='sidecar'",
+            params![library, pick.asset_id, path.to_str()],
+            |r| r.get(0),
+        ).optional()?;
+        let valid = match (identity.as_deref(), registered) {
+            (Some(id), _) => id == photo_id,
+            (None, Some(hash)) => crate::media::sha256_file(path)? == hash,
+            _ => false,
+        };
         ensure!(
-            crate::identity::file_sidecar_photo_id(path)?.as_deref() == Some(&photo_id),
+            valid,
             error(409, format!("XMP 的照片身份不符：{}", path.display()))
         );
     }
+    ensure!(
+        sidecars_to_keep
+            .iter()
+            .map(|path| crate::identity::file_sidecar_photo_id(path))
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .any(|id| id.as_deref() == Some(&photo_id)),
+        error(409, "保留版本缺少带照片 ID 的 XMP")
+    );
     let retained_files = std::iter::once(keep)
         .chain(sidecars_to_keep.iter().map(PathBuf::as_path))
         .map(File::inspect)
@@ -237,22 +257,76 @@ pub(super) fn inventory(
     })
 }
 
-pub(super) fn reconcile_editing_negatives(
+pub(super) fn withdraw_recycled_paths(
     store: &Store,
     library: &str,
     selections: &[Selection],
+    recycled: &[File],
 ) -> Result<()> {
+    let recycled: HashSet<_> = recycled.iter().map(|f| f.path.as_str()).collect();
     let mut db = store.lock()?;
     let tx = db.transaction()?;
-    for row in selections.iter().filter(|row| row.changes_editing_negative) {
-        if !Path::new(&row.pick.recycle_path).try_exists()? {
+    for row in selections {
+        for xmp in row
+            .recycle_files
+            .iter()
+            .filter(|p| *p != &row.pick.recycle_path && recycled.contains(p.as_str()))
+        {
+            ensure!(
+                !Path::new(xmp).try_exists()?,
+                error(409, "待回收 XMP 路径重新出现，停止协调")
+            );
+            let owner: Option<(String,String)> = tx.query_row(
+                "SELECT asset_id,role FROM catalog_physical_files WHERE library_id=? AND path=?",
+                params![library,xmp], |r| Ok((r.get(0)?,r.get(1)?)),
+            ).optional()?;
+            ensure!(
+                owner.is_none_or(|(asset, role)| asset == row.pick.asset_id && role == "sidecar"),
+                error(409, "待回收 XMP 的图库归属已变化")
+            );
+            crate::physical_files::withdraw(&tx, library, xmp)?;
+        }
+    }
+    for row in selections
+        .iter()
+        .filter(|row| recycled.contains(row.pick.recycle_path.as_str()))
+    {
+        let path = &row.pick.recycle_path;
+        let asset = &row.pick.asset_id;
+        ensure!(
+            !Path::new(path).try_exists()?,
+            error(409, "待回收路径重新出现，停止协调")
+        );
+        let indexed: Option<(String,String,String)> = tx.query_row(
+            "SELECT asset_id,content_hash,role FROM catalog_paths WHERE library_id=? AND path=?",
+            params![library,path], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        if let Some((owner, hash, role)) = indexed {
+            ensure!(
+                owner == *asset && hash == row.recycle_hash,
+                error(409, "待回收路径的图库归属已变化")
+            );
+            crate::versions::missing_path(&tx, library, asset, path)?;
+            tx.execute(
+                "UPDATE catalog_files AS f SET availability='missing' WHERE library_id=?1 AND asset_id=?2 AND content_hash=?3 AND role=?4 AND holder='keeps-nas' AND NOT EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=f.library_id AND p.asset_id=f.asset_id AND p.content_hash=f.content_hash AND p.role=f.role)",
+                params![library,asset,hash,role],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM catalog_version_path_history WHERE library_id=? AND path=? AND asset_id=? AND content_hash=?",
+            params![library,path,asset,row.recycle_hash],
+        )?;
+        if row.changes_default {
+            crate::versions::select_default(&tx, library, asset, &row.keep_hash)?;
+        }
+        if row.changes_editing_negative {
             ensure!(tx.execute("UPDATE catalog_assets SET negative_hash=?4,edit_revision=edit_revision+1,last_edit_request=NULL
                  WHERE library_id=?1 AND id=?2 AND negative_hash=?3
                  AND NOT EXISTS(SELECT 1 FROM photo_edits WHERE library_id=?1 AND asset_id=?2)",
-                 params![library,row.pick.asset_id,row.recycle_hash,row.keep_hash])? == 1
-                 || tx.query_row("SELECT negative_hash=?3 FROM catalog_assets WHERE library_id=?1 AND id=?2",
-                    params![library,row.pick.asset_id,row.keep_hash], |r|r.get::<_,bool>(0))?,
-                 error(409,"编辑底片已变化，停止归并"));
+                params![library,asset,row.recycle_hash,row.keep_hash])? == 1
+                || tx.query_row("SELECT negative_hash=?3 FROM catalog_assets WHERE library_id=?1 AND id=?2",
+                    params![library,asset,row.keep_hash], |r|r.get::<_,bool>(0))?,
+                error(409,"编辑底片已变化，停止归并"));
         }
     }
     crate::revisions::flush(&tx)?;
@@ -282,18 +356,11 @@ pub(super) fn finish(
             });
         }
     }
-    {
-        let mut db = store.lock()?;
-        let tx = db.transaction()?;
-        for row in selections {
-            ensure!(
-                !Path::new(&row.pick.recycle_path).try_exists()?,
-                error(409, "待回收路径重新出现，停止归位")
-            );
-            tx.execute("DELETE FROM catalog_version_paths WHERE library_id=?1 AND asset_id=?2 AND path=?3 AND content_hash=?4 AND available=0",
-                params![library,row.pick.asset_id,row.pick.recycle_path,row.recycle_hash])?;
-        }
-        tx.commit()?;
+    for row in selections {
+        ensure!(
+            !Path::new(&row.pick.recycle_path).try_exists()?,
+            error(409, "待回收路径重新出现，停止归位")
+        );
     }
     crate::asset_move::preflight(jobs, store, library, &moves)?;
     crate::asset_move::move_files(jobs, store, library, moves, || Ok(()))?;
@@ -306,9 +373,6 @@ pub(super) fn finish(
             != Path::new(&row.destination).parent()
         {
             store.choose_photo_location(library, &row.pick.asset_id, &row.destination)?;
-        }
-        if row.changes_default {
-            store.set_default_version(library, &row.pick.asset_id, &row.keep_hash)?;
         }
         ensure!(
             crate::media::sha256_file(Path::new(&row.destination))? == row.keep_hash,

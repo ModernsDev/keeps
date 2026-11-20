@@ -997,7 +997,7 @@ mod tests {
                 .unwrap(),
         )?;
         let retained = seed(&app, root.path(), "B0014325.HEIC");
-        let removed = seed(&app, root.path(), "duplicate/other.3FR");
+        let removed = seed(&app, root.path(), "other.3FR");
         let unchanged = seed(&app, root.path(), "unchanged.jpg");
         let manager = manager(app.clone());
         let replica = Uuid::new_v4();
@@ -1022,7 +1022,7 @@ mod tests {
                 chrono::Utc::now().timestamp(),
             )?;
             tx.execute(
-                "UPDATE catalog_paths SET asset_id=? WHERE asset_id=?",
+                "UPDATE catalog_physical_files SET asset_id=? WHERE asset_id=?",
                 params![retained, removed],
             )?;
             tx.execute("DELETE FROM catalog_assets WHERE id=?", [&removed])?;
@@ -1116,7 +1116,7 @@ mod tests {
                 [retained.to_uppercase()],
                 |r| r.get::<_, i64>(0)
             )?,
-            1
+            2
         );
         let mut db = app.store.lock()?;
         let tx = db.transaction()?;
@@ -1311,19 +1311,20 @@ mod tests {
     }
 
     #[test]
-    fn schema_v24_republishes_existing_cross_directory_paths_for_offline_sync() -> Result<()> {
+    fn schema_v24_republishes_legacy_paths_and_schema_v25_rejects_cross_directory_ownership()
+    -> Result<()> {
         let root = tempfile::tempdir()?;
         let app = fixture(root.path());
         let id = seed(&app, root.path(), "primary/photo.jpg");
         let alias = app.jobs.root().join("copy/photo.jpg");
         let mut db = app.store.lock()?;
+        crate::physical_files::restore_legacy_path_tables(&db)?;
         {
             let tx = db.transaction()?;
             tx.execute(
-                "INSERT INTO catalog_paths VALUES('photos',?,?,'primary/photo.jpg','jpeg_original')",
+                "INSERT INTO catalog_paths(library_id,path,asset_id,content_hash,role) VALUES('photos',?,?,'primary/photo.jpg','jpeg_original')",
                 params![alias.to_str(), id],
             )?;
-            crate::revisions::flush(&tx)?;
             tx.commit()?;
         }
         let before: i64 = db.query_row(
@@ -1331,7 +1332,17 @@ mod tests {
             [&id],
             |r| r.get(0),
         )?;
-        db.execute_batch("DROP VIEW catalog_asset_locations; PRAGMA user_version=23;")?;
+        db.pragma_update(None, "user_version", 23)?;
+        assert!(crate::catalog::ensure_schema(&mut db, true).is_err());
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
+            23
+        );
+        let valid = app.jobs.root().join("primary/copy.jpg");
+        db.execute(
+            "UPDATE catalog_paths SET path=? WHERE path=?",
+            params![valid.to_str(), alias.to_str()],
+        )?;
         crate::catalog::ensure_schema(&mut db, true)?;
         let after: i64 = db.query_row(
             "SELECT revision FROM catalog_sync_assets WHERE library_id='photos' AND asset_id=?",
@@ -1341,7 +1352,10 @@ mod tests {
         assert!(after > before);
         assert_eq!(
             crate::catalog::photo_location_paths(&db, "photos", &id)?,
-            [app.jobs.root().join("primary/photo.jpg").to_str().unwrap()]
+            [
+                valid.to_str().unwrap(),
+                app.jobs.root().join("primary/photo.jpg").to_str().unwrap()
+            ]
         );
         assert_eq!(
             db.query_row(

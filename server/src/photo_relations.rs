@@ -294,10 +294,10 @@ mod tests {
     }
 
     #[test]
-    fn raw_heif_pair_across_directories_shares_identity() -> Result<()> {
+    fn raw_heif_pair_in_one_directory_shares_identity() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
-        let raw = dir.path().join("Mexico/B0003498.3FR");
+        let raw = dir.path().join("Vail/B0003498.3FR");
         let heif = dir.path().join("Vail/B0003498.HEIC");
         let evidence = VersionEvidence {
             capture_original: "2025:11:28 12:03:27-06:00".into(),
@@ -333,14 +333,14 @@ mod tests {
             };
             assert_eq!(store.query_assets("lib", &query)?["total"], total);
         }
-        store.set_hidden_directory("lib", raw.parent().unwrap().to_str().unwrap(), true)?;
+        store.set_hidden_directory("lib", dir.path().join("Mexico").to_str().unwrap(), true)?;
         assert_eq!(store.counts("lib", false)?["all"], 1);
         store.set_trashed("lib", &ids[0], true)?;
         assert_eq!(store.counts("lib", false)?["trashed"], 1);
         assert_eq!(std::fs::read(&raw)?, b"raw");
         assert_eq!(std::fs::read(&heif)?, b"heif");
         store.set_trashed("lib", &ids[0], false)?;
-        assert_eq!(store.asset("lib", &ids[0])?["paths"], json!([heif]));
+        assert_eq!(store.asset("lib", &ids[0])?["paths"], json!([raw, heif]));
         let unrelated = dir.path().join("Other/B0003498.HEIC");
         std::fs::create_dir_all(unrelated.parent().unwrap())?;
         std::fs::write(&unrelated, "different")?;
@@ -609,10 +609,10 @@ mod tests {
         let root = uuid::Uuid::new_v4().to_string();
         let mut metadata = snapshot("raw");
         metadata["originalDocumentID"] = json!(root);
-        ingest(&store, &first, "raw", &metadata, None)?;
+        let id = ingest(&store, &first, "raw", &metadata, None)?;
         ingest(&store, &second, "heif", &snapshot("heif"), None)?;
         let copied = dir.path().join("second/a.3FR");
-        let id = ingest(&store, &copied, "raw", &metadata, None)?;
+        assert!(ingest(&store, &copied, "raw", &metadata, None).is_err());
         let db = store.lock()?;
         let alias: String = db.query_row(
             "SELECT asset_id FROM catalog_identity_aliases WHERE library_id='lib' AND root_id=?",

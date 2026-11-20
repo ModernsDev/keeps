@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 // Path ordering otherwise encourages SQLite to scan the library-wide path primary key.
-const VERSION_PATHS: &str = "SELECT p.path,p.available FROM catalog_version_paths p INDEXED BY catalog_version_paths_asset WHERE p.library_id=? AND p.asset_id=? AND p.content_hash=? AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path";
-const AVAILABLE_VERSION_PATHS: &str = "SELECT p.path FROM catalog_version_paths p INDEXED BY catalog_version_paths_asset JOIN catalog_versions v USING(library_id,asset_id,content_hash) JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=? AND p.asset_id=? AND p.content_hash=? AND p.available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path";
+const VERSION_PATHS: &str = "SELECT p.path,p.available FROM catalog_version_paths p WHERE p.library_id=? AND p.asset_id=? AND p.content_hash=? AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path";
+const AVAILABLE_VERSION_PATHS: &str = "SELECT p.path FROM catalog_version_paths p JOIN catalog_versions v USING(library_id,asset_id,content_hash) JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=? AND p.asset_id=? AND p.content_hash=? AND p.available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path";
 
 #[derive(Default, Debug, Clone)]
 pub struct VersionEvidence {
@@ -56,12 +56,14 @@ pub(crate) fn register(
     snapshot: &Value,
     evidence: &VersionEvidence,
 ) -> Result<()> {
-    if file["role"] == "sidecar" {
-        return Ok(());
-    }
+    let role = file["role"].as_str().context("missing file role")?;
     let hash = file["contentHash"]
         .as_str()
         .context("missing contentHash")?;
+    if role == "sidecar" {
+        crate::physical_files::publish(db, lib, id, path, hash, role, false)?;
+        return Ok(());
+    }
     let priority = if evidence.edited {
         3
     } else if file["role"] == "raw_original" {
@@ -154,7 +156,7 @@ pub(crate) fn register(
             |r| r.get(0),
         )
         .optional()?;
-    let path_changed = db.execute("INSERT INTO catalog_version_paths VALUES(?,?,?,?,1) ON CONFLICT(library_id,path) DO UPDATE SET asset_id=excluded.asset_id,content_hash=excluded.content_hash,available=1 WHERE asset_id IS NOT excluded.asset_id OR content_hash IS NOT excluded.content_hash OR available<>1",params![lib,path,id,hash])? > 0;
+    let path_changed = crate::physical_files::publish(db, lib, id, path, hash, role, true)?;
     let default_changed = choose(db, lib, id)?;
     if let Some(previous) = previous.filter(|p| p != id) {
         choose(db, lib, &previous)?;
@@ -201,10 +203,7 @@ pub(crate) fn choose(db: &Connection, lib: &str, id: &str) -> Result<bool> {
     Ok(true)
 }
 pub(crate) fn missing_path(db: &Connection, lib: &str, id: &str, path: &str) -> Result<()> {
-    let changed = db.execute(
-        "UPDATE catalog_version_paths SET available=0 WHERE library_id=? AND path=? AND available<>0",
-        params![lib, path],
-    )? > 0;
+    let changed = crate::physical_files::withdraw(db, lib, path)?;
     if changed {
         choose(db, lib, id)?;
         touch(db, lib, id)?;
@@ -383,10 +382,6 @@ impl Store {
         let file = json!({"contentHash":hash,"sizeBytes":size,"role":"jpeg_original"});
         let reserved: Option<(String,Option<String>)> = tx.query_row("SELECT p.asset_id,json_extract(v.evidence,'$.generatedFrom') FROM (SELECT library_id,asset_id,content_hash,path FROM catalog_paths UNION SELECT library_id,asset_id,content_hash,path FROM catalog_version_paths) p LEFT JOIN catalog_versions v ON v.library_id=p.library_id AND v.asset_id=p.asset_id AND v.content_hash=p.content_hash WHERE p.library_id=? AND p.path=?",params![lib,path],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         anyhow::ensure!(reserved.as_ref().is_none_or(|(owner,source)| owner == id && source.as_deref() == Some(source_hash)), "standard photo path belongs to another source");
-        tx.execute(
-            "INSERT INTO catalog_paths VALUES(?,?,?,?,?) ON CONFLICT(library_id,path) DO UPDATE SET content_hash=excluded.content_hash",
-            params![lib, path, id, hash, "jpeg_original"],
-        )?;
         tx.execute("INSERT INTO catalog_files VALUES(?,?,?,?,?,'keeps-nas','online') ON CONFLICT DO NOTHING", params![lib,id,hash,size,"jpeg_original"])?;
         let source_version: Option<String> = tx.query_row("SELECT json_extract(evidence,'$.versionID') FROM catalog_versions WHERE library_id=? AND asset_id=? AND content_hash=?",params![lib,id,source_hash],|r|r.get(0)).optional()?.flatten();
         tx.execute("INSERT OR IGNORE INTO catalog_versions(library_id,asset_id,content_hash,width,height,priority,evidence) VALUES(?,?,?,?,?,1,?)",params![lib,id,hash,dimensions.0,dimensions.1,json!({"versionID":uuid::Uuid::new_v4().to_string(),"sourceVersionID":source_version,"generatedFrom":source_hash,"capture":serde_json::from_str::<Value>(&snapshot)?}).to_string()])?;
@@ -516,29 +511,37 @@ impl Store {
         self.asset(lib, id)?;
         let mut db = self.lock()?;
         let tx = db.transaction()?;
-        let available:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_version_paths p WHERE library_id=? AND asset_id=? AND content_hash=? AND available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path))",params![lib,id,hash],|r|r.get(0))?;
-        if !available {
-            return Err(invalid("version is not available for this asset"));
-        }
-        let old: Option<String> = tx
-            .query_row(
-                "SELECT content_hash FROM catalog_defaults WHERE library_id=? AND asset_id=?",
-                params![lib, id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let changed = tx.execute("INSERT INTO catalog_defaults VALUES(?,?,?,1) ON CONFLICT(library_id,asset_id) DO UPDATE SET content_hash=excluded.content_hash,user_selected=1 WHERE content_hash IS NOT excluded.content_hash OR user_selected<>1",params![lib,id,hash])? > 0;
-        if old.as_deref() != Some(hash) {
-            tx.execute("DELETE FROM derivative_objects WHERE library_id=? AND asset_id=? AND role='preview'",params![lib,id])?;
-        }
-        if changed {
-            touch(&tx, lib, id)?;
-        }
+        select_default(&tx, lib, id, hash)?;
         crate::revisions::flush(&tx)?;
         tx.commit()?;
         drop(db);
         self.versions(lib, id)
     }
+}
+
+pub(crate) fn select_default(db: &Connection, lib: &str, id: &str, hash: &str) -> Result<()> {
+    let available:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_version_paths p WHERE library_id=? AND asset_id=? AND content_hash=? AND available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path))",params![lib,id,hash],|r|r.get(0))?;
+    if !available {
+        return Err(invalid("version is not available for this asset"));
+    }
+    let old: Option<String> = db
+        .query_row(
+            "SELECT content_hash FROM catalog_defaults WHERE library_id=? AND asset_id=?",
+            params![lib, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let changed = db.execute("INSERT INTO catalog_defaults VALUES(?,?,?,1) ON CONFLICT(library_id,asset_id) DO UPDATE SET content_hash=excluded.content_hash,user_selected=1 WHERE content_hash IS NOT excluded.content_hash OR user_selected<>1",params![lib,id,hash])? > 0;
+    if old.as_deref() != Some(hash) {
+        db.execute(
+            "DELETE FROM derivative_objects WHERE library_id=? AND asset_id=? AND role='preview'",
+            params![lib, id],
+        )?;
+    }
+    if changed {
+        touch(db, lib, id)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -557,10 +560,22 @@ mod tests {
                 ("/photos/missing.mp4", 0),
                 ("/photos/deprecated.mp4", 1),
             ] {
-                db.execute(
-                    "INSERT INTO catalog_version_paths VALUES(?,?,?,?,?)",
-                    params!["lib", path, id, "video", available],
-                )?;
+                if available == 1 {
+                    crate::physical_files::publish(
+                        &db,
+                        "lib",
+                        &id,
+                        path,
+                        "video",
+                        "video_original",
+                        true,
+                    )?;
+                } else {
+                    db.execute(
+                        "INSERT INTO catalog_version_path_history VALUES(?,?,?,?)",
+                        params!["lib", path, id, "video"],
+                    )?;
+                }
             }
             db.execute(
                 "INSERT INTO catalog_deprecated_files VALUES(?,?,?,?,?)",
@@ -609,7 +624,12 @@ mod tests {
                     row.get::<_, String>(3)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            assert!(plan.iter().any(|step| step.contains("SEARCH p USING INDEX catalog_version_paths_asset (library_id=? AND asset_id=? AND content_hash=?")), "{plan:?}");
+            assert!(
+                plan.iter().any(|step| step.contains(
+                    "catalog_physical_files_version (library_id=? AND asset_id=? AND content_hash=?"
+                )),
+                "{plan:?}"
+            );
         }
         Ok(())
     }
@@ -1142,7 +1162,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn historical_cross_directory_assets_do_not_bridge_content_evidence() -> Result<()> {
+    fn unavailable_cross_directory_paths_do_not_bridge_content_evidence() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let id = store.ingest_original_with_evidence(
@@ -1153,19 +1173,9 @@ mod tests {
             &evidence("image-a"),
         )?;
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES(?,?,?,?,?)",
-            params!["lib", "/two/b.jpg", id, "b", "jpeg_original"],
+            "INSERT INTO catalog_version_path_history VALUES(?,?,?,?)",
+            params!["lib", "/two/b.jpg", id, "b"],
         )?;
-        assert_eq!(
-            store.ingest_original_with_evidence(
-                "lib",
-                "/two/b.jpg",
-                &file("b", false),
-                &snapshot(),
-                &evidence("image-b")
-            )?,
-            id
-        );
         let mut copy = snapshot();
         copy["originalFilename"] = json!("metadata-copy.jpg");
         let visual = store.ingest_original_with_evidence(
@@ -1328,7 +1338,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn missing_default_preview_is_repaired_even_when_replacement_is_outside_scope() -> Result<()> {
+    fn missing_default_preview_is_repaired_from_another_version_in_the_same_folder() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let ev = evidence("same");
@@ -1339,14 +1349,13 @@ mod tests {
             &snapshot(),
             &ev,
         )?;
-        // Seed a legacy association; new cross-directory files now stay separate.
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES(?,?,?,?,?)",
-            params!["lib", "/b/two.jpg", id, "two", "jpeg_original"],
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES(?,?,?,?,?)",
+            params!["lib", "/a/two.jpg", id, "two", "jpeg_original"],
         )?;
         store.ingest_original_with_evidence(
             "lib",
-            "/b/two.jpg",
+            "/a/two.jpg",
             &file("two", false),
             &snapshot(),
             &ev,
@@ -1362,7 +1371,7 @@ mod tests {
         }
         assert_eq!(
             store.default_version("lib", &id)?.unwrap().path,
-            "/b/two.jpg"
+            "/a/two.jpg"
         );
         assert_eq!(store.defaults_needing_previews("lib", "/a")?, vec![id]);
         assert!(
@@ -1386,6 +1395,7 @@ mod tests {
             let db = store.lock()?;
             crate::revisions::remove_schema(&db)?;
             crate::edits::remove_schema(&db)?;
+            crate::physical_files::restore_legacy_path_tables(&db)?;
             db.execute_batch("DROP TABLE catalog_versions;DROP TABLE catalog_defaults;DROP TABLE catalog_version_paths;DROP TABLE catalog_version_revision;DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; PRAGMA user_version=2;")?;
         }
         drop(store);

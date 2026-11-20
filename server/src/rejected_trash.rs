@@ -158,7 +158,7 @@ fn inventory_scope(
         let assets=db.prepare("SELECT id FROM catalog_assets a WHERE library_id=?1 AND ((?2=0 AND flag='rejected' AND trashed=0) OR (?2=1 AND trashed=1 AND (?3 IS NULL OR EXISTS(SELECT 1 FROM catalog_trash_entries t WHERE t.library_id=a.library_id AND t.asset_id=a.id AND t.trashed_at<=?3)))) AND (?2=1 OR EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id)) ORDER BY id")?
             .query_map(params![library,keeps_trash,cutoff],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut originals = BTreeMap::new();
-        let mut query=db.prepare("SELECT path FROM catalog_paths WHERE library_id=?1 AND asset_id=?2 UNION SELECT path FROM catalog_version_paths WHERE library_id=?1 AND asset_id=?2 AND (available=1 OR ?3=1)")?;
+        let mut query=db.prepare("SELECT path FROM catalog_physical_files WHERE library_id=?1 AND asset_id=?2 UNION SELECT path FROM catalog_version_path_history WHERE library_id=?1 AND asset_id=?2 AND ?3=1 AND NOT EXISTS(SELECT 1 FROM catalog_physical_files p WHERE p.library_id=?1 AND p.path=catalog_version_path_history.path)")?;
         for id in &assets {
             originals.insert(
                 id.clone(),
@@ -180,8 +180,10 @@ fn inventory_scope(
             if !keeps_trash || path.try_exists()? {
                 files.insert(path.clone());
             }
-            for sidecar in crate::media::sidecars(&path)? {
-                files.insert(sidecar.canonicalize()?);
+            if crate::media::is_photo(&path) || crate::media::is_video(&path) {
+                for sidecar in crate::media::sidecars(&path)? {
+                    files.insert(sidecar.canonicalize()?);
+                }
             }
         }
         associated.extend(files.iter().cloned());
@@ -249,7 +251,8 @@ fn validate_ownership(
         .prepare("SELECT DISTINCT library_id FROM catalog_assets")?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut query = db.prepare("SELECT asset_id FROM catalog_paths WHERE library_id=?1 AND path=?2 UNION SELECT asset_id FROM catalog_version_paths WHERE library_id=?1 AND path=?2 AND available=1")?;
+    let mut query =
+        db.prepare("SELECT asset_id FROM catalog_physical_files WHERE library_id=?1 AND path=?2")?;
     for path in paths {
         for owner_library in &libraries {
             for owner in query.query_map(
@@ -317,7 +320,29 @@ fn transition(jobs: &Jobs, id: &str, phase: &str, message: Option<&str>) -> Resu
     jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status=?2,phase=?3,error=?4,updated_at=unixepoch(),finished_at=CASE WHEN ?2 IN ('completed','failed') THEN unixepoch() ELSE NULL END WHERE id=?1",params![id,status,phase,message])?;
     Ok(())
 }
-fn reconcile(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> Result<Vec<String>> {
+fn reconcile(
+    jobs: &Jobs,
+    store: &Store,
+    library: &str,
+    id: &str,
+    plan: &Plan,
+) -> Result<Vec<String>> {
+    if !plan.versions.is_empty() {
+        let (task, _, _) = load(jobs, library, id)?;
+        let recycled = plan
+            .files
+            .get(..task.completed_files)
+            .context("回收任务进度无效")?;
+        versions::withdraw_recycled_paths(store, library, &plan.versions, recycled)?;
+        for file in recycled {
+            jobs.db.lock().unwrap().execute(
+                "DELETE FROM files WHERE path=?1 AND folder_id IN (SELECT id FROM folders WHERE library_id=?2)",
+                params![file.path, library],
+            )?;
+        }
+        store.reconcile_cache()?;
+        return Ok(Vec::new());
+    }
     if plan.keeps_trash {
         store.enqueue_recycled_asset_caches(library, &plan.assets)?;
     }
@@ -329,9 +354,6 @@ fn reconcile(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> Result<V
         if !Path::new(&path).try_exists()? {
             jobs.db.lock().unwrap().execute("DELETE FROM files WHERE path=?1 AND folder_id IN (SELECT id FROM folders WHERE library_id=?2)",params![path,library])?;
         }
-    }
-    if !plan.versions.is_empty() {
-        versions::reconcile_editing_negatives(store, library, &plan.versions)?;
     }
     store.reconcile_cache()?;
     let mut finished = Vec::new();
@@ -378,6 +400,13 @@ fn recycle_plan(
     )?;
     let mut next = task.completed_files;
     if inflight {
+        ensure!(
+            plan.versions.is_empty(),
+            error(
+                409,
+                "版本回收的最后一个文件没有已确认的回收凭证，请检查 NAS 回收站"
+            )
+        );
         let file = plan.files.get(next).context("回收任务进度无效")?;
         ensure!(
             !Path::new(&file.path).try_exists()?,
@@ -437,19 +466,7 @@ fn process(
     let _guard = jobs.directory_mutation.write().unwrap();
     let (task, plan, _) = load(jobs, library, id)?;
     if task.phase == "reconciling" {
-        for asset in reconcile(jobs, store, library, &plan)? {
-            store.collect_asset_cache_garbage(previews, library, &asset)?;
-        }
-        return transition(
-            jobs,
-            id,
-            if task.error.is_some() {
-                "failed"
-            } else {
-                "completed"
-            },
-            task.error.as_deref(),
-        );
+        return finish_reconciliation(jobs, store, previews, library, &task, &plan);
     }
     if plan.soft_delete {
         return match store.trash_rejected_ids(library, &plan.assets) {
@@ -505,21 +522,37 @@ fn process(
         jobs.trash_db.lock().unwrap().execute("INSERT INTO trash_cleanup_checks VALUES(?1,?2) ON CONFLICT(library_id) DO UPDATE SET next_check=excluded.next_check",params![library,i64::MAX])?;
     }
     transition(jobs, id, "reconciling", message.as_deref())?;
-    for asset in reconcile(jobs, store, library, &plan)? {
+    let (task, _, _) = load(jobs, library, id)?;
+    finish_reconciliation(jobs, store, previews, library, &task, &plan)
+}
+
+fn finish_reconciliation(
+    jobs: &Jobs,
+    store: &Store,
+    previews: &crate::previews::PreviewStorage,
+    library: &str,
+    task: &Task,
+    plan: &Plan,
+) -> Result<()> {
+    for asset in reconcile(jobs, store, library, &task.id, plan)? {
         store.collect_asset_cache_garbage(previews, library, &asset)?;
     }
-    if message.is_none() && !plan.versions.is_empty() {
+    if task.error.is_none() && !plan.versions.is_empty() {
+        ensure!(
+            task.completed_files == plan.files.len(),
+            error(409, "回收凭证数量与预览不符")
+        );
         versions::finish(jobs, store, library, &plan.versions)?;
     }
     transition(
         jobs,
-        id,
-        if message.is_some() {
+        &task.id,
+        if task.error.is_some() {
             "failed"
         } else {
             "completed"
         },
-        message.as_deref(),
+        task.error.as_deref(),
     )
 }
 pub fn interrupt_pending(jobs: &Jobs, store: &Store) -> Result<()> {
@@ -535,7 +568,7 @@ pub fn interrupt_pending(jobs: &Jobs, store: &Store) -> Result<()> {
     for (id, library) in rows {
         let (task, plan, _) = load(jobs, &library, &id)?;
         if task.phase != "waiting" && !plan.soft_delete {
-            reconcile(jobs, store, &library, &plan)?;
+            reconcile(jobs, store, &library, &id, &plan)?;
         }
         jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status='failed',error=coalesce(error||char(10),'')||'服务已重启，照片回收已中断；请检查原目录与 NAS 回收站后手动重试。',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [&id])?;
         if plan.cutoff.is_some() {
@@ -850,10 +883,10 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn confirmed_version_recycle_keeps_xmp_and_moves_exact_file_under_original_name() -> Result<()>
+    fn confirmed_version_recycle_withdraws_exact_legacy_path_and_preserves_mac_holder() -> Result<()>
     {
         let (_tmp, jobs, store, config) = setup()?;
-        let keep = jobs.root().join("outside/photo.jpg");
+        let keep = jobs.root().join("gallery/keeper.jpg");
         let retire = jobs.root().join("gallery/photo.jpg");
         let untouched = jobs.root().join("gallery/other.jpg");
         let root = "12345678-1234-1234-1234-123456789012";
@@ -867,9 +900,20 @@ mod tests {
         store.choose_photo_location("lib", &id, retire.to_str().unwrap())?;
         store.set_default_version("lib", &id, &loser)?;
         store.lock()?.execute("UPDATE catalog_assets SET negative_hash=?1,negative_selected=1 WHERE library_id='lib' AND id=?2",params![loser,id])?;
-        let sidecar = crate::identity::ensure_known(&retire, root)?.path;
+        {
+            let db = store.lock()?;
+            db.execute(
+                "UPDATE catalog_files SET holder='legacy-mac' WHERE library_id='lib' AND asset_id=? AND content_hash=?",
+                params![id, loser],
+            )?;
+            db.execute(
+                "UPDATE catalog_physical_files SET versioned=0 WHERE library_id='lib' AND path=?",
+                [retire.to_str().unwrap()],
+            )?;
+        }
+        let sidecar = crate::identity::ensure_known(&keep, root)?.path;
         let xmp = fs::read(&sidecar)?;
-        let unindexed = jobs.root().join("outside/unindexed.jpg");
+        let unindexed = jobs.root().join("gallery/unindexed.jpg");
         fs::write(&unindexed, b"other")?;
         let bad = serde_json::from_value(json!({
             "assetId":id, "keepPath":unindexed, "recyclePath":retire
@@ -917,14 +961,28 @@ mod tests {
             submit(&jobs, &store, "lib", &draft.id, 1)?.status,
             "completed"
         );
-        assert!(!keep.exists());
-        assert_eq!(fs::read(&retire)?, b"keep-jpg");
+        assert!(!retire.exists());
+        assert_eq!(fs::read(&keep)?, b"keep-jpg");
         assert_eq!(
             fs::read(jobs.root().join("#recycle/gallery/photo.jpg"))?,
             b"lose-jpg"
         );
         assert_eq!(fs::read(&sidecar)?, xmp);
         assert_eq!(fs::read(&untouched)?, b"other");
+        {
+            let db = store.lock()?;
+            let retained: i64 = db.query_row(
+                "SELECT count(*) FROM catalog_paths WHERE library_id='lib' AND asset_id=?",
+                [&id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(retained, 1);
+            let holder: String = db.query_row(
+                "SELECT holder FROM catalog_files WHERE library_id='lib' AND asset_id=? AND content_hash=?",
+                params![id, loser], |r| r.get(0),
+            )?;
+            assert_eq!(holder, "legacy-mac");
+        }
         let versions = store.versions("lib", &id)?;
         assert_eq!(versions["negativeContentHash"], winner);
         let items = versions["items"].as_array().unwrap();
@@ -939,7 +997,7 @@ mod tests {
     -> Result<()> {
         let (_tmp, jobs, store, config) = setup()?;
         let keep = jobs.root().join("gallery/photo.heic");
-        let retire = jobs.root().join("outside/photo.heic");
+        let retire = jobs.root().join("gallery/alternate.heic");
         let root = "12345678-1234-1234-1234-123456789012";
         let winner = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"keep-one"));
         let loser = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"lose-one"));
@@ -978,7 +1036,7 @@ mod tests {
         assert_eq!(fs::read(&kept_xmp)?, xmp);
         assert!(!retire.exists() && !recycled_xmp.exists());
         assert_eq!(
-            fs::read(jobs.root().join("#recycle/outside/photo.heic.xmp"))?,
+            fs::read(jobs.root().join("#recycle/gallery/alternate.heic.xmp"))?,
             outside_xmp
         );
         let items = store.versions("lib", &id)?["items"]
@@ -1693,7 +1751,7 @@ mod tests {
         photo(&store, &file, "a", None)?;
         let task = preview(&jobs, &store, "lib")?;
         submit(&jobs, &store, "lib", &task.id, 1)?;
-        store.lock()?.execute_batch("CREATE TRIGGER fail_reconcile BEFORE DELETE ON catalog_paths BEGIN SELECT RAISE(ABORT,'simulate reconcile failure'); END")?;
+        store.lock()?.execute_batch("CREATE TRIGGER fail_reconcile BEFORE DELETE ON catalog_physical_files BEGIN SELECT RAISE(ABORT,'simulate reconcile failure'); END")?;
         assert!(
             process(
                 &jobs,
