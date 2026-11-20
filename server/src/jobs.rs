@@ -531,6 +531,27 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         Ok(())
     }
 
+    pub(crate) fn pending_file_publication(
+        &self,
+        library: &str,
+        directory: Option<&str>,
+    ) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        if let Some(directory) = directory {
+            let directory = directory.trim_end_matches('/');
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM file_publications WHERE library_id=? AND path>=? AND path<?)",
+                params![library, format!("{directory}/"), format!("{directory}0")], |row| row.get(0),
+            )?)
+        } else {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM file_publications WHERE library_id=?)",
+                [library],
+                |row| row.get(0),
+            )?)
+        }
+    }
+
     pub(crate) fn file_publication(
         &self,
         library: &str,

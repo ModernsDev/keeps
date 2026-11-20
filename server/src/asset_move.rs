@@ -246,8 +246,8 @@ fn validate_directories(jobs: &Jobs, library: &str, request: &Request) -> Result
         |r| r.get(0),
     )?;
     ensure!(
-        !active_import,
-        error(409, "Finish active imports before moving photos")
+        !active_import && !jobs.pending_file_publication(library, None)?,
+        error(409, "Finish indexing published files before moving photos")
     );
     Ok(())
 }
@@ -1297,6 +1297,48 @@ mod tests {
                 .iter()
                 .all(|m| Path::new(&m.destination).exists() && !Path::new(&m.source).exists())
         );
+        Ok(())
+    }
+    #[test]
+    fn an_import_stays_protected_after_publication_until_indexing() -> Result<()> {
+        let (_tmp, jobs, store, mut request) = setup()?;
+        let photo = Path::new(request.source_path.as_deref().unwrap()).join("photo.jpg");
+        let published = photo.with_extension("heic");
+        request.asset_ids = vec![ingest(&store, &photo, "photo")?];
+        fs::write(&published, b"new rendition pending index")?;
+        let checksum = crate::media::sha256_file(&published)?;
+        {
+            let db = jobs.db.lock().unwrap();
+            Jobs::permit_file(&db, "lib", &published, &checksum, None)?;
+        }
+        submit(&jobs, "lib", request.clone())?;
+        process_next(&jobs, &store)?;
+        let blocked = get(&jobs, "lib", &request.request_id)?;
+        assert_eq!(blocked.status, "failed");
+        assert!(
+            blocked
+                .error
+                .unwrap()
+                .contains("Finish indexing published files")
+        );
+        assert!(photo.exists() && published.exists());
+        assert!(!Path::new(&request.parent_path).join("photo.jpg").exists());
+        jobs.complete_file_publication("lib", published.to_str().unwrap(), &checksum)?;
+        let db = store.lock()?;
+        crate::physical_files::publish(
+            &db,
+            "lib",
+            &request.asset_ids[0],
+            published.to_str().unwrap(),
+            &checksum,
+            "jpeg_original",
+            false,
+        )?;
+        drop(db);
+        submit(&jobs, "lib", request.clone())?;
+        process_next(&jobs, &store)?;
+        assert_eq!(get(&jobs, "lib", &request.request_id)?.status, "completed");
+        assert!(Path::new(&request.parent_path).join("photo.heic").exists());
         Ok(())
     }
     #[test]

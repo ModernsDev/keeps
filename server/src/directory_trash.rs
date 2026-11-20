@@ -291,6 +291,13 @@ fn validate(jobs: &Jobs, library: &str, path: &str, confirmation: &str) -> Resul
             && (source.starts_with(&f.path) || Path::new(&f.path).starts_with(&source))),
         error(409, "Directory overlaps another library's tracking roots")
     );
+    ensure!(
+        !jobs.pending_file_publication(
+            library,
+            Some(source.to_str().context("path must be UTF-8")?)
+        )?,
+        error(409, "请先完成此目录已发布文件的索引，再回收目录")
+    );
     Ok(source)
 }
 

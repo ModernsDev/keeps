@@ -506,7 +506,10 @@ fn process(
             [],
             |r| r.get(0),
         )?;
-        ensure!(!importing, error(409, "请先完成正在进行的导入，再回收照片"));
+        ensure!(
+            !importing && !jobs.pending_file_publication(library, None)?,
+            error(409, "请先完成已发布文件的索引，再回收照片")
+        );
         let config = config()?;
         native_started = true;
         recycle_plan(jobs, store, library, &task, &plan, &config, recycle)
