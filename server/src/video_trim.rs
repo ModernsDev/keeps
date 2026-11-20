@@ -493,6 +493,16 @@ fn prepare(store: &Store, jobs: &Jobs, record: &mut Record, stop: &AtomicBool) -
         fs::File::open(output.parent().context("output has no parent")?)?.sync_all()?;
     }
     record.task.status = "indexing".into();
+    Jobs::permit_file(
+        &jobs.db.lock().unwrap(),
+        &record.library,
+        &output,
+        record
+            .output_hash
+            .as_deref()
+            .context("trim output has no digest")?,
+        None,
+    )?;
     let job = jobs.enqueue_operation_file(&record.folder_id, &output, 0)?;
     record.index_job = Some(job.id);
     save(jobs, record)?;

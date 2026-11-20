@@ -291,6 +291,13 @@ fn validate(jobs: &Jobs, library: &str, path: &str, confirmation: &str) -> Resul
             && (source.starts_with(&f.path) || Path::new(&f.path).starts_with(&source))),
         error(409, "Directory overlaps another library's tracking roots")
     );
+    ensure!(
+        !jobs.pending_file_publication(
+            library,
+            Some(source.to_str().context("path must be UTF-8")?)
+        )?,
+        error(409, "请先完成此目录已发布文件的索引，再回收目录")
+    );
     Ok(source)
 }
 
@@ -858,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_reconciles_native_deletion_and_retains_other_locations() -> Result<()> {
+    fn catalog_reconciles_native_deletion_and_retains_other_photos() -> Result<()> {
         for retain_other in [false, true] {
             let (_tmp, jobs, store, config) = setup();
             let source = jobs.root().join("folder");
@@ -872,8 +879,10 @@ mod tests {
             let other = jobs.root().join("retained.jpg");
             if retain_other {
                 fs::write(&other, b"original")?;
-                assert_eq!(
-                    store.ingest_original("lib", other.to_str().unwrap(), &file, &snapshot)?,
+                let mut other_snap = snapshot.clone();
+                other_snap["photoID"] = json!(uuid::Uuid::new_v4().to_string());
+                assert_ne!(
+                    store.ingest_original("lib", other.to_str().unwrap(), &file, &other_snap)?,
                     id
                 );
                 assert_eq!(store.asset("lib", &id)?["paths"], json!([photo]));
@@ -896,7 +905,7 @@ mod tests {
             );
             assert_eq!(store.counts("lib", false)?["all"], i32::from(retain_other));
             if retain_other {
-                assert_eq!(store.asset("lib", &id)?["paths"], json!([other]));
+                assert_eq!(store.asset("lib", &id)?["paths"], json!([]));
                 assert_eq!(fs::read(other)?, b"original");
             }
             assert_eq!(

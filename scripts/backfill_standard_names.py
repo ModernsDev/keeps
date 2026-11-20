@@ -225,6 +225,8 @@ def main():
     if args.apply and (not args.service_stopped or not args.backup):
         parser.error('--apply requires --service-stopped and --backup')
     with sqlite3.connect(f'file:{args.control_db}?mode=ro', uri=True) as db:
+        if args.apply and db.execute('PRAGMA user_version').fetchone()[0] >= 25:
+            parser.error('Use the Keeps API to modify files in schema 25 or newer')
         items = plan(db, Path(args.photo_root).resolve())
     save(Path(args.plan), {'count': len(items), 'items': items})
     print(json.dumps({'planned': len(items), 'plan': args.plan}))

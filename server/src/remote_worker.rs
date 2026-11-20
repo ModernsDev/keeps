@@ -864,7 +864,7 @@ mod tests {
         let source = root.join("photo.jpg");
         fs::write(&source, b"original")?;
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'asset','hash','jpeg_original')",
             [source.to_str().unwrap()],
         )?;
         Ok(())
@@ -940,7 +940,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                24
+                25
             );
             let edited: (f64, Option<String>) = db.query_row(
                 "SELECT exposure_ev,recipe FROM photo_edits WHERE asset_id='asset'",
@@ -1118,9 +1118,11 @@ mod tests {
             None,
         )?;
         jobs.enqueue_directory_change(&folder.id, jobs.root(), 0)?;
-        store.lock()?.execute("DELETE FROM catalog_paths", [])?;
+        store
+            .lock()?
+            .execute("DELETE FROM catalog_physical_files", [])?;
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','raw_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'asset','hash','raw_original')",
             [source.to_str().unwrap()],
         )?;
         let (_, asset, _) = claim_pending(&store, "lib", "worker")?.unwrap();
@@ -1154,7 +1156,7 @@ mod tests {
         let source = originals.join("photo.3fr");
         jobs.enqueue_file_change(&folder.id, &originals.join("photo.heic"), 0)?;
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','raw_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'asset','hash','raw_original')",
             [source.to_str().unwrap()],
         )?;
         let (_, asset, _) = claim_pending(&store, "lib", "worker")?.unwrap();
@@ -1184,7 +1186,7 @@ mod tests {
         let missing = scope.join("photo.jpg");
         jobs.enqueue_path_change(&folder.id, &scope, 0)?;
         store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'asset','hash','jpeg_original')",
             [missing.to_str().unwrap()],
         )?;
         let state = AppState {

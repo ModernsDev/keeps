@@ -140,7 +140,7 @@ mod tests {
         let db = store.lock()?;
         db.execute("INSERT OR IGNORE INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag) VALUES(?,?,'{}',?,'meta','2026',?,0,'unflagged')",params![library,id,id,name])?;
         db.execute(
-            "INSERT INTO catalog_paths VALUES(?,?,?,?,'jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES(?,?,?,?,'jpeg_original')",
             params![library, path.to_str(), id, id],
         )?;
         Ok(())

@@ -18,18 +18,21 @@ const SUPPORTED: &[&str] = &[
     "jpeg", "heic", "heif", "hif", "png", "tif", "tiff",
 ];
 
-pub(crate) fn read_tags(path: &Path) -> Result<Value> {
+pub(crate) fn read_tags(path: &Path, sidecars: &[std::path::PathBuf]) -> Result<Value> {
     let mut tags = original_tags(path)
         .with_context(|| format!("reading native metadata {}", path.display()))?;
-    for sidecar in crate::media::sidecars(path)? {
+    for sidecar in sidecars {
         let meta = XmpMeta::from_str(
-            &fs::read_to_string(&sidecar)
+            &fs::read_to_string(sidecar)
                 .with_context(|| format!("reading {}", sidecar.display()))?,
         )
         .with_context(|| format!("parsing XMP {}", sidecar.display()))?;
         merge_xmp(&mut tags, &meta);
     }
-    if let Some(id) = crate::identity::sidecar_photo_id(path)? {
+    let dedicated = crate::identity::sidecar_path(path);
+    if sidecars.contains(&dedicated)
+        && let Some(id) = crate::identity::file_sidecar_photo_id(&dedicated)?
+    {
         tags.insert(
             "XMP:Identifier".into(),
             json!(format!("https://keeps.photos/photo/{id}")),
@@ -38,8 +41,8 @@ pub(crate) fn read_tags(path: &Path) -> Result<Value> {
     Ok(Value::Object(tags))
 }
 
-pub(crate) fn embedded_photo_id(path: &Path) -> Result<Option<String>> {
-    let tags = if path
+pub(crate) fn import_identity_tags(path: &Path) -> Result<Map<String, Value>> {
+    let mut tags = if path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("xmp"))
     {
@@ -49,14 +52,26 @@ pub(crate) fn embedded_photo_id(path: &Path) -> Result<Option<String>> {
     } else {
         original_tags(path)?
     };
-    Ok(
-        crate::identity::identifier_photo_id(tags.get("XMP:Identifier").unwrap_or(&Value::Null))
-            .or_else(|| {
-                tags.get("XMP:PhotoID")
-                    .and_then(Value::as_str)
-                    .and_then(crate::identity::normalize)
-            }),
-    )
+    tags.retain(|key, _| {
+        [
+            "XMP:Identifier",
+            "XMP:PhotoID",
+            "EXIF:ImageUniqueID",
+            "MakerNotes:ImageUniqueID",
+            "XMP:ImageUniqueID",
+            "XMP:OriginalDocumentID",
+            "XMP:DocumentID",
+        ]
+        .contains(&key.as_str())
+    });
+    Ok(tags)
+}
+
+pub(crate) fn embedded_photo_id(path: &Path) -> Result<Option<String>> {
+    let tags = Value::Object(import_identity_tags(path)?);
+    Ok(crate::media::source_identity(&tags)["photoID"]
+        .as_str()
+        .map(str::to_owned))
 }
 
 fn original_tags(path: &Path) -> Result<Map<String, Value>> {
@@ -517,7 +532,7 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&[0x1c, 2, 10, 0, 1, b'3', 0]);
         fs::write(&path, &bytes)?;
-        let tags = read_tags(&path)?;
+        let tags = read_tags(&path, &crate::media::sidecars(&path)?)?;
         assert_eq!(tags["EXIF:Rating"], json!(4));
         assert_eq!(tags["IPTC:Urgency"], json!("3"));
         assert!(tags["XMP:Urgency"].is_null());

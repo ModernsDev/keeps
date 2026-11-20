@@ -110,7 +110,8 @@ pub(crate) fn migrate_updates(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn install_triggers(db: &Connection) -> Result<()> {
+pub(crate) fn install_triggers(db: &Connection) -> Result<()> {
+    let physical: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='catalog_physical_files')", [], |r| r.get(0))?;
     // Audit timestamps do not change cached representations.
     for (table, asset, columns, path) in [
         (
@@ -126,15 +127,31 @@ fn install_triggers(db: &Connection) -> Result<()> {
             false,
         ),
         (
-            "catalog_paths",
+            if physical {
+                "catalog_physical_files"
+            } else {
+                "catalog_paths"
+            },
             "asset_id",
-            "library_id,path,asset_id,content_hash,role",
+            if physical {
+                "library_id,path,asset_id,content_hash,role,versioned"
+            } else {
+                "library_id,path,asset_id,content_hash,role"
+            },
             true,
         ),
         (
-            "catalog_version_paths",
+            if physical {
+                "catalog_version_path_history"
+            } else {
+                "catalog_version_paths"
+            },
             "asset_id",
-            "library_id,path,asset_id,content_hash,available",
+            if physical {
+                "library_id,path,asset_id,content_hash"
+            } else {
+                "library_id,path,asset_id,content_hash,available"
+            },
             true,
         ),
         (
@@ -178,7 +195,7 @@ fn install_triggers(db: &Connection) -> Result<()> {
             } else {
                 String::new()
             };
-            db.execute_batch(&format!("CREATE TRIGGER catalog_revision_{table}_{event} AFTER {event} ON {table}{condition} BEGIN {body} END;"))?;
+            db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS catalog_revision_{table}_{event} AFTER {event} ON {table}{condition} BEGIN {body} END;"))?;
         }
     }
     for (event, sides) in [
@@ -192,7 +209,7 @@ fn install_triggers(db: &Connection) -> Result<()> {
         } else {
             ""
         };
-        db.execute_batch(&format!("CREATE TRIGGER catalog_revision_hidden_{event} AFTER {event} ON catalog_hidden_directories{condition} BEGIN {body} END;"))?;
+        db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS catalog_revision_hidden_{event} AFTER {event} ON catalog_hidden_directories{condition} BEGIN {body} END;"))?;
     }
     Ok(())
 }
@@ -737,7 +754,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                24
+                25
             );
             assert_eq!(
                 db.query_row(
@@ -872,9 +889,8 @@ mod tests {
         {
             let mut connection = store.lock()?;
             let db = connection.transaction()?;
-            for table in ["catalog_paths", "catalog_version_paths"] {
-                db.execute(&format!("UPDATE {table} SET path='/photos/new/a.jpg' WHERE library_id='lib' AND path='/photos/old/a.jpg'"), [])?;
-            }
+            db.execute("UPDATE catalog_asset_directories SET directory='/photos/new' WHERE library_id='lib' AND directory='/photos/old'", [])?;
+            db.execute("UPDATE catalog_physical_files SET path='/photos/new/a.jpg' WHERE library_id='lib' AND path='/photos/old/a.jpg'", [])?;
             flush(&db)?;
             db.commit()?;
         }
@@ -895,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn hiding_a_path_invalidates_all_aliases_but_not_unrelated_directories() -> Result<()> {
+    fn hiding_a_folder_with_versions_invalidates_only_affected_directories() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let id = seed(&store, "lib", "/private/a.jpg")?;
@@ -904,7 +920,7 @@ mod tests {
             let mut connection = store.lock()?;
             let db = connection.transaction()?;
             db.execute(
-                "INSERT INTO catalog_paths VALUES('lib','/public/a.jpg',?,'hash','jpeg_original')",
+                "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib','/private/b.jpg',?,'hash','jpeg_original')",
                 [&id],
             )?;
             flush(&db)?;
@@ -913,20 +929,19 @@ mod tests {
         let old = revision(&store, "lib", None)?;
         let unrelated = revision(&store, "lib", Some("/unrelated"))?;
         store.set_hidden_directory("lib", "/private", true)?;
-        for path in ["/private", "/public"] {
-            assert_eq!(revision(&store, "lib", Some(path))?, old + 1);
-        }
+        assert_eq!(revision(&store, "lib", Some("/private"))?, old + 1);
         let query = AssetQuery {
-            directory: Some("/public".into()),
+            directory: Some("/private".into()),
             ..Default::default()
         };
-        assert_eq!(store.query_assets("lib", &query)?["total"], 0);
+        assert_eq!(store.query_assets("lib", &query)?["total"], 1);
+        assert_eq!(store.counts("lib", false)?["all"], 1);
         assert_eq!(revision(&store, "lib", Some("/unrelated"))?, unrelated);
         store.set_hidden_directory("lib", "/private", true)?;
         assert_eq!(revision(&store, "lib", None)?, old + 1);
         store.set_hidden_directory("lib", "/private", false)?;
-        assert_eq!(revision(&store, "lib", Some("/public"))?, old + 2);
-        assert_eq!(store.query_assets("lib", &query)?["total"], 0);
+        assert_eq!(revision(&store, "lib", Some("/private"))?, old + 2);
+        assert_eq!(store.query_assets("lib", &query)?["total"], 1);
         Ok(())
     }
 
@@ -1004,7 +1019,7 @@ mod tests {
         let db = connection.transaction()?;
         db.execute_batch("WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<99999)
             INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) SELECT 'lib',printf('asset-%d',i),'{}','hash','fingerprint','2024','photo.jpg',0,'unflagged',NULL,0 FROM n;
-            INSERT INTO catalog_paths SELECT 'lib',printf('/photos/%03d/%s.jpg',CAST(substr(id,7) AS INTEGER)/1000,id),id,'hash','jpeg_original' FROM catalog_assets;")?;
+            INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) SELECT 'lib',printf('/photos/%03d/%s.jpg',CAST(substr(id,7) AS INTEGER)/1000,id),id,'hash','jpeg_original' FROM catalog_assets;")?;
         flush(&db)?;
         assert_eq!(read(&db, "lib", None)?, 1);
         db.execute(

@@ -18,6 +18,13 @@ fn error(status: u16, message: impl Into<String>) -> anyhow::Error {
 }
 pub(crate) fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS directory_moves(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,source TEXT NOT NULL,destination TEXT NOT NULL,completed INTEGER NOT NULL DEFAULT 0)")?;
+    if !db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('directory_moves') WHERE name='file_hash')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        db.execute("ALTER TABLE directory_moves ADD COLUMN file_hash TEXT", [])?;
+    }
     db.execute_batch("CREATE TABLE IF NOT EXISTS directory_move_tasks(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,path TEXT NOT NULL,parent_path TEXT NOT NULL,destination TEXT NOT NULL,status TEXT NOT NULL,phase TEXT NOT NULL,error TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()),updated_at INTEGER NOT NULL DEFAULT(unixepoch()),finished_at INTEGER)")?;
     crate::asset_move::initialize(db)?;
     Ok(())
@@ -42,9 +49,8 @@ pub(crate) fn catalog(
     destination: &str,
 ) -> Result<()> {
     for (table, column) in [
-        ("catalog_paths", "path"),
-        ("catalog_location_choices", "path"),
-        ("catalog_version_paths", "path"),
+        ("catalog_asset_directories", "directory"),
+        ("catalog_physical_files", "path"),
         ("catalog_hidden_directories", "path"),
         ("catalog_deprecated_files", "path"),
         ("catalog_deprecated_files", "retained_path"),
@@ -94,6 +100,21 @@ pub(crate) fn tracking(
             table,
             column,
             "folder_id IN (SELECT id FROM folders WHERE library_id=?1)",
+            library,
+            source,
+            destination,
+        )?;
+    }
+    for table in [
+        "file_publications",
+        "import_match_claims",
+        "import_file_digests",
+    ] {
+        rewrite(
+            db,
+            table,
+            "path",
+            "library_id=?1",
             library,
             source,
             destination,
@@ -257,7 +278,7 @@ pub(crate) fn recover_locked(jobs: &Jobs, store: &Store) -> Result<()> {
         }
     }
     for (library, moves) in files {
-        crate::asset_move::reconcile_files(jobs, store, &library, &moves)?;
+        crate::asset_move::recover_files(jobs, store, &library, &moves)?;
     }
     Ok(())
 }

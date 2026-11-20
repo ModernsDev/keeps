@@ -201,6 +201,10 @@ def save_manifest(path, value):
 
 
 def apply(args, items):
+    if not args.precopy:
+        with connect(args.source / 'db/control_plane.sqlite') as db:
+            if db.execute('PRAGMA user_version').fetchone()[0] >= 25:
+                raise RuntimeError('Use the Keeps API to modify files in schema 25 or newer')
     state = json.loads(subprocess.check_output([args.docker, 'inspect', args.container]))[0]
     if state['State']['Running'] and not args.precopy:
         raise RuntimeError('Stop the container before applying the migration')

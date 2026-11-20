@@ -888,6 +888,8 @@ fn open_version_source(
     {
         return Err(resource_error(400, "invalid content hash"));
     }
+    let _guard = state.jobs.directory_mutation.read().unwrap();
+    crate::directory_move::ensure_reconciled(&state.jobs)?;
     let paths = state.store.available_version_paths(library, &id, hash)?;
     if paths.is_empty() {
         return Err(resource_error(404, "version not available for this asset"));
@@ -1097,6 +1099,8 @@ async fn default_version(
     let id = asset_id(&id)?;
     Ok(Json(
         interactive(move || {
+            let _guard = state.jobs.directory_mutation.read().unwrap();
+            crate::directory_move::ensure_reconciled(&state.jobs)?;
             let versions = state.store.versions(&library, &id)?;
             let version = versions["items"]
                 .as_array()

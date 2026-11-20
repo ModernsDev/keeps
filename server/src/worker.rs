@@ -373,23 +373,36 @@ fn file_stamp(path: &Path) -> Result<(i64, i64)> {
     Ok((size, mtime))
 }
 
-fn photo_paths(store: &Store, library: &str, path: &Path) -> Result<Vec<PathBuf>> {
+fn photo_paths(store: &Store, jobs: &Jobs, library: &str, path: &Path) -> Result<Vec<PathBuf>> {
     let parent = path.parent().context("photo has no directory")?;
     let stem = path
         .file_stem()
         .context("photo has no filename")?
         .to_string_lossy();
     let mut paths = vec![path.to_path_buf()];
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && media::is_photo(&entry.path())
-            && entry
-                .path()
-                .file_stem()
-                .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(&stem))
-        {
-            paths.push(entry.path());
+    let parent = parent
+        .to_str()
+        .context("original directory must be UTF-8")?;
+    let directory_prefix = format!("{}/", parent.trim_end_matches('/'));
+    let directory_ceiling = format!("{}0", parent.trim_end_matches('/'));
+    {
+        let db = jobs.db.lock().unwrap();
+        let mut query = db.prepare(
+            "SELECT path FROM file_publications WHERE library_id=? AND path>=? AND path<?",
+        )?;
+        for entry in query.query_map(
+            rusqlite::params![library, directory_prefix, directory_ceiling],
+            |row| row.get::<_, String>(0),
+        )? {
+            let candidate = PathBuf::from(entry?);
+            if candidate.parent() == Some(Path::new(parent))
+                && (media::is_photo(&candidate) || media::is_video(&candidate))
+                && candidate
+                    .file_stem()
+                    .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(&stem))
+            {
+                paths.push(candidate);
+            }
         }
     }
     {
@@ -399,7 +412,9 @@ fn photo_paths(store: &Store, library: &str, path: &Path) -> Result<Vec<PathBuf>
             r.get::<_, String>(0)
         })? {
             let p = PathBuf::from(item?);
-            if p.parent() == Some(parent) && p.is_file() {
+            if p.parent() == Some(Path::new(parent))
+                && fs::symlink_metadata(&p).is_ok_and(|info| info.is_file())
+            {
                 paths.push(p);
             }
         }
@@ -409,6 +424,81 @@ fn photo_paths(store: &Store, library: &str, path: &Path) -> Result<Vec<PathBuf>
     Ok(paths)
 }
 
+fn managed_source_hash(
+    store: &Store,
+    jobs: &Jobs,
+    library: &str,
+    path: &Path,
+) -> Result<Option<(String, bool)>> {
+    use rusqlite::OptionalExtension;
+    if let Some((hash, _)) = jobs.file_publication(library, path)? {
+        return Ok(Some((hash, true)));
+    }
+    let path = path.to_str().context("original path must be UTF-8")?;
+    let hash = store.read()?.query_row(
+        "SELECT p.content_hash FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=? AND p.path=? AND a.trashed=0",
+        rusqlite::params![library,path], |r| r.get(0),
+    ).optional()?;
+    Ok(hash.map(|hash| (hash, false)))
+}
+
+fn managed_sidecars(
+    store: &Store,
+    jobs: &Jobs,
+    library: &str,
+    asset: Option<&str>,
+    path: &Path,
+) -> Result<Vec<PathBuf>> {
+    use rusqlite::OptionalExtension;
+    let catalog = store.read()?;
+    let mut managed = Vec::new();
+    for sidecar in media::sidecars(path)? {
+        let publication = jobs.file_publication(library, &sidecar)?;
+        let hash: Option<String> = if let Some((hash, _)) = publication {
+            Some(hash)
+        } else {
+            catalog.query_row(
+                "SELECT content_hash FROM catalog_physical_files WHERE library_id=? AND asset_id=? AND path=? AND role='sidecar'",
+                rusqlite::params![library,asset,sidecar.to_str()], |r| r.get(0),
+            ).optional()?
+        };
+        if let Some(hash) = hash {
+            ensure!(
+                crate::imports::file_digest(jobs, library, &sidecar)? == hash,
+                "XMP 在图库之外发生变更：{}",
+                sidecar.display()
+            );
+            managed.push(sidecar);
+        }
+    }
+    Ok(managed)
+}
+
+fn publish_import_sidecars(
+    store: &Store,
+    jobs: &Jobs,
+    library: &str,
+    id: &str,
+    path: &Path,
+) -> Result<()> {
+    for sidecar in media::sidecars(path)? {
+        if let Some((hash, batch)) = jobs.file_publication(library, &sidecar)? {
+            ensure!(
+                crate::imports::file_digest(jobs, library, &sidecar)? == hash,
+                "已导入的 XMP 在图库之外发生变更：{}",
+                sidecar.display()
+            );
+            store.publish_identity_sidecar(library, id, path, &sidecar, batch.as_deref())?;
+            jobs.complete_file_publication(
+                library,
+                sidecar.to_str().context("sidecar path must be UTF-8")?,
+                &hash,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn process_photo(
     store: &Store,
     jobs: &Jobs,
@@ -416,7 +506,10 @@ fn process_photo(
     job: &Job,
     path: &Path,
 ) -> Result<bool> {
-    let paths = photo_paths(store, &job.library_id, path)?;
+    if managed_source_hash(store, jobs, &job.library_id, path)?.is_none() {
+        return Ok(false);
+    }
+    let paths = photo_paths(store, jobs, &job.library_id, path)?;
     // Metadata writers may replace inodes. Keep the whole photo group untouched
     // until import checkpoints make every published link independently recoverable.
     if crate::imports::group_pending_publication(jobs, &job.library_id, &paths)? {
@@ -482,8 +575,17 @@ fn process_file(
 ) -> Result<bool> {
     jobs.validate_path(path.parent().context("original has no parent")?)?;
     let text = path.to_str().context("original path must be UTF-8")?;
+    let Some((expected_hash, pending_publication)) =
+        managed_source_hash(store, jobs, &job.library_id, path)?
+    else {
+        return Ok(false);
+    };
     let (size, mtime) = file_stamp(path)?;
-    let mut sidecars = media::sidecar_stamp(path)?;
+    let current_asset = store.existing_asset_for_path(&job.library_id, text)?;
+    let sidecar = crate::identity::sidecar_path(path);
+    let authorized =
+        managed_sidecars(store, jobs, &job.library_id, current_asset.as_deref(), path)?;
+    let mut sidecars = media::sidecar_paths_stamp(&authorized)?;
     let previous = jobs.file_state(&job.folder_id, text)?;
     let mut asset_id = previous
         .as_ref()
@@ -502,17 +604,26 @@ fn process_file(
         && previous.mtime_ns == mtime
         && previous.metadata_stamp == sidecars
         && previous.error.is_none()
+        && previous.version == expected_hash
+        && (!pending_publication
+            || crate::imports::file_digest(jobs, &job.library_id, path)? == expected_hash)
         && !previous.asset_id.is_empty()
         && store.original_is_online(&job.library_id, text, &previous.version)?
-        && let Some(current_asset_id) = store.existing_asset_for_path(&job.library_id, text)?
-        && crate::identity::standard_sidecar_photo_id(path)?.as_deref()
-            == Some(store.root_id(&job.library_id, &current_asset_id)?.as_str())
+        && let Some(current_asset_id) = &current_asset
+        && ((!authorized.contains(&sidecar) && !pending_publication)
+            || (authorized.contains(&sidecar)
+                && crate::identity::standard_sidecar_photo_id(path)?.as_deref()
+                    == Some(store.root_id(&job.library_id, current_asset_id)?.as_str())))
     {
         // Identity merges can replace the asset without changing the indexed file.
-        if previous.asset_id != current_asset_id {
+        if previous.asset_id != *current_asset_id {
             let mut checkpoint = previous.clone();
-            checkpoint.asset_id = current_asset_id;
+            checkpoint.asset_id = current_asset_id.clone();
             jobs.record_metadata_result(&job.folder_id, text, &checkpoint)?;
+        }
+        publish_import_sidecars(store, jobs, &job.library_id, current_asset_id, path)?;
+        if pending_publication {
+            jobs.complete_file_publication(&job.library_id, text, &expected_hash)?;
         }
         return Ok(false);
     }
@@ -521,9 +632,14 @@ fn process_file(
         let processor = MediaProcessor::new();
         let started = std::time::Instant::now();
         hash = crate::imports::file_digest(jobs, &job.library_id, path)?;
+        ensure!(
+            hash == expected_hash,
+            "原片内容在图库之外发生变更：{}",
+            path.display()
+        );
         let digest_ms = started.elapsed().as_millis();
         let extracted = std::time::Instant::now();
-        let metadata = processor.extract(path)?;
+        let metadata = processor.extract_with_sidecars(path, &authorized)?;
         let metadata_ms = extracted.elapsed().as_millis();
         if stopped(jobs, job, stop)? {
             return Ok(false);
@@ -542,7 +658,9 @@ fn process_file(
         if let Some(capture_time) = &metadata.capture_time {
             snapshot["captureTime"] = json!(capture_time);
         }
-        if let Some(id) = &metadata.photo_id {
+        if let Some(asset) = &current_asset {
+            snapshot["photoID"] = json!(store.root_id(&job.library_id, asset)?);
+        } else if let Some(id) = &metadata.photo_id {
             snapshot["photoID"] = json!(id);
         }
         if let Some(id) = &metadata.camera_image_id {
@@ -568,7 +686,7 @@ fn process_file(
             "original changed during identity extraction"
         );
         ensure!(
-            media::sidecar_stamp(path)? == sidecars,
+            media::sidecar_paths_stamp(&authorized)? == sidecars,
             "sidecar changed during metadata extraction"
         );
         let ingested = std::time::Instant::now();
@@ -582,7 +700,10 @@ fn process_file(
         )?;
         let ingest_ms = ingested.elapsed().as_millis();
         let root = store.root_id(&job.library_id, &asset_id)?;
-        if crate::identity::standard_sidecar_photo_id(path)?.as_deref() == Some(root.as_str()) {
+        publish_import_sidecars(store, jobs, &job.library_id, &asset_id, path)?;
+        if authorized.contains(&sidecar)
+            && crate::identity::standard_sidecar_photo_id(path)?.as_deref() == Some(root.as_str())
+        {
             tracing::info!(
                 path = text,
                 digest_ms,
@@ -594,14 +715,38 @@ fn process_file(
             identity_checked = true;
             return Ok(true);
         }
+        if !(pending_publication || job.refresh_metadata && authorized.contains(&sidecar)) {
+            return Ok(true);
+        }
+        if sidecar.try_exists()? && !authorized.contains(&sidecar) {
+            if pending_publication {
+                bail!("既有的 XMP 尚未登记，请先核对图库：{}", sidecar.display());
+            }
+            return Ok(true);
+        }
         let updated = store.with_identity_update(&job.library_id, text, &hash, || {
             crate::identity::ensure_metadata(path, &root, &metadata)?;
-            sidecars = media::sidecar_stamp(path)?;
             Ok(())
         })?;
         if !updated {
             return Ok(false);
         }
+        let generated_hash = crate::imports::file_digest(jobs, &job.library_id, &sidecar)?;
+        Jobs::permit_file(
+            &jobs.db.lock().unwrap(),
+            &job.library_id,
+            &sidecar,
+            &generated_hash,
+            None,
+        )?;
+        publish_import_sidecars(store, jobs, &job.library_id, &asset_id, path)?;
+        sidecars = media::sidecar_paths_stamp(&managed_sidecars(
+            store,
+            jobs,
+            &job.library_id,
+            Some(&asset_id),
+            path,
+        )?)?;
         tracing::info!(
             path = text,
             digest_ms,
@@ -637,6 +782,9 @@ fn process_file(
             )?;
             if identity_checked {
                 jobs.identity_result(&job.folder_id, text, None)?;
+                if pending_publication {
+                    jobs.complete_file_publication(&job.library_id, text, &hash)?;
+                }
             }
         }
         Err(error) => {
@@ -690,7 +838,8 @@ mod tests {
             &json!({"contentHash":hash,"sizeBytes":size,"role":"jpeg_original"}),
             &json!({"originalFilename":"photo.jpg","contentFingerprint":hash,"metadataFingerprint":"fixture","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"}),
         )?;
-        crate::identity::ensure_known(&path, &store.root_id("library", &id)?)?;
+        let sidecar = crate::identity::ensure_known(&path, &store.root_id("library", &id)?)?.path;
+        store.publish_identity_sidecar("library", &id, &path, &sidecar, None)?;
         let folder = jobs.add_folder("library", ".")?;
         jobs.record_file(
             &folder.id,
@@ -704,7 +853,7 @@ mod tests {
         jobs.record_metadata_stamp(
             &folder.id,
             path.to_str().unwrap(),
-            &media::sidecar_stamp(&path)?,
+            &media::sidecar_paths_stamp(std::slice::from_ref(&sidecar))?,
         )?;
         let mut job = jobs.enqueue_manual_file(&folder.id, &path)?;
         let stop = AtomicBool::new(false);
@@ -759,6 +908,7 @@ mod tests {
             ],
         )?;
         let hash = media::sha256_file(&path)?;
+        Jobs::permit_file(&jobs.db.lock().unwrap(), "library", &path, &hash, None)?;
         let folder = jobs.add_folder("library", ".")?;
         let initial = jobs.enqueue_manual_metadata_refresh(&folder.id, jobs.root())?;
         let job = jobs.claim_next()?.unwrap();
@@ -785,14 +935,16 @@ mod tests {
             &store, &jobs, &previews, &next, &path, &stop
         )?);
         assert_eq!(media::sha256_file(&path)?, hash);
-        let sidecar = crate::identity::sidecar_path(&path);
-        let mut xmp = fs::read_to_string(&sidecar)?;
-        xmp.push('\n');
-        fs::write(&sidecar, xmp)?;
-        assert!(process_file(&store, &jobs, &previews, &next, &path, &stop)?);
+        let unauthorized = path.with_extension("xmp");
+        fs::write(
+            &unauthorized,
+            b"unregistered sidecar must not affect metadata",
+        )?;
         assert!(!process_file(
             &store, &jobs, &previews, &next, &path, &stop
         )?);
+        let unknown: bool = store.read()?.query_row("SELECT EXISTS(SELECT 1 FROM catalog_physical_files WHERE library_id='library' AND path=?)", [unauthorized.to_str().unwrap()], |r|r.get(0))?;
+        assert!(!unknown);
         fs::write(&path, b"changed invalid source must be inspected")?;
         assert!(process_file(&store, &jobs, &previews, &next, &path, &stop).is_err());
         assert!(
@@ -813,6 +965,13 @@ mod tests {
         let jobs = Jobs::open(&directory.path().join("jobs.sqlite"), &originals)?;
         let path = jobs.root().join("pair.CR3");
         fs::write(&path, b"unchanged original")?;
+        Jobs::permit_file(
+            &jobs.db.lock().unwrap(),
+            "library",
+            &path,
+            &media::sha256_file(&path)?,
+            None,
+        )?;
         let previews = PreviewStorage::new(
             &directory.path().join("keeps"),
             Some(&originals),
@@ -881,6 +1040,14 @@ mod tests {
             "test-key",
         )?;
         let folder = jobs.add_folder("library", ".")?;
+        let bad = bad.canonicalize()?;
+        Jobs::permit_file(
+            &jobs.db.lock().unwrap(),
+            "library",
+            &bad,
+            &media::sha256_file(&bad)?,
+            None,
+        )?;
         let parent = jobs.enqueue_external_scan(&folder.id)?;
         let job = jobs.claim_next()?.unwrap();
         let error = run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false)).unwrap_err();
@@ -923,6 +1090,14 @@ mod tests {
             "test-key",
         )?;
         let folder = jobs.add_folder("library", ".")?;
+        let bad = bad.canonicalize()?;
+        Jobs::permit_file(
+            &jobs.db.lock().unwrap(),
+            "library",
+            &bad,
+            &media::sha256_file(&bad)?,
+            None,
+        )?;
         let (size, mtime) = file_stamp(&bad)?;
         jobs.record_file(
             &folder.id,
@@ -973,6 +1148,14 @@ mod tests {
             "test-key",
         )?;
         let folder = jobs.add_folder("library", ".")?;
+        let bad = bad.canonicalize()?;
+        Jobs::permit_file(
+            &jobs.db.lock().unwrap(),
+            "library",
+            &bad,
+            &media::sha256_file(&bad)?,
+            None,
+        )?;
         jobs.enqueue_external_scan(&folder.id)?;
         let job = jobs.claim_next()?.unwrap();
         assert!(!process_file(
@@ -1002,6 +1185,7 @@ mod tests {
                 b"original",
             )?;
         }
+        fs::write(originals.join("unmanaged.jpg"), b"manually copied original")?;
         let outside = directory.path().join("outside.jpg");
         fs::write(&outside, b"outside")?;
         #[cfg(unix)]
@@ -1019,6 +1203,14 @@ mod tests {
         let job = jobs.claim_next()?.unwrap();
         run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false))?;
         assert_eq!(store.counts("library", false)?["all"], 0);
+        assert!(
+            jobs.file_state(
+                &folder.id,
+                jobs.root().join("unmanaged.jpg").to_str().unwrap()
+            )?
+            .is_none()
+        );
+        assert!(!crate::identity::sidecar_path(&jobs.root().join("unmanaged.jpg")).exists());
         assert_eq!(fs::read(outside)?, b"outside");
         for name in [".hidden", "@eaDir", "#recycle"] {
             assert_eq!(

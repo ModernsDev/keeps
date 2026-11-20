@@ -15,6 +15,20 @@ const RAW_EXTENSIONS: &[&str] = &[
     "srf", "srw",
 ];
 
+pub(crate) fn source_identity(tags: &Value) -> Value {
+    let first = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| tags[*key].as_str().map(str::trim).filter(|v| !v.is_empty()))
+    };
+    serde_json::json!({
+        "photoID": crate::identity::identifier_photo_id(&tags["XMP:Identifier"])
+            .or_else(|| first(&["XMP:PhotoID"]).and_then(crate::identity::normalize)),
+        "cameraImageID": first(&["EXIF:ImageUniqueID", "MakerNotes:ImageUniqueID", "XMP:ImageUniqueID"]),
+        "originalDocumentID": first(&["XMP:OriginalDocumentID"]),
+        "documentID": first(&["XMP:DocumentID"]),
+    })
+}
+
 pub fn is_raw(path: &Path) -> bool {
     RAW_EXTENSIONS.contains(&extension(path).as_str())
 }
@@ -150,13 +164,21 @@ impl MediaProcessor {
         let path = path
             .canonicalize()
             .with_context(|| format!("resolving {}", path.display()))?;
-        let tags = read_tags(&path)?;
+        self.extract_with_sidecars(&path, &sidecars(&path)?)
+    }
+
+    pub(crate) fn extract_with_sidecars(
+        &self,
+        path: &Path,
+        sidecars: &[PathBuf],
+    ) -> Result<Metadata> {
+        let tags = crate::native_metadata::read_tags(path, sidecars)?;
         let text = |key: &str| tags[key].as_str().unwrap_or_default().to_owned();
         let capture_original = tags["Composite:SubSecDateTimeOriginal"]
             .as_str()
             .or_else(|| tags["EXIF:DateTimeOriginal"].as_str())
             .unwrap_or_default();
-        let capture_time = complete_capture_time(&tags, &path)?;
+        let capture_time = complete_capture_time(&tags, path)?;
         let optional_text = |keys: &[&str]| {
             keys.iter().find_map(|key| {
                 tags[*key]
@@ -166,18 +188,14 @@ impl MediaProcessor {
                     .map(str::to_owned)
             })
         };
+        let identity = source_identity(&tags);
+        let identity_field = |key: &str| identity[key].as_str().map(str::to_owned);
         Ok(Metadata {
             capture_time,
-            photo_id: crate::identity::identifier_photo_id(&tags["XMP:Identifier"]).or_else(|| {
-                optional_text(&["XMP:PhotoID"]).and_then(|id| crate::identity::normalize(&id))
-            }),
-            camera_image_id: optional_text(&[
-                "EXIF:ImageUniqueID",
-                "MakerNotes:ImageUniqueID",
-                "XMP:ImageUniqueID",
-            ]),
-            original_document_id: optional_text(&["XMP:OriginalDocumentID"]),
-            document_id: optional_text(&["XMP:DocumentID"]),
+            photo_id: identity_field("photoID"),
+            camera_image_id: identity_field("cameraImageID"),
+            original_document_id: identity_field("originalDocumentID"),
+            document_id: identity_field("documentID"),
             instance_id: optional_text(&["XMP:InstanceID"]),
             original_filename: optional_text(&["XMP:OriginalFileName", "XMP:PreservedFileName"]),
             camera_make: text("EXIF:Make"),
@@ -471,10 +489,6 @@ fn run_with_timeout(command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn read_tags(path: &Path) -> Result<Value> {
-    crate::native_metadata::read_tags(path)
-}
-
 fn rating(tags: &Value) -> Option<i64> {
     [
         "XMP:Rating",
@@ -493,20 +507,23 @@ fn rating(tags: &Value) -> Option<i64> {
     .map(|value: i64| value.clamp(0, 5))
 }
 
-pub(crate) fn sidecars(path: &Path) -> Result<Vec<PathBuf>> {
-    let mut result = Vec::new();
-    for extension in ["xmp", "XMP"] {
+pub(crate) fn sidecar_candidates(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    ["xmp", "XMP"].into_iter().flat_map(|extension| {
         let mut appended = path.as_os_str().to_os_string();
         appended.push(format!(".{extension}"));
-        for candidate in [path.with_extension(extension), PathBuf::from(appended)] {
-            match std::fs::symlink_metadata(&candidate) {
-                Ok(info) if info.file_type().is_file() => result.push(candidate),
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("stat sidecar {}", candidate.display()));
-                }
+        [path.with_extension(extension), PathBuf::from(appended)]
+    })
+}
+
+pub(crate) fn sidecars(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut result = Vec::new();
+    for candidate in sidecar_candidates(path) {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(info) if info.file_type().is_file() => result.push(candidate),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat sidecar {}", candidate.display()));
             }
         }
     }
@@ -514,9 +531,13 @@ pub(crate) fn sidecars(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn sidecar_stamp(path: &Path) -> Result<String> {
+    sidecar_paths_stamp(&sidecars(path)?)
+}
+
+pub(crate) fn sidecar_paths_stamp(sidecars: &[PathBuf]) -> Result<String> {
     let mut entries = Vec::new();
-    for candidate in sidecars(path)? {
-        let info = std::fs::symlink_metadata(&candidate)
+    for candidate in sidecars {
+        let info = std::fs::symlink_metadata(candidate)
             .with_context(|| format!("stat sidecar {}", candidate.display()))?;
         entries.push(format!(
             "{}:{}:{}",

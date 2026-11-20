@@ -52,6 +52,10 @@ struct File {
     file_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     received_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    source_identity_tags: serde_json::Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    matched_photo_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repair: Option<repair::Repair>,
     #[serde(default)]
@@ -494,6 +498,8 @@ fn plan_files(
                         input: input.clone(),
                         file_name: name,
                         received_sha256: if skipped { input.sha256.clone() } else { None },
+                        source_identity_tags: Default::default(),
+                        matched_photo_id: None,
                         skipped,
                         duplicate_path: None,
                         matched: true,
@@ -542,6 +548,8 @@ fn plan_files(
                     input: input.clone(),
                     file_name: name,
                     received_sha256: None,
+                    source_identity_tags: Default::default(),
+                    matched_photo_id: None,
                     skipped: false,
                     duplicate_path: None,
                     matched: false,
@@ -838,6 +846,26 @@ fn match_group(
         indices.iter().all(|index| !batch.files[*index].uploaded),
         conflict("cannot rematch a partially uploaded photo")
     );
+    let claimed_identity = catalog
+        .and_then(|(_, photo_id)| photo_id)
+        .map(|id| id.to_string());
+    {
+        let db = jobs.db.lock().unwrap();
+        let mut query = db.prepare("SELECT EXISTS(SELECT 1 FROM import_match_claims WHERE library_id=? AND kind=? AND value=? AND (batch_id<>? OR group_id<>?))")?;
+        let keys = inputs
+            .iter()
+            .filter(|input| !input.relative_path.to_ascii_lowercase().ends_with(".xmp"))
+            .filter_map(|input| input.sha256.as_deref().map(|sha256| ("sha256", sha256)))
+            .chain(claimed_identity.as_deref().map(|id| ("photo_id", id)));
+        for (kind, value) in keys {
+            let taken: bool =
+                query.query_row(params![library, kind, value, batch.id, key], |r| r.get(0))?;
+            ensure!(
+                !taken,
+                conflict("已有导入任务正在处理同一张照片，请在该任务完成后重试")
+            );
+        }
+    }
     let destination = target(jobs, library, &batch.target_path)?;
     let parent = if batch.preserve_structure {
         FsPath::new(&inputs[0].relative_path)
@@ -852,38 +880,13 @@ fn match_group(
         let (_, stem, suffix) = group(input)?;
         entries.push((input.clone(), stem, suffix));
     }
-    let groups = BTreeMap::from([(key, entries)]);
+    let groups = BTreeMap::from([(key.clone(), entries)]);
     let duplicate = match catalog {
         Some((store, photo_id)) => {
             cross_directory_duplicate(jobs, store, library, &directory, &inputs, photo_id)?
         }
         None => None,
     };
-    let duplicate = duplicate.or_else(|| {
-        batch
-            .files
-            .iter()
-            .filter(|file| {
-                file.uploaded
-                    && file.duplicate_path.is_none()
-                    && !file.file_name.to_ascii_lowercase().ends_with(".xmp")
-            })
-            .filter(|file| {
-                !indices
-                    .iter()
-                    .any(|i| batch.files[*i].input.id == file.input.id)
-            })
-            .filter(|file| {
-                inputs.iter().any(|input| {
-                    !input.relative_path.to_ascii_lowercase().ends_with(".xmp")
-                        && input.sha256.is_some()
-                        && input.sha256 == file.received_sha256
-                })
-            })
-            .map(|file| destination.join(&file.file_name))
-            .find(|path| path.parent() != Some(directory.as_path()))
-            .map(|path| path.to_string_lossy().into_owned())
-    });
     let planned = if let Some(path) = duplicate {
         indices
             .iter()
@@ -916,9 +919,33 @@ fn match_group(
             Some(&batch.id),
         )?
     };
-    let db = jobs.db.lock().unwrap();
-    // Uploads of other groups may have advanced while destination files were read.
-    batch = load(&db, library, id)?;
+    if let Some((store, _)) = catalog {
+        let db = store.read()?;
+        for file in planned
+            .iter()
+            .filter(|file| file.skipped && file.duplicate_path.is_none())
+        {
+            let path = directory.join(&file.file_name);
+            let path = path.to_str().context("UTF-8 import path")?;
+            let hash = file
+                .received_sha256
+                .as_deref()
+                .context("matched file lacks digest")?;
+            let managed = if file.file_name.to_ascii_lowercase().ends_with(".xmp") {
+                db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_physical_files WHERE library_id=? AND path=? AND content_hash=? AND role='sidecar')",
+                    params![library,path,hash], |r| r.get(0))?
+            } else {
+                store.original_is_online(library, path, hash)?
+            };
+            ensure!(
+                managed,
+                conflict("目标目录存在尚未登记的相同文件，请先核对图库")
+            );
+        }
+    }
+    let mut db = jobs.db.lock().unwrap();
+    let tx = db.transaction()?;
+    batch = load(&tx, library, id)?;
     let mut result = Vec::new();
     for mut file in planned {
         let index = batch
@@ -932,12 +959,55 @@ fn match_group(
             file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
         }
         file.matched = true;
+        file.matched_photo_id = claimed_identity.clone();
         batch.files[index] = file.clone();
         result.push(file);
     }
-    save(&db, library, &batch)?;
+    let new_originals = result
+        .iter()
+        .filter(|file| !file.skipped && !file.file_name.to_ascii_lowercase().ends_with(".xmp"));
+    for file in new_originals.clone() {
+        let sha256 = file
+            .received_sha256
+            .as_deref()
+            .context("matched original lacks digest")?;
+        reserve_import_match(&tx, library, &batch, &key, "sha256", sha256, file)?;
+    }
+    if let Some(photo_id) = claimed_identity
+        && let Some(file) = new_originals.clone().next()
+    {
+        reserve_import_match(&tx, library, &batch, &key, "photo_id", &photo_id, file)?;
+    }
+    save(&tx, library, &batch)?;
+    tx.commit()?;
     batch.files = result;
     Ok(batch)
+}
+
+fn reserve_import_match(
+    db: &rusqlite::Connection,
+    library: &str,
+    batch: &Batch,
+    group: &str,
+    kind: &str,
+    value: &str,
+    file: &File,
+) -> Result<()> {
+    let path = FsPath::new(&batch.target_path).join(&file.file_name);
+    let path = path.to_str().context("UTF-8 import path")?;
+    let sha256 = file
+        .received_sha256
+        .as_deref()
+        .context("matched original lacks digest")?;
+    let reserved = db.execute(
+        "INSERT INTO import_match_claims(library_id,kind,value,batch_id,group_id,path,sha256) VALUES(?,?,?,?,?,?,?) ON CONFLICT(library_id,kind,value) DO UPDATE SET group_id=excluded.group_id WHERE batch_id=excluded.batch_id AND group_id=excluded.group_id",
+        params![library,kind,value,batch.id,group,path,sha256],
+    )?;
+    ensure!(
+        reserved == 1,
+        conflict("已有导入任务正在处理同一张照片，请在该任务完成后重试")
+    );
+    Ok(())
 }
 
 fn cross_directory_duplicate(
@@ -949,24 +1019,31 @@ fn cross_directory_duplicate(
     photo_id: Option<uuid::Uuid>,
 ) -> Result<Option<String>> {
     let db = store.read()?;
+    let mut matched = BTreeMap::new();
     if let Some(photo_id) = photo_id {
-        let location: Option<String> = db
+        let location: Option<(String, String)> = db
             .query_row(
-                "SELECT l.path FROM catalog_identity_aliases i
+                "SELECT i.asset_id,l.path FROM catalog_identity_aliases i
             JOIN catalog_asset_locations l ON l.library_id=i.library_id AND l.asset_id=i.asset_id
             JOIN catalog_assets a ON a.library_id=i.library_id AND a.id=i.asset_id
             WHERE i.library_id=? AND i.root_id=? AND a.trashed=0",
                 params![library, photo_id.to_string()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some(path) = location
-            && FsPath::new(&path).try_exists()?
-        {
-            return Ok((FsPath::new(&path).parent() != Some(destination)).then_some(path));
+        if let Some((id, path)) = location {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    matched.insert(id, path);
+                }
+                Ok(_) => return Err(conflict("重复照片的图库路径不是普通文件，请先核对图库")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(conflict("重复照片的图库路径已缺失，请先核对图库"));
+                }
+                Err(error) => return Err(error).context("inspect duplicate location"),
+            }
         }
     }
-    let mut matched = BTreeMap::new();
     for input in inputs {
         if input.relative_path.to_ascii_lowercase().ends_with(".xmp") {
             continue;
@@ -1001,6 +1078,10 @@ fn cross_directory_duplicate(
             }
         }
     }
+    ensure!(
+        matched.len() <= 1,
+        conflict("匹配到多个已登记的照片，请核对后重试")
+    );
     if matched
         .values()
         .any(|location| FsPath::new(location).parent() == Some(destination))
@@ -1151,7 +1232,7 @@ async fn upload(
             .cloned()
             .ok_or_else(|| invalid("file not found"))?;
         ensure!(
-            !batch.deduplicate || file.matched || file.uploaded || file.input.sha256.is_some(),
+            !batch.deduplicate || file.matched || file.uploaded,
             conflict("match the photo group before uploading")
         );
         let destination = target(&jobs, &lib, &batch.target_path)?;
@@ -1168,8 +1249,14 @@ async fn upload(
         }
         return Ok(Json(json!({"uploaded":true})));
     }
+    let extension = FsPath::new(&file.file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_owned();
     let temporary = tempfile::Builder::new()
         .prefix(".keeps-import-")
+        .suffix(&format!(".{extension}"))
         .tempfile_in(&destination)
         .map_err(anyhow::Error::from)?;
     let mut writer = tokio::fs::File::from_std(temporary.reopen().map_err(anyhow::Error::from)?);
@@ -1207,6 +1294,14 @@ async fn upload(
             crate::media::sha256_file(temporary.path())? == received_sha256,
             invalid("uploaded file failed disk SHA256 verification")
         );
+        let source_identity_tags = match crate::native_metadata::import_identity_tags(temporary.path()) {
+            Ok(tags) => tags,
+            Err(error) if !extension.eq_ignore_ascii_case("xmp") => {
+                tracing::debug!(name = file.file_name, error = %format!("{error:#}"), "Import source identity probe could not decode media");
+                Default::default()
+            }
+            Err(error) => return Err(error),
+        };
         let _import = state.jobs.import_mutation.lock().unwrap();
         let destination = target(&state.jobs, &library, &batch.target_path)?;
         let db = state.jobs.db.lock().unwrap();
@@ -1244,6 +1339,7 @@ async fn upload(
         drop(temporary);
         item.digest_stamp = Some(DigestStamp::read(&output)?);
         item.received_sha256 = Some(received_sha256);
+        item.source_identity_tags = source_identity_tags;
         item.uploaded = true;
         save(&db, &library, &current)?;
         Ok(())
@@ -1476,7 +1572,7 @@ async fn finish(
     Ok(Json(
         tokio::task::spawn_blocking(move || {
             let _guard = state.jobs.import_mutation.lock().unwrap();
-            execute_finish(&state.jobs, &library, &id, None)
+            execute_finish(&state.jobs, &state.store, &library, &id, None)
         })
         .await
         .map_err(anyhow::Error::from)??,
@@ -1515,7 +1611,7 @@ pub fn run(
                 continue;
             }
             let result = repair::execute(&jobs, &store, &library, &id)
-                .and_then(|_| execute_finish(&jobs, &library, &id, Some(&stop)));
+                .and_then(|_| execute_finish(&jobs, &store, &library, &id, Some(&stop)));
             if let Err(error) = result {
                 let db = jobs.db.lock().unwrap();
                 let mut failed = load(&db, &library, &id)?;
@@ -1535,11 +1631,12 @@ pub fn run(
 
 fn execute_finish(
     jobs: &Jobs,
+    store: &crate::store::Store,
     library: &str,
     id: &str,
     stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Value> {
-    let result = finish_batch(jobs, library, id, stop);
+    let result = finish_batch(jobs, Some(store), library, id, stop);
     if let Err(error) = &result {
         let db = jobs.db.lock().unwrap();
         let mut batch = load(&db, library, id)?;
@@ -1622,8 +1719,11 @@ fn finalize_publications(jobs: &Jobs, library: &str, batch: &Batch, files: &[&Fi
     let tx = db.transaction()?;
     let mut latest = load(&tx, library, &batch.id)?;
     for (file, destination, unchanged, stamp) in receipts {
-        if unchanged && let Some(hash) = &file.received_sha256 {
-            save_digest(&tx, library, &destination, hash, &stamp)?;
+        if let Some(hash) = &file.received_sha256 {
+            if unchanged {
+                save_digest(&tx, library, &destination, hash, &stamp)?;
+            }
+            Jobs::permit_file(&tx, library, &destination, hash, Some(&batch.id))?;
         }
         latest
             .files
@@ -1637,8 +1737,130 @@ fn finalize_publications(jobs: &Jobs, library: &str, batch: &Batch, files: &[&Fi
     Ok(())
 }
 
+fn require_import_directory(
+    db: &rusqlite::Connection,
+    library: &str,
+    asset: &str,
+    target: &FsPath,
+) -> Result<()> {
+    let canonical: Option<String> = db
+        .query_row(
+            "SELECT directory FROM catalog_asset_directories WHERE library_id=? AND asset_id=?",
+            params![library, asset],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(directory) = canonical {
+        ensure!(
+            target == FsPath::new(&directory),
+            conflict(format!("照片已归属其他目录：{directory}"))
+        );
+    }
+    Ok(())
+}
+
+fn verify_group_locations(
+    jobs: &Jobs,
+    store: &crate::store::Store,
+    library: &str,
+    batch: &Batch,
+    groups: &BTreeMap<String, Vec<usize>>,
+    eligible: &HashSet<usize>,
+) -> Result<()> {
+    let catalog = store.read()?;
+    let mut db = jobs.db.lock().unwrap();
+    let tx = db.transaction()?;
+    for indices in groups
+        .values()
+        .filter(|indices| indices.iter().all(|i| eligible.contains(i)))
+    {
+        let files = indices.iter().map(|index| &batch.files[*index]);
+        let Some(anchor) = files
+            .clone()
+            .find(|file| !file.skipped && !file.file_name.to_ascii_lowercase().ends_with(".xmp"))
+            .or_else(|| files.clone().find(|file| !file.skipped))
+        else {
+            continue;
+        };
+        let group = group(&anchor.input)?.0;
+        let declared = anchor.matched_photo_id.as_deref();
+        let folder = FsPath::new(&batch.target_path).join(&anchor.file_name);
+        let target = folder.parent().context("import parent")?;
+        let mut roots = HashSet::new();
+        let mut claims = Vec::new();
+        if let Some(id) = declared {
+            roots.insert(id.to_owned());
+            claims.push(("photo_id", id.to_owned(), anchor));
+            if let Some(asset) =
+                crate::catalog::identified_photo(&catalog, library, &Value::Null, Some(id), None)?
+            {
+                require_import_directory(&catalog, library, &asset, target)?;
+            }
+        }
+        let media = files
+            .clone()
+            .filter(|file| !file.skipped && !file.file_name.to_ascii_lowercase().ends_with(".xmp"));
+        let sidecars = files
+            .clone()
+            .filter(|file| !file.skipped && file.file_name.to_ascii_lowercase().ends_with(".xmp"));
+        let sidecar_only = media.clone().next().is_none();
+        for file in media.chain(sidecars.clone().filter(|_| sidecar_only)) {
+            let path = FsPath::new(&file.file_name);
+            let mut tags = file.source_identity_tags.clone();
+            for candidate in crate::media::sidecar_candidates(path) {
+                if let Some(sidecar) = sidecars
+                    .clone()
+                    .find(|sidecar| FsPath::new(&sidecar.file_name) == candidate)
+                {
+                    for (key, value) in &sidecar.source_identity_tags {
+                        tags.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                    if candidate == crate::identity::sidecar_path(path)
+                        && let Some(id) = crate::media::source_identity(&Value::Object(
+                            sidecar.source_identity_tags.clone(),
+                        ))["photoID"]
+                            .as_str()
+                    {
+                        tags.insert(
+                            "XMP:Identifier".to_string(),
+                            json!(format!("https://keeps.photos/photo/{id}")),
+                        );
+                    }
+                }
+            }
+            let identity = crate::media::source_identity(&Value::Object(tags));
+            let root = identity["photoID"].as_str();
+            if let Some(id) = root {
+                roots.insert(id.to_owned());
+                claims.push(("photo_id", id.to_owned(), file));
+            }
+            for (kind, value) in crate::catalog::photo_source_keys(&identity) {
+                if kind == "software" && crate::identity::normalize(&value).is_some() {
+                    claims.push(("photo_id", value.clone(), file));
+                }
+                claims.push((kind, value, file));
+            }
+            if let Some(asset) =
+                crate::catalog::identified_photo(&catalog, library, &identity, root, None)?
+            {
+                require_import_directory(&catalog, library, &asset, target)?;
+            }
+        }
+        ensure!(
+            roots.len() <= 1,
+            conflict("同一导入组包含不同的照片身份，请先核对")
+        );
+        for (kind, value, file) in claims {
+            reserve_import_match(&tx, library, batch, &group, kind, &value, file)?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn finish_batch(
     jobs: &Jobs,
+    store: Option<&crate::store::Store>,
     library: &str,
     id: &str,
     stop: Option<&std::sync::atomic::AtomicBool>,
@@ -1676,6 +1898,9 @@ fn finish_batch(
         .flat_map(|(_, indices)| indices)
         .copied()
         .collect();
+    if let Some(store) = store {
+        verify_group_locations(jobs, store, library, &batch, &groups, &eligible)?;
+    }
     let folder = jobs
         .folders()?
         .into_iter()
@@ -1722,6 +1947,15 @@ fn finish_batch(
             .filter(|(i, item)| eligible.contains(i) && !item.published)
             .map(|(_, item)| item)
         {
+            let staged = staging(&destination, &current.id, &item.input.id);
+            if let Some(hash) = &item.received_sha256
+                && item.digest_stamp.as_ref() != Some(&DigestStamp::read(&staged)?)
+            {
+                ensure!(
+                    file_digest(jobs, library, &staged)? == *hash,
+                    conflict("已验证的导入文件发生变更，请重新上传")
+                );
+            }
             let output = destination.join(&item.file_name);
             match std::fs::symlink_metadata(&output) {
                 Ok(_) => ensure!(
@@ -1913,6 +2147,66 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn active_match_claim_persists_across_batches_and_resolves_after_indexing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let originals = dir.path().join("photos");
+        std::fs::create_dir(&originals)?;
+        let jobs_path = dir.path().join("jobs.sqlite");
+        let jobs = Jobs::open(&jobs_path, &originals)?;
+        let store = crate::store::Store::open(&dir.path().join("catalog.sqlite"), true)?;
+        jobs.add_folder("lib", ".")?;
+        let first = prepare(
+            &jobs,
+            "lib",
+            structure_input(jobs.root(), &["first/photo.jpg"], true),
+        )?;
+        let second = prepare(
+            &jobs,
+            "lib",
+            structure_input(jobs.root(), &["second/photo.jpg"], true),
+        )?;
+        let mut third_input = structure_input(jobs.root(), &["third/photo.jpg"], true);
+        third_input.files[0].sha256 = None;
+        let third = prepare(&jobs, "lib", third_input)?;
+        let hash = format!("{:x}", Sha256::digest(b"original"));
+        let identity = uuid::Uuid::new_v4();
+        let match_file = |jobs: &Jobs, batch: &Batch, sha256: &str, id| {
+            let mut input = batch.files[0].input.clone();
+            input.sha256 = Some(sha256.to_owned());
+            match_group(
+                jobs,
+                Some((&store, id)),
+                "lib",
+                &batch.id,
+                &input.id.clone(),
+                vec![input],
+            )
+        };
+        assert!(!match_file(&jobs, &first, &hash, Some(identity))?.files[0].skipped);
+        drop(jobs);
+        let jobs = Jobs::open(&jobs_path, &originals)?;
+        for (batch, digest, id) in [
+            (&second, hash.clone(), None),
+            (&third, "f".repeat(64), Some(identity)),
+        ] {
+            let err = match_file(&jobs, batch, &digest, id).unwrap_err();
+            assert!(err.to_string().contains("正在处理同一张照片"), "{err:#}");
+        }
+        let first_path = jobs.root().join("first/photo.jpg");
+        std::fs::create_dir(first_path.parent().unwrap())?;
+        std::fs::write(&first_path, b"original")?;
+        let text = first_path.to_str().unwrap();
+        store.ingest_original("lib", text,
+            &json!({"contentHash":hash,"sizeBytes":8,"role":"jpeg_original"}),
+            &json!({"photoID":identity,"originalFilename":"photo.jpg","contentFingerprint":hash,"metadataFingerprint":"test","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"}))?;
+        jobs.complete_file_publication("lib", text, &hash)?;
+        let matched = match_file(&jobs, &second, &hash, None)?;
+        assert_eq!(matched.files[0].duplicate_path.as_deref(), Some(text));
+        assert!(matched.files[0].skipped);
+        Ok(())
     }
 
     #[test]
@@ -2120,7 +2414,7 @@ mod tests {
         batch.files[0].received_sha256 = Some(hash.clone());
         batch.files[0].digest_stamp = Some(DigestStamp::read(&staged).unwrap());
         save(&jobs.db.lock().unwrap(), "lib", &batch).unwrap();
-        finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        finish_batch(&jobs, None, "lib", &batch.id, None).unwrap();
         let destination = jobs.root().join("image.CR3");
         assert!(!staged.exists());
         let stamp: String = jobs
@@ -2151,6 +2445,12 @@ mod tests {
         let db = dir.path().join("jobs.sqlite");
         let jobs = Jobs::open(&db, &root).unwrap();
         jobs.add_folder("lib", ".").unwrap();
+        let store = crate::store::Store::open(&dir.path().join("catalog.sqlite"), true).unwrap();
+        let existing = jobs.root().join("card/day/IMG.CR3");
+        let hash = crate::media::sha256_file(&existing).unwrap();
+        store.ingest_original("lib", existing.to_str().unwrap(),
+            &json!({"contentHash":hash,"sizeBytes":8,"role":"raw_original"}),
+            &json!({"originalFilename":"IMG.CR3","contentFingerprint":hash,"metadataFingerprint":"test","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})).unwrap();
         let input = structure_input(
             jobs.root(),
             &["card/day/IMG.CR3", "card/day/IMG.CR3.xmp", "other/IMG.CR3"],
@@ -2165,7 +2465,7 @@ mod tests {
         );
         match_group(
             &jobs,
-            None,
+            Some((&store, None)),
             "lib",
             &batch.id,
             &input.files[0].id,
@@ -2174,7 +2474,7 @@ mod tests {
         .unwrap();
         match_group(
             &jobs,
-            None,
+            Some((&store, None)),
             "lib",
             &batch.id,
             &input.files[2].id,
@@ -2301,7 +2601,7 @@ mod tests {
         );
         state.store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','hash','fp','2024-01-01','photo.jpg',0,'none',NULL,0)",[])?;
         state.store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'asset','hash','jpeg_original')",
             [state.jobs.root().join("photo.jpg").to_str().unwrap()],
         )?;
         assert_eq!(
@@ -2309,7 +2609,7 @@ mod tests {
             0
         );
         state.store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','raw_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'asset','hash','raw_original')",
             [state.jobs.root().join("photo.CR3").to_str().unwrap()],
         )?;
         let first = pipeline_status(&state, "lib", &batch.id)?;
@@ -2319,7 +2619,7 @@ mod tests {
         assert_eq!(first["thumbnailCompleted"], 0);
         state.store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','second','{}','hash2','fp2','2024-01-01','second.jpg',0,'none',NULL,0)",[])?;
         state.store.lock()?.execute(
-            "INSERT INTO catalog_paths VALUES('lib',?,'second','hash2','jpeg_original')",
+            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'second','hash2','jpeg_original')",
             [state.jobs.root().join("second.jpg").to_str().unwrap()],
         )?;
         state.store.reconcile_cache()?;
@@ -2416,7 +2716,7 @@ mod tests {
         }
         assert!(!root.join("card").exists());
         std::os::unix::fs::symlink(dir.path(), root.join("card")).unwrap();
-        assert!(finish_batch(&state.jobs, "lib", &batch.id, None).is_err());
+        assert!(finish_batch(&state.jobs, Some(&state.store), "lib", &batch.id, None).is_err());
         std::fs::remove_file(root.join("card")).unwrap();
         assert!(!dir.path().join("day").exists());
         let Json(submitted) = finish(
@@ -2512,7 +2812,7 @@ mod tests {
             }
         }
         save(&jobs.db.lock().unwrap(), "lib", &batch).unwrap();
-        finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        finish_batch(&jobs, None, "lib", &batch.id, None).unwrap();
         assert!(!jobs.root().join("first.CR3").exists());
         assert!(jobs.jobs(100).unwrap().is_empty());
         for file in &mut batch.files {
@@ -2523,7 +2823,7 @@ mod tests {
             }
         }
         save(&jobs.db.lock().unwrap(), "lib", &batch).unwrap();
-        finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        finish_batch(&jobs, None, "lib", &batch.id, None).unwrap();
         let published = load(&jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
         assert!(!published.finished && !published.finish_requested);
         assert_eq!(published.files.iter().filter(|f| f.published).count(), 2);
@@ -2536,7 +2836,7 @@ mod tests {
         assert!(
             group_pending_publication(&jobs, "lib", &[jobs.root().join("second.CR3")]).unwrap()
         );
-        finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        finish_batch(&jobs, None, "lib", &batch.id, None).unwrap();
         assert_eq!(jobs.jobs(100).unwrap().len(), 1);
         // A publication snapshot must not erase a concurrent upload or seal.
         let mut latest = published.clone();
@@ -2604,7 +2904,7 @@ mod tests {
         std::fs::write(staging(&root, &batch.id, &first.input.id), b"original").unwrap();
         first.uploaded = true;
         save(&state.jobs.db.lock().unwrap(), "lib", &batch).unwrap();
-        finish_batch(&state.jobs, "lib", &batch.id, None).unwrap();
+        finish_batch(&state.jobs, Some(&state.store), "lib", &batch.id, None).unwrap();
         let mut batch = load(&state.jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
         let old_job = batch.group_jobs.values().next().unwrap().clone();
         state.jobs.db.lock().unwrap().execute("UPDATE jobs SET status='failed',failed=1,error='synthetic index failure' WHERE id=?",[&old_job]).unwrap();
@@ -2677,7 +2977,7 @@ mod tests {
         save(&jobs.db.lock().unwrap(), "lib", &batch).unwrap();
         let stopping = std::sync::atomic::AtomicBool::new(true);
         assert_eq!(
-            finish_batch(&jobs, "lib", &batch.id, Some(&stopping)).unwrap()["status"],
+            finish_batch(&jobs, None, "lib", &batch.id, Some(&stopping)).unwrap()["status"],
             "publishing"
         );
         assert!(
@@ -2688,7 +2988,7 @@ mod tests {
         assert!(jobs.jobs(100).unwrap().is_empty());
         let worker = std::thread::spawn({
             let (jobs, id) = (jobs.clone(), batch.id.clone());
-            move || finish_batch(&jobs, "lib", &id, None).unwrap()
+            move || finish_batch(&jobs, None, "lib", &id, None).unwrap()
         });
         let mut observed_checkpoint = false;
         while !worker.is_finished() {
@@ -2705,7 +3005,7 @@ mod tests {
             observed_checkpoint,
             "database must remain accessible between publication checkpoints"
         );
-        let repeated = finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        let repeated = finish_batch(&jobs, None, "lib", &batch.id, None).unwrap();
         assert_eq!(result["job"]["id"], repeated["job"]["id"]);
         assert_eq!(jobs.jobs(1000).unwrap().len(), 256);
         assert!(
