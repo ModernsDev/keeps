@@ -272,6 +272,67 @@ CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NUL
     Ok(())
 }
 
+pub(crate) fn photo_source_keys(
+    snapshot: &Value,
+) -> impl Iterator<Item = (&'static str, String)> + '_ {
+    [
+        ("camera", "cameraImageID"),
+        ("software", "originalDocumentID"),
+        ("software", "documentID"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, field)| {
+        let raw = snapshot[field].as_str().filter(|value| !value.is_empty())?;
+        let value = if kind == "software" {
+            crate::identity::normalize(raw).unwrap_or_else(|| raw.to_owned())
+        } else {
+            raw.to_owned()
+        };
+        Some((kind, value))
+    })
+}
+
+pub(crate) fn identified_photo(
+    db: &Connection,
+    lib: &str,
+    snapshot: &Value,
+    root: Option<&str>,
+    previous_path_asset: Option<String>,
+) -> Result<Option<String>> {
+    let alias = |value: &str| -> Result<Option<String>> {
+        Ok(db
+            .query_row(
+                "SELECT asset_id FROM catalog_identity_aliases WHERE library_id=? AND root_id=?",
+                params![lib, value],
+                |r| r.get(0),
+            )
+            .optional()?)
+    };
+    if let Some(root) = root {
+        return Ok(Some(alias(root)?.unwrap_or_else(|| root.to_owned())));
+    }
+    if previous_path_asset.is_some() {
+        return Ok(previous_path_asset);
+    }
+    for (kind, value) in photo_source_keys(snapshot) {
+        if kind == "software"
+            && let Some(asset) = alias(&value)?
+        {
+            return Ok(Some(asset));
+        }
+        let mut q = db.prepare("SELECT DISTINCT asset_id FROM catalog_photo_sources WHERE library_id=? AND kind=? AND value=? LIMIT 2")?;
+        let ids = q
+            .query_map(params![lib, kind, value], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if ids.len() == 1 {
+            return Ok(ids.into_iter().next());
+        }
+    }
+    Ok(snapshot["originalDocumentID"]
+        .as_str()
+        .and_then(crate::identity::normalize))
+}
+
 fn capture_uuid(snapshot: &Value) -> String {
     let millis = snapshot["captureTime"]
         .as_str()
@@ -1009,57 +1070,10 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        let id = if let Some(root) = &root {
-            tx.query_row(
-                "SELECT asset_id FROM catalog_identity_aliases WHERE library_id=? AND root_id=?",
-                params![lib, root],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or_else(|| root.clone())
-        } else if let Some(id) = previous_path_asset {
-            id
-        } else {
-            let mut matched = None;
-            for (kind, field) in [
-                ("camera", "cameraImageID"),
-                ("software", "originalDocumentID"),
-                ("software", "documentID"),
-            ] {
-                if let Some(raw) = snapshot[field].as_str().filter(|v| !v.is_empty()) {
-                    let normalized = if kind == "software" {
-                        crate::identity::normalize(raw).unwrap_or_else(|| raw.to_owned())
-                    } else {
-                        raw.to_owned()
-                    };
-                    let value = normalized.as_str();
-                    if kind == "software" {
-                        let known: Option<String> = tx.query_row("SELECT asset_id FROM catalog_identity_aliases WHERE library_id=? AND root_id=?",params![lib,value],|r|r.get(0)).optional()?;
-                        if known.is_some() {
-                            matched = known;
-                            break;
-                        }
-                    }
-                    let mut q = tx.prepare("SELECT DISTINCT asset_id FROM catalog_photo_sources WHERE library_id=? AND kind=? AND value=? LIMIT 2")?;
-                    let ids = q
-                        .query_map(params![lib, kind, value], |r| r.get::<_, String>(0))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    if ids.len() == 1 {
-                        matched = ids.into_iter().next();
-                        break;
-                    }
-                }
-            }
-            let matched = matched.or_else(|| {
-                snapshot["originalDocumentID"]
-                    .as_str()
-                    .and_then(crate::identity::normalize)
-            });
-            match matched {
-                Some(id) => id,
-                None => crate::photo_relations::filename_match(&tx, lib, path, snapshot)?
-                    .unwrap_or_else(|| capture_uuid(snapshot)),
-            }
+        let id = match identified_photo(&tx, lib, snapshot, root.as_deref(), previous_path_asset)? {
+            Some(id) => id,
+            None => crate::photo_relations::filename_match(&tx, lib, path, snapshot)?
+                .unwrap_or_else(|| capture_uuid(snapshot)),
         };
         if existing(&tx, lib, &id)?.is_none() {
             let mut snapshot = snapshot.clone();
@@ -1082,22 +1096,11 @@ impl Store {
         )?;
         register_file(&tx, lib, &id, file, "online")?;
         crate::versions::register(&tx, lib, &id, path, file, snapshot, evidence)?;
-        for (kind, field) in [
-            ("camera", "cameraImageID"),
-            ("software", "originalDocumentID"),
-            ("software", "documentID"),
-        ] {
-            if let Some(raw) = snapshot[field].as_str().filter(|v| !v.is_empty()) {
-                let value = if kind == "software" {
-                    crate::identity::normalize(raw).unwrap_or_else(|| raw.to_owned())
-                } else {
-                    raw.to_owned()
-                };
-                tx.execute(
-                    "INSERT OR IGNORE INTO catalog_photo_sources VALUES(?,?,?,?)",
-                    params![lib, kind, value, id],
-                )?;
-            }
+        for (kind, value) in photo_source_keys(snapshot) {
+            tx.execute(
+                "INSERT OR IGNORE INTO catalog_photo_sources VALUES(?,?,?,?)",
+                params![lib, kind, value, id],
+            )?;
         }
         if let Some(time) = snapshot["captureTime"].as_str() {
             tx.execute("UPDATE catalog_assets SET snapshot=json_set(snapshot,'$.captureTime',?),sort_time=? WHERE library_id=? AND id=? AND json_extract(snapshot,'$.captureTime') IS NULL",params![time,time,lib,id])?;

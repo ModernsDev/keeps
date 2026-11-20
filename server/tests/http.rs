@@ -1899,6 +1899,15 @@ async fn cross_directory_import_skip_reports_existing_path_and_needs_no_index_jo
 
 #[tokio::test]
 async fn disabling_import_dedup_does_not_publish_a_known_photo_in_another_directory() {
+    assert_cross_directory_identity_rejected(true).await;
+}
+
+#[tokio::test]
+async fn imports_resolve_software_original_document_id_before_publication() {
+    assert_cross_directory_identity_rejected(false).await;
+}
+
+async fn assert_cross_directory_identity_rejected(keeps_id: bool) {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path());
     state.jobs.add_folder("photos", ".").unwrap();
@@ -1908,16 +1917,54 @@ async fn disabling_import_dedup_does_not_publish_a_known_photo_in_another_direct
     let original = root.join("existing/photo.jpg");
     std::fs::write(&original, b"original").unwrap();
     let identity = uuid::Uuid::new_v4();
-    state.store.ingest_original("photos",original.to_str().unwrap(),
-        &json!({"contentHash":"known","sizeBytes":8,"role":"jpeg_original"}),
-        &json!({"photoID":identity,"originalFilename":"photo.jpg","contentFingerprint":"known","metadataFingerprint":"meta","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
-    ).unwrap();
+    let document_id = "xmp.did:original-document-preflight-regression";
+    let mut snapshot = json!({"originalFilename":"photo.jpg","contentFingerprint":"known","metadataFingerprint":"meta","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"});
+    let identity_attribute = if keeps_id {
+        snapshot["photoID"] = json!(identity);
+        format!(
+            r#"xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="https://keeps.photos/photo/{identity}""#
+        )
+    } else {
+        snapshot["originalDocumentID"] = json!(document_id);
+        format!(
+            r#"xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/" xmpMM:OriginalDocumentID="{document_id}""#
+        )
+    };
+    state
+        .store
+        .ingest_original(
+            "photos",
+            original.to_str().unwrap(),
+            &json!({"contentHash":"known","sizeBytes":8,"role":"jpeg_original"}),
+            &snapshot,
+        )
+        .unwrap();
     let app = router(state.clone());
+    let batch = stage_import_with_xmp(app.clone(), &root.join("target"), &identity_attribute).await;
+    let (status, body) = call(
+        app,
+        "POST",
+        &format!("/libraries/photos/imports/{batch}/finish"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("照片已归属其他目录"), "{body}");
+    assert!(!root.join("target/photo.jpg").exists());
+    assert!(!root.join("target/photo.jpg.xmp").exists());
+    assert_eq!(std::fs::read(&original).unwrap(), b"original");
+}
+
+async fn stage_import_with_xmp(
+    app: axum::Router,
+    target: &Path,
+    identity_attribute: &str,
+) -> uuid::Uuid {
     let batch = uuid::Uuid::new_v4();
     let original_id = uuid::Uuid::new_v4();
     let sidecar_id = uuid::Uuid::new_v4();
     let sidecar = format!(
-        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="https://keeps.photos/photo/{identity}" /></rdf:RDF></x:xmpmeta>"#
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" {identity_attribute} /></rdf:RDF></x:xmpmeta>"#
     );
     let files = [
         (original_id, "photo.jpg", b"different bytes".to_vec()),
@@ -1931,7 +1978,7 @@ async fn disabling_import_dedup_does_not_publish_a_known_photo_in_another_direct
         app.clone(),
         "POST",
         "/libraries/photos/imports",
-        json!({"id":batch,"targetPath":root.join("target"),"deduplicate":false,"files":manifest}),
+        json!({"id":batch,"targetPath":target,"deduplicate":false,"files":manifest}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{prepared}");
@@ -1950,18 +1997,45 @@ async fn disabling_import_dedup_does_not_publish_a_known_photo_in_another_direct
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let (status, body) = call(
-        app,
+    batch
+}
+
+#[tokio::test]
+async fn imports_reserve_software_identity_until_first_batch_is_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    state.jobs.add_folder("photos", ".").unwrap();
+    let first = state.jobs.root().join("first");
+    let second = state.jobs.root().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let app = router(state.clone());
+    let identity = r#"xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/" xmpMM:OriginalDocumentID="xmp.did:claim-regression""#;
+    let first_batch = stage_import_with_xmp(app.clone(), &first, identity).await;
+    let second_batch = stage_import_with_xmp(app.clone(), &second, identity).await;
+    let (first_status, first_body) = call(
+        app.clone(),
         "POST",
-        &format!("/libraries/photos/imports/{batch}/finish"),
+        &format!("/libraries/photos/imports/{first_batch}/finish"),
         Value::Null,
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.to_string().contains("照片已归属其他目录"), "{body}");
-    assert!(!root.join("target/photo.jpg").exists());
-    assert!(!root.join("target/photo.jpg.xmp").exists());
-    assert_eq!(std::fs::read(&original).unwrap(), b"original");
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    let (second_status, second_body) = call(
+        app,
+        "POST",
+        &format!("/libraries/photos/imports/{second_batch}/finish"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(second_status, StatusCode::CONFLICT, "{second_body}");
+    assert!(
+        second_body.to_string().contains("正在处理同一张照片"),
+        "{second_body}"
+    );
+    assert!(first.join("photo.jpg").exists());
+    assert!(!second.join("photo.jpg").exists());
+    assert!(!second.join("photo.jpg.xmp").exists());
 }
 
 #[tokio::test]

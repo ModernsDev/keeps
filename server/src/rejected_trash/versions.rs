@@ -365,25 +365,47 @@ pub(super) fn finish(
     crate::asset_move::preflight(jobs, store, library, &moves)?;
     crate::asset_move::move_files(jobs, store, library, moves, || Ok(()))?;
     for row in selections {
-        let current = {
-            let db = store.lock()?;
-            crate::catalog::photo_location(&db, library, &row.pick.asset_id)?
+        let destination = Path::new(&row.destination);
+        let db = store.read()?;
+        let (directory, photo_id, default, negative): (String, String, Option<String>, Option<String>) = db.query_row(
+            "SELECT p.directory,i.root_id,d.content_hash,a.negative_hash
+            FROM catalog_physical_files p
+            JOIN catalog_identity_roots i USING(library_id,asset_id)
+            JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id
+            LEFT JOIN catalog_defaults d ON d.library_id=p.library_id AND d.asset_id=p.asset_id
+            WHERE p.library_id=? AND p.asset_id=? AND p.path=? AND p.content_hash=? AND p.versioned=1",
+            params![library,row.pick.asset_id,row.destination,row.keep_hash],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        )?;
+        let expected_default = if row.changes_default {
+            Some(row.keep_hash.as_str())
+        } else {
+            row.default_hash.as_deref()
         };
-        if current.as_deref().and_then(|p| Path::new(p).parent())
-            != Path::new(&row.destination).parent()
-        {
-            store.choose_photo_location(library, &row.pick.asset_id, &row.destination)?;
-        }
         ensure!(
-            crate::media::sha256_file(Path::new(&row.destination))? == row.keep_hash,
+            destination.parent() == Some(Path::new(&directory))
+                && photo_id == row.photo_id
+                && expected_default.is_none_or(|hash| default.as_deref() == Some(hash))
+                && (!row.changes_editing_negative || negative.as_deref() == Some(&row.keep_hash)),
+            error(409, "保留版本的目录、照片身份或版本引用与预览不符")
+        );
+        ensure!(
+            crate::media::sha256_file(destination)? == row.keep_hash,
             error(409, "归位后的文件内容与预览不符")
         );
+        let mut canonical_xmp = false;
         for sidecar in &row.retained_files[1..] {
+            let path = Path::new(&sidecar.path);
             ensure!(
-                File::inspect(Path::new(&sidecar.path))? == *sidecar,
+                File::inspect(path)? == *sidecar,
                 error(409, "保留 XMP 与预览不符")
             );
+            if let Some(id) = crate::identity::file_sidecar_photo_id(path)? {
+                ensure!(id == photo_id, error(409, "保留 XMP 的照片身份与图库不符"));
+                canonical_xmp = true;
+            }
         }
+        ensure!(canonical_xmp, error(409, "保留版本缺少带照片 ID 的 XMP"));
     }
     store.reconcile_cache()?;
     crate::sync_navigation::refresh(store, jobs, library)?;

@@ -52,8 +52,10 @@ struct File {
     file_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     received_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    source_identity_tags: serde_json::Map<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_photo_id: Option<String>,
+    matched_photo_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repair: Option<repair::Repair>,
     #[serde(default)]
@@ -496,7 +498,8 @@ fn plan_files(
                         input: input.clone(),
                         file_name: name,
                         received_sha256: if skipped { input.sha256.clone() } else { None },
-                        source_photo_id: None,
+                        source_identity_tags: Default::default(),
+                        matched_photo_id: None,
                         skipped,
                         duplicate_path: None,
                         matched: true,
@@ -545,7 +548,8 @@ fn plan_files(
                     input: input.clone(),
                     file_name: name,
                     received_sha256: None,
-                    source_photo_id: None,
+                    source_identity_tags: Default::default(),
+                    matched_photo_id: None,
                     skipped: false,
                     duplicate_path: None,
                     matched: false,
@@ -955,6 +959,7 @@ fn match_group(
             file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
         }
         file.matched = true;
+        file.matched_photo_id = claimed_identity.clone();
         batch.files[index] = file.clone();
         result.push(file);
     }
@@ -1289,16 +1294,13 @@ async fn upload(
             crate::media::sha256_file(temporary.path())? == received_sha256,
             invalid("uploaded file failed disk SHA256 verification")
         );
-        let source_photo_id = if extension.eq_ignore_ascii_case("xmp") {
-            crate::identity::file_sidecar_photo_id(temporary.path())?
-        } else {
-            match crate::native_metadata::embedded_photo_id(temporary.path()) {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::debug!(name = file.file_name, error = %format!("{error:#}"), "Import source identity probe could not decode media");
-                    None
-                }
+        let source_identity_tags = match crate::native_metadata::import_identity_tags(temporary.path()) {
+            Ok(tags) => tags,
+            Err(error) if !extension.eq_ignore_ascii_case("xmp") => {
+                tracing::debug!(name = file.file_name, error = %format!("{error:#}"), "Import source identity probe could not decode media");
+                Default::default()
             }
+            Err(error) => return Err(error),
         };
         let _import = state.jobs.import_mutation.lock().unwrap();
         let destination = target(&state.jobs, &library, &batch.target_path)?;
@@ -1337,7 +1339,7 @@ async fn upload(
         drop(temporary);
         item.digest_stamp = Some(DigestStamp::read(&output)?);
         item.received_sha256 = Some(received_sha256);
-        item.source_photo_id = source_photo_id;
+        item.source_identity_tags = source_identity_tags;
         item.uploaded = true;
         save(&db, &library, &current)?;
         Ok(())
@@ -1735,6 +1737,28 @@ fn finalize_publications(jobs: &Jobs, library: &str, batch: &Batch, files: &[&Fi
     Ok(())
 }
 
+fn require_import_directory(
+    db: &rusqlite::Connection,
+    library: &str,
+    asset: &str,
+    target: &FsPath,
+) -> Result<()> {
+    let canonical: Option<String> = db
+        .query_row(
+            "SELECT directory FROM catalog_asset_directories WHERE library_id=? AND asset_id=?",
+            params![library, asset],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(directory) = canonical {
+        ensure!(
+            target == FsPath::new(&directory),
+            conflict(format!("照片已归属其他目录：{directory}"))
+        );
+    }
+    Ok(())
+}
+
 fn verify_group_locations(
     jobs: &Jobs,
     store: &crate::store::Store,
@@ -1759,33 +1783,76 @@ fn verify_group_locations(
             continue;
         };
         let group = group(&anchor.input)?.0;
-        let declared: Option<String> = tx.query_row(
-            "SELECT value FROM import_match_claims WHERE library_id=? AND batch_id=? AND group_id=? AND kind='photo_id'",
-            params![library,batch.id,group], |r| r.get(0),
-        ).optional()?;
-        let identities: HashSet<_> = files
-            .filter_map(|file| file.source_photo_id.as_deref())
-            .chain(declared.as_deref())
-            .collect();
+        let declared = anchor.matched_photo_id.as_deref();
+        let folder = FsPath::new(&batch.target_path).join(&anchor.file_name);
+        let target = folder.parent().context("import parent")?;
+        let mut roots = HashSet::new();
+        let mut claims = Vec::new();
+        if let Some(id) = declared {
+            roots.insert(id.to_owned());
+            claims.push(("photo_id", id.to_owned(), anchor));
+            if let Some(asset) =
+                crate::catalog::identified_photo(&catalog, library, &Value::Null, Some(id), None)?
+            {
+                require_import_directory(&catalog, library, &asset, target)?;
+            }
+        }
+        let media = files
+            .clone()
+            .filter(|file| !file.skipped && !file.file_name.to_ascii_lowercase().ends_with(".xmp"));
+        let sidecars = files
+            .clone()
+            .filter(|file| !file.skipped && file.file_name.to_ascii_lowercase().ends_with(".xmp"));
+        let sidecar_only = media.clone().next().is_none();
+        for file in media.chain(sidecars.clone().filter(|_| sidecar_only)) {
+            let path = FsPath::new(&file.file_name);
+            let mut tags = file.source_identity_tags.clone();
+            for candidate in crate::media::sidecar_candidates(path) {
+                if let Some(sidecar) = sidecars
+                    .clone()
+                    .find(|sidecar| FsPath::new(&sidecar.file_name) == candidate)
+                {
+                    for (key, value) in &sidecar.source_identity_tags {
+                        tags.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                    if candidate == crate::identity::sidecar_path(path)
+                        && let Some(id) = crate::media::source_identity(&Value::Object(
+                            sidecar.source_identity_tags.clone(),
+                        ))["photoID"]
+                            .as_str()
+                    {
+                        tags.insert(
+                            "XMP:Identifier".to_string(),
+                            json!(format!("https://keeps.photos/photo/{id}")),
+                        );
+                    }
+                }
+            }
+            let identity = crate::media::source_identity(&Value::Object(tags));
+            let root = identity["photoID"].as_str();
+            if let Some(id) = root {
+                roots.insert(id.to_owned());
+                claims.push(("photo_id", id.to_owned(), file));
+            }
+            for (kind, value) in crate::catalog::photo_source_keys(&identity) {
+                if kind == "software" && crate::identity::normalize(&value).is_some() {
+                    claims.push(("photo_id", value.clone(), file));
+                }
+                claims.push((kind, value, file));
+            }
+            if let Some(asset) =
+                crate::catalog::identified_photo(&catalog, library, &identity, root, None)?
+            {
+                require_import_directory(&catalog, library, &asset, target)?;
+            }
+        }
         ensure!(
-            identities.len() <= 1,
+            roots.len() <= 1,
             conflict("同一导入组包含不同的照片身份，请先核对")
         );
-        let Some(photo_id) = identities.into_iter().next() else {
-            continue;
-        };
-        let canonical: Option<String> = catalog.query_row(
-            "SELECT d.directory FROM catalog_identity_aliases i JOIN catalog_asset_directories d USING(library_id,asset_id) WHERE i.library_id=? AND i.root_id=?",
-            params![library,photo_id], |r| r.get(0),
-        ).optional()?;
-        let destination = FsPath::new(&batch.target_path).join(&anchor.file_name);
-        if let Some(directory) = canonical {
-            ensure!(
-                destination.parent() == Some(FsPath::new(&directory)),
-                conflict(format!("照片已归属其他目录：{directory}"))
-            );
+        for (kind, value, file) in claims {
+            reserve_import_match(&tx, library, batch, &group, kind, &value, file)?;
         }
-        reserve_import_match(&tx, library, batch, &group, "photo_id", photo_id, anchor)?;
     }
     tx.commit()?;
     Ok(())
