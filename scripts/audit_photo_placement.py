@@ -179,8 +179,8 @@ def catalog_snapshot(db, library, report):
 
     db.execute("BEGIN")
     schema = db.execute("PRAGMA user_version").fetchone()[0]
-    if schema not in (24, 25, 26, 27):
-        raise ValueError(f"不支持图库 schema {schema}，需要 24 至 27")
+    if schema not in (24, 25, 26, 27, 28):
+        raise ValueError(f"不支持图库 schema {schema}，需要 24 至 28")
     revision = get("SELECT coalesce(max(revision),0) FROM catalog_version_revision WHERE library_id=?").fetchone()[0]
     assets = {asset for asset, in get("SELECT id FROM catalog_assets WHERE library_id=?")}
     roots = dict(get("SELECT asset_id,root_id FROM catalog_identity_roots WHERE library_id=?"))

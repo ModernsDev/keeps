@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 27;
+pub(crate) const VERSION: i64 = 28;
 const DIRECTORY_EXACT: &str = "SELECT library_id,asset_id,directory FROM catalog_asset_directories WHERE library_id=? AND directory=?";
 const DIRECTORY_RANGE: &str = "SELECT library_id,asset_id,directory FROM catalog_asset_directories WHERE library_id=? AND directory>=? AND directory<?";
 const LIVE_ASSET: &str = "EXISTS(SELECT 1 FROM catalog_physical_files live
@@ -83,19 +83,7 @@ fn directory_scope(
 }
 
 pub(crate) fn directory_photo_counts(db: &Connection, lib: &str, path: &str) -> Result<(i64, i64)> {
-    let direct = path.trim_end_matches('/');
-    let direct = if direct.is_empty() { "/" } else { direct };
-    let (scope, mut values) = directory_scope(lib, path, true);
-    values.insert(0, direct.to_owned().into());
-    Ok(db
-        .prepare_cached(&format!(
-            "SELECT count(*) FILTER(WHERE d.directory=?), count(*)
-        FROM ({scope}) d JOIN catalog_assets a ON a.library_id=d.library_id AND a.id=d.asset_id
-        WHERE a.trashed=0 AND {LIVE_ASSET}"
-        ))?
-        .query_row(rusqlite::params_from_iter(values), |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?)
+    crate::directory_counts::read(db, lib, path)
 }
 
 const SCHEMA: &str = r#"
@@ -156,6 +144,10 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         db.prepare("SELECT library_id,path,asset_id,content_hash,role FROM catalog_paths LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,path FROM catalog_asset_locations LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,directory FROM catalog_asset_directories INDEXED BY catalog_asset_directories_directory LIMIT 0")?;
+        db.prepare("SELECT library_id,asset_id,directory FROM catalog_counted_photos LIMIT 0")?;
+        db.prepare(
+            "SELECT library_id,directory,direct_count FROM catalog_directory_photo_counts LIMIT 0",
+        )?;
         db.prepare("SELECT library_id,path FROM catalog_hidden_directories LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,content_hash,visual_hash,capture_key,width,height,priority,evidence FROM catalog_versions LIMIT 0")?;
         db.prepare("SELECT library_id,path,asset_id,content_hash,available FROM catalog_version_paths LIMIT 0")?;
@@ -331,6 +323,9 @@ CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NUL
             "DELETE FROM catalog_revision_dirty WHERE kind='navigation'",
             [],
         )?;
+    }
+    if version < 28 {
+        crate::directory_counts::migrate(&tx)?;
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
@@ -547,7 +542,7 @@ fn existing(db: &Connection, lib: &str, id: &str) -> Result<Option<Value>> {
         .transpose()
 }
 fn save(db: &Connection, lib: &str, a: &Value) -> Result<()> {
-    db.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(library_id,id) DO UPDATE SET snapshot=excluded.snapshot,content_hash=excluded.content_hash,fingerprint=excluded.fingerprint,sort_time=excluded.sort_time,filename=excluded.filename,rating=excluded.rating,flag=excluded.flag,color=excluded.color,trashed=excluded.trashed",params![lib,text(a,"id")?,a.to_string(),text(a,"contentFingerprint")?,text(a,"metadataFingerprint")?,a["captureTime"].as_str().unwrap_or(text(a,"createdAt")?),text(a,"originalFilename")?,a["rating"].as_i64().unwrap_or(0),a["flagState"].as_str().unwrap_or("unflagged"),a["colorLabel"].as_str(),a["trashed"].as_bool().unwrap_or(false)])?;
+    db.prepare_cached("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(library_id,id) DO UPDATE SET snapshot=excluded.snapshot,content_hash=excluded.content_hash,fingerprint=excluded.fingerprint,sort_time=excluded.sort_time,filename=excluded.filename,rating=excluded.rating,flag=excluded.flag,color=excluded.color,trashed=excluded.trashed")?.execute(params![lib,text(a,"id")?,a.to_string(),text(a,"contentFingerprint")?,text(a,"metadataFingerprint")?,a["captureTime"].as_str().unwrap_or(text(a,"createdAt")?),text(a,"originalFilename")?,a["rating"].as_i64().unwrap_or(0),a["flagState"].as_str().unwrap_or("unflagged"),a["colorLabel"].as_str(),a["trashed"].as_bool().unwrap_or(false)])?;
     Ok(())
 }
 
@@ -763,13 +758,13 @@ impl Store {
                 }
             }
         }
-        let mut filter = format!("a.library_id=? AND a.trashed=? AND {LIVE_ASSET}");
+        let mut member_filters = String::new();
         let mut values: Vec<rusqlite::types::Value> = vec![
             lib.to_string().into(),
             (q.trashed.unwrap_or(false) as i64).into(),
         ];
         if let Some(s) = q.q.as_ref().filter(|v| !v.is_empty()) {
-            filter.push_str(" AND (a.filename LIKE ? ESCAPE '\\' OR json_extract(a.snapshot,'$.cameraModel') LIKE ? ESCAPE '\\')");
+            member_filters.push_str(" AND (a.filename LIKE ? ESCAPE '\\' OR json_extract(a.snapshot,'$.cameraModel') LIKE ? ESCAPE '\\')");
             let pattern = format!("%{}%", escape_like(s));
             values.push(pattern.clone().into());
             values.push(pattern.into());
@@ -778,38 +773,68 @@ impl Store {
             if !(0..=5).contains(&rating) {
                 return Err(invalid("minRating must be 0...5"));
             }
-            filter.push_str(" AND a.rating>=?");
+            member_filters.push_str(" AND a.rating>=?");
             values.push(rating.into());
         }
         for (value, column) in [(&q.flag_state, "a.flag"), (&q.color_label, "a.color")] {
             if let Some(value) = value {
-                filter.push_str(&format!(" AND {column}=?"));
+                member_filters.push_str(&format!(" AND {column}=?"));
                 values.push(value.clone().into());
             }
         }
         if let Some(tag) = &q.tag {
-            filter.push_str(
+            member_filters.push_str(
                 " AND EXISTS(SELECT 1 FROM json_each(a.snapshot,'$.tags') WHERE value=?)",
             );
             values.push(tag.clone().into());
         }
+        let plain_photos = member_filters.is_empty() && !q.trashed.unwrap_or(false);
+        let mut filter = format!("a.library_id=? AND a.trashed=? AND {LIVE_ASSET}{member_filters}");
         if let Some(path) = &q.directory {
             let (scope, bindings) = directory_scope(lib, path, q.recursive.unwrap_or(true));
             filter.push_str(&format!(" AND a.id IN (SELECT asset_id FROM ({scope}))"));
             values.extend(bindings);
         }
-        if !q.show_hidden.unwrap_or(false) {
-            hidden_filter(&mut filter, &mut values, lib, q.directory.as_deref());
-        }
         let mut connection = self.read()?;
         let db = connection.transaction()?;
         let revision = crate::revisions::read(&db, lib, q.directory.as_deref())?;
         let is_updating = crate::revisions::is_updating(&db, lib, q.directory.as_deref())?;
-        let total: i64 = db.query_row(
-            &format!("SELECT count(*) FROM catalog_assets a WHERE {filter}"),
-            rusqlite::params_from_iter(&values),
+        let excludes_hidden = crate::asset_totals::excludes_hidden(&db, lib, q)?;
+        if excludes_hidden {
+            hidden_filter(&mut filter, &mut values, lib, q.directory.as_deref());
+        }
+        let count = || -> Result<i64> {
+            if plain_photos && !excludes_hidden {
+                let (direct, recursive) =
+                    directory_photo_counts(&db, lib, q.directory.as_deref().unwrap_or("/"))?;
+                return Ok(if q.directory.is_some() && q.recursive == Some(false) {
+                    direct
+                } else {
+                    recursive
+                });
+            }
+            Ok(db.query_row(
+                &format!("SELECT count(*) FROM catalog_assets a WHERE {filter}"),
+                rusqlite::params_from_iter(&values),
+                |r| r.get(0),
+            )?)
+        };
+        let unpublished: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM catalog_revision_dirty WHERE library_id=?)",
+            [lib],
             |r| r.get(0),
         )?;
+        let total = if unpublished {
+            count()?
+        } else {
+            let library_revision = if q.directory.is_none() {
+                revision
+            } else {
+                crate::revisions::read(&db, lib, None)?
+            };
+            self.asset_totals
+                .get_or_count(library_revision, &filter, &values, count)?
+        };
         if let Some((time, id)) = boundary {
             filter.push_str(&format!(
                 " AND ({sort_time}<? OR ({sort_time}=? AND a.id>?))"

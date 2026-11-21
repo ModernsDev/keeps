@@ -1520,13 +1520,27 @@ mod tests {
                 .get::<_, String>(0))?,
             expected.to_string()
         );
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM navigation WHERE path=''", [], |r| r
-                .get::<_, i64>(
-                0
-            ))?,
-            1
-        );
+        let root_page: String =
+            db.query_row("SELECT snapshot FROM navigation WHERE path=''", [], |row| {
+                row.get(0)
+            })?;
+        let offline: Value = serde_json::from_str(&root_page)?;
+        let online = crate::navigation::navigation(
+            &app.store,
+            &app.jobs,
+            "photos",
+            None,
+            &app.original_root_names,
+        )?;
+        assert_eq!(offline, online);
+        let hidden = offline["directories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "hidden")
+            .unwrap();
+        assert_eq!(hidden["directPhotoCount"], 1);
+        assert_eq!(hidden["photoCount"], 1);
         let entry = entries.next().unwrap()?;
         assert_eq!(
             entry.path()?.to_string_lossy(),
