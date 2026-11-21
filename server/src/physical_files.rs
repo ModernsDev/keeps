@@ -179,16 +179,17 @@ pub(crate) fn publish(
         "DELETE FROM catalog_version_path_history WHERE library_id=? AND path=?",
         params![lib, path],
     )?;
-    let changed = db.execute(
-        "
+    let changed = db
+        .prepare_cached(
+            "
         INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role,versioned)
         VALUES (?,?,?,?,?,?)
         ON CONFLICT(library_id,path) DO UPDATE SET asset_id=excluded.asset_id,
             content_hash=excluded.content_hash,role=excluded.role,versioned=excluded.versioned
         WHERE asset_id IS NOT excluded.asset_id OR content_hash IS NOT excluded.content_hash
             OR role IS NOT excluded.role OR versioned IS NOT excluded.versioned",
-        params![lib, path, id, hash, role, versioned],
-    )?;
+        )?
+        .execute(params![lib, path, id, hash, role, versioned])?;
     Ok(changed > 0)
 }
 
@@ -251,6 +252,7 @@ pub(crate) fn parent(path: &str) -> Result<&str> {
 #[cfg(test)]
 pub(crate) fn restore_legacy_path_tables(db: &Connection) -> Result<()> {
     db.execute_batch("
+        DROP TRIGGER count_photo_restored;
         CREATE TEMP TABLE legacy_paths AS SELECT * FROM catalog_paths;
         CREATE TEMP TABLE legacy_version_paths AS SELECT * FROM catalog_version_paths;
         DROP VIEW catalog_asset_locations;

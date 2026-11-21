@@ -1,7 +1,9 @@
 pub mod api;
+mod asset_totals;
 pub mod cache_gc;
 pub mod cache_pipeline;
 pub mod catalog;
+mod directory_counts;
 pub mod identity;
 pub mod jobs;
 pub mod media;
@@ -45,3 +47,6 @@ pub mod background;
 pub mod video_trim;
 
 mod task_state;
+
+#[cfg(test)]
+mod gallery_perf;

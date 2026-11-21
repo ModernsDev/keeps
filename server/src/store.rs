@@ -38,6 +38,7 @@ pub struct Store {
     connection: crate::database::Database,
     path: PathBuf,
     pub(crate) source_mutation: RwLock<()>,
+    pub(crate) asset_totals: crate::asset_totals::AssetTotals,
 }
 impl Store {
     pub fn open(path: &Path, auto_create: bool) -> Result<Self> {
@@ -63,6 +64,7 @@ impl Store {
             connection: crate::database::Database::new(connection),
             path: path.to_path_buf(),
             source_mutation: RwLock::new(()),
+            asset_totals: Default::default(),
         })
     }
     pub(crate) fn path(&self) -> &Path {
@@ -210,7 +212,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                27
+                crate::catalog::VERSION
             );
             let legacy_count: i64 = db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('ledger_events','ledger_sequence_counters','device_states','archive_receipts','sync_conflicts')", [], |r| r.get(0))?;
             assert_eq!(legacy_count, 0);

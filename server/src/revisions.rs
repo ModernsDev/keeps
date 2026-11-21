@@ -755,7 +755,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                27
+                crate::catalog::VERSION
             );
             assert_eq!(
                 db.query_row(

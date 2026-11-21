@@ -518,7 +518,8 @@ impl Store {
                 let report: Inventory = serde_json::from_reader(std::fs::File::open(path)?)
                     .with_context(|| format!("read directory inventory {}", path.display()))?;
                 ensure!(
-                    matches!(report.schema_version, 26 | 27) && report.issues.is_empty(),
+                    matches!(report.schema_version, 26..=crate::catalog::VERSION)
+                        && report.issues.is_empty(),
                     "inventory contains unresolved differences: {}",
                     path.display()
                 );
