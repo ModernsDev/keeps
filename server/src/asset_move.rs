@@ -621,7 +621,8 @@ pub(crate) fn reconcile_files(
         tx.execute("UPDATE catalog_asset_directories AS a SET directory=(
             SELECT m.destination_parent FROM catalog_physical_files p JOIN photo_move_paths m ON m.source=p.path
             WHERE p.library_id=a.library_id AND p.asset_id=a.asset_id LIMIT 1)
-            WHERE a.library_id=?1 AND EXISTS(SELECT 1 FROM catalog_physical_files p JOIN photo_move_paths m ON m.source=p.path WHERE p.library_id=a.library_id AND p.asset_id=a.asset_id)", [library])?;
+            WHERE a.library_id=?1 AND a.asset_id IN (SELECT asset_id FROM photo_move_assets)
+            AND EXISTS(SELECT 1 FROM catalog_physical_files p JOIN photo_move_paths m ON m.source=p.path WHERE p.library_id=a.library_id AND p.asset_id=a.asset_id)", [library])?;
         for (table, column) in [
             ("catalog_physical_files", "path"),
             ("catalog_deprecated_files", "path"),

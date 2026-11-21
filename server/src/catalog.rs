@@ -20,9 +20,11 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 25;
-const DIRECTORY_ASSET_SET: &str =
-    " AND a.id IN (SELECT f.asset_id FROM catalog_asset_locations f WHERE f.library_id=? AND ";
+const VERSION: i64 = 26;
+const DIRECTORY_EXACT: &str = "SELECT library_id,asset_id,directory FROM catalog_asset_directories WHERE library_id=? AND directory=?";
+const DIRECTORY_RANGE: &str = "SELECT library_id,asset_id,directory FROM catalog_asset_directories WHERE library_id=? AND directory>=? AND directory<?";
+const LIVE_ASSET: &str = "EXISTS(SELECT 1 FROM catalog_physical_files live
+    WHERE live.library_id=a.library_id AND live.asset_id=a.id AND live.role<>'sidecar')";
 // Ordering by path must not make SQLite scan the whole library for every asset.
 const ASSET_PATHS: &str = "SELECT path FROM catalog_physical_files INDEXED BY catalog_physical_files_asset WHERE library_id=? AND asset_id=? AND role<>'sidecar' ORDER BY path";
 // Path updates preserve rowid, so an explicit move carries the photo location with it.
@@ -45,26 +47,55 @@ pub(crate) fn photo_location(db: &Connection, lib: &str, id: &str) -> Result<Opt
 }
 
 pub(crate) fn photo_location_paths(db: &Connection, lib: &str, id: &str) -> Result<Vec<String>> {
-    let Some(location) = photo_location(db, lib, id)? else {
-        return Ok(Vec::new());
-    };
-    let directory = std::path::Path::new(&location).parent();
     let mut paths = db.prepare_cached(ASSET_PATHS)?;
-    let paths = paths.query_map(params![lib, id], |row| row.get::<_, String>(0))?;
-    let mut result = Vec::new();
-    for path in paths {
-        let path = path?;
-        if std::path::Path::new(&path).parent() == directory {
-            result.push(path);
-        }
+    Ok(paths
+        .query_map(params![lib, id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn directory_scope(
+    lib: &str,
+    path: &str,
+    recursive: bool,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let stem = path.trim_end_matches('/');
+    let directory = if stem.is_empty() { "/" } else { stem };
+    let range = || {
+        vec![
+            lib.to_owned().into(),
+            format!("{stem}/").into(),
+            format!("{stem}0").into(),
+        ]
+    };
+    if recursive && stem.is_empty() {
+        return (DIRECTORY_RANGE.into(), range());
     }
-    Ok(result)
+    let mut values = vec![lib.to_owned().into(), directory.to_owned().into()];
+    if recursive {
+        values.extend(range());
+        (
+            format!("{DIRECTORY_EXACT} UNION ALL {DIRECTORY_RANGE}"),
+            values,
+        )
+    } else {
+        (DIRECTORY_EXACT.into(), values)
+    }
 }
 
 pub(crate) fn directory_photo_counts(db: &Connection, lib: &str, path: &str) -> Result<(i64, i64)> {
-    let root = path.trim_end_matches('/');
-    Ok(db.prepare_cached("SELECT count(CASE WHEN instr(substr(p.path,length(?2)+1),'/')=0 THEN 1 END), count(*) FROM catalog_asset_locations p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0")?
-        .query_row(params![lib, format!("{root}/"), format!("{root}0")], |row| Ok((row.get(0)?, row.get(1)?)))?)
+    let direct = path.trim_end_matches('/');
+    let direct = if direct.is_empty() { "/" } else { direct };
+    let (scope, mut values) = directory_scope(lib, path, true);
+    values.insert(0, direct.to_owned().into());
+    Ok(db
+        .prepare_cached(&format!(
+            "SELECT count(*) FILTER(WHERE d.directory=?), count(*)
+        FROM ({scope}) d JOIN catalog_assets a ON a.library_id=d.library_id AND a.id=d.asset_id
+        WHERE a.trashed=0 AND {LIVE_ASSET}"
+        ))?
+        .query_row(rusqlite::params_from_iter(values), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?)
 }
 
 const SCHEMA: &str = r#"
@@ -121,7 +152,7 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         )?;
         db.prepare("SELECT library_id,path,asset_id,content_hash,role FROM catalog_paths LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,path FROM catalog_asset_locations LIMIT 0")?;
-        db.prepare("SELECT library_id,asset_id,directory FROM catalog_asset_directories LIMIT 0")?;
+        db.prepare("SELECT library_id,asset_id,directory FROM catalog_asset_directories INDEXED BY catalog_asset_directories_directory LIMIT 0")?;
         db.prepare("SELECT library_id,path FROM catalog_hidden_directories LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,content_hash,visual_hash,capture_key,width,height,priority,evidence FROM catalog_versions LIMIT 0")?;
         db.prepare("SELECT library_id,path,asset_id,content_hash,available FROM catalog_version_paths LIMIT 0")?;
@@ -261,6 +292,9 @@ CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NUL
     }
     if version < 25 {
         crate::physical_files::migrate(&tx)?;
+    }
+    if version < 26 {
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS catalog_asset_directories_directory ON catalog_asset_directories(library_id,directory,asset_id)")?;
         let mut check = tx.prepare("PRAGMA foreign_key_check")?;
         ensure!(
             check.query([])?.next()?.is_none(),
@@ -453,7 +487,11 @@ fn hidden_filter(
     lib: &str,
     directory: Option<&str>,
 ) {
-    filter.push_str(" AND a.id NOT IN (SELECT p.asset_id FROM catalog_hidden_directories h JOIN catalog_asset_locations p ON p.library_id=h.library_id AND p.path>=rtrim(h.path,'/') || '/' AND p.path<rtrim(h.path,'/') || '0' WHERE h.library_id=? AND NOT (?=h.path OR substr(?,1,length(rtrim(h.path,'/'))+1)=rtrim(h.path,'/') || '/'))");
+    filter.push_str(" AND a.id NOT IN (
+        SELECT d.asset_id FROM catalog_hidden_directories h CROSS JOIN catalog_asset_directories d
+        ON d.library_id=h.library_id AND d.directory>=h.path AND d.directory<rtrim(h.path,'/') || '0'
+           AND (d.directory=h.path OR d.directory>=rtrim(h.path,'/') || '/')
+        WHERE h.library_id=? AND NOT (?=h.path OR substr(?,1,length(rtrim(h.path,'/'))+1)=rtrim(h.path,'/') || '/'))");
     values.push(lib.to_string().into());
     let directory = directory
         .map(|p| if p == "/" { p } else { p.trim_end_matches('/') })
@@ -522,6 +560,14 @@ impl Store {
         self.hidden_directories(lib)
     }
     pub fn query_assets(&self, lib: &str, q: &AssetQuery) -> Result<Value> {
+        self.query_assets_impl(lib, q, false)
+    }
+
+    pub(crate) fn query_assets_with_media(&self, lib: &str, q: &AssetQuery) -> Result<Value> {
+        self.query_assets_impl(lib, q, true)
+    }
+
+    fn query_assets_impl(&self, lib: &str, q: &AssetQuery, include_media: bool) -> Result<Value> {
         let sort = q.sort.as_deref().unwrap_or("capture_desc");
         let limit = q.limit.unwrap_or(100).clamp(1, 200);
         let from = if sort == "trash_desc" {
@@ -564,7 +610,7 @@ impl Store {
                 }
             }
         }
-        let mut filter = "a.library_id=? AND a.trashed=? AND EXISTS(SELECT 1 FROM catalog_paths live WHERE live.library_id=a.library_id AND live.asset_id=a.id)".to_string();
+        let mut filter = format!("a.library_id=? AND a.trashed=? AND {LIVE_ASSET}");
         let mut values: Vec<rusqlite::types::Value> = vec![
             lib.to_string().into(),
             (q.trashed.unwrap_or(false) as i64).into(),
@@ -595,19 +641,9 @@ impl Store {
             values.push(tag.clone().into());
         }
         if let Some(path) = &q.directory {
-            // Materialize the directory asset set once; a correlated EXISTS can repeat
-            // the entire path range scan for every asset in a large library.
-            filter.push_str(DIRECTORY_ASSET_SET);
-            values.push(lib.to_string().into());
-            let root = path.trim_end_matches('/');
-            filter.push_str("f.path>=? AND f.path<?");
-            values.push(format!("{root}/").into());
-            values.push(format!("{root}0").into());
-            if !q.recursive.unwrap_or(true) {
-                filter.push_str(" AND substr(f.path,?) NOT LIKE '%/%'");
-                values.push(((root.chars().count() + 2) as i64).into());
-            }
-            filter.push(')');
+            let (scope, bindings) = directory_scope(lib, path, q.recursive.unwrap_or(true));
+            filter.push_str(&format!(" AND a.id IN (SELECT asset_id FROM ({scope}))"));
+            values.extend(bindings);
         }
         if !q.show_hidden.unwrap_or(false) {
             hidden_filter(&mut filter, &mut values, lib, q.directory.as_deref());
@@ -643,7 +679,11 @@ impl Store {
         let mut items = Vec::new();
         let mut last_key = None;
         for (snapshot, time, id) in rows.into_iter().take(limit) {
-            items.push(decorate(&db, lib, serde_json::from_str(&snapshot)?)?);
+            let mut asset = decorate(&db, lib, serde_json::from_str(&snapshot)?)?;
+            if include_media {
+                asset["_media"] = Self::media_snapshot_on(&db, lib, &id)?;
+            }
+            items.push(asset);
             last_key = Some((time, id));
         }
         let next_cursor = if has_more {
@@ -670,7 +710,7 @@ impl Store {
     }
     pub fn counts(&self, lib: &str, show_hidden: bool) -> Result<Value> {
         let db = self.read()?;
-        let mut filter = "a.library_id=? AND EXISTS(SELECT 1 FROM catalog_paths live WHERE live.library_id=a.library_id AND live.asset_id=a.id)".to_string();
+        let mut filter = format!("a.library_id=? AND {LIVE_ASSET}");
         let mut values: Vec<rusqlite::types::Value> = vec![lib.to_string().into()];
         if !show_hidden {
             hidden_filter(&mut filter, &mut values, lib, None);
@@ -688,24 +728,15 @@ impl Store {
     }
     pub fn directories(&self, lib: &str) -> Result<Value> {
         let db = self.read()?;
-        let mut statement =
-            db.prepare("SELECT path,asset_id FROM catalog_asset_locations WHERE library_id=?")?;
-        let paths = statement.query_map([lib], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        let mut counts = std::collections::BTreeMap::<String, BTreeSet<String>>::new();
-        for row in paths {
-            let (path, id) = row?;
-            if let Some(parent) = std::path::Path::new(&path).parent() {
-                counts
-                    .entry(parent.to_string_lossy().into_owned())
-                    .or_default()
-                    .insert(id);
-            }
-        }
-        Ok(
-            json!({"directories":counts.into_iter().map(|(path,count)|json!({"path":path,"count":count.len()})).collect::<Vec<_>>()}),
-        )
+        let mut statement = db.prepare(&format!("SELECT d.directory,count(*)
+            FROM catalog_asset_directories d JOIN catalog_assets a ON a.library_id=d.library_id AND a.id=d.asset_id
+            WHERE d.library_id=? AND {LIVE_ASSET} GROUP BY d.directory ORDER BY d.directory"))?;
+        let directories = statement
+            .query_map([lib], |r| {
+                Ok(json!({"path":r.get::<_, String>(0)?,"count":r.get::<_, i64>(1)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!({"directories":directories}))
     }
     pub fn tag_library(&self, lib: &str) -> Result<Value> {
         let db = self.read()?;
@@ -2245,33 +2276,132 @@ mod directory_plan_tests {
     fn directory_asset_set_is_not_correlated_per_catalog_asset() -> Result<()> {
         let mut db = Connection::open_in_memory()?;
         ensure_schema(&mut db, true)?;
-        for suffix in [
-            "f.path>=? AND f.path<?)",
-            "f.path>=? AND f.path<? AND substr(f.path,7) NOT LIKE '%/%')",
-        ] {
-            let mut query = db.prepare(&format!("EXPLAIN QUERY PLAN SELECT count(*) FROM catalog_assets a WHERE a.library_id=? AND a.trashed=?{DIRECTORY_ASSET_SET}{suffix}"))?;
+        for recursive in [false, true] {
+            let (scope, bindings) = directory_scope("photos", "/photo", recursive);
+            let mut query = db.prepare(&format!("EXPLAIN QUERY PLAN SELECT count(*) FROM catalog_assets a WHERE a.library_id='photos' AND a.trashed=0 AND a.id IN (SELECT asset_id FROM ({scope}))"))?;
             let plan = query
-                .query_map(
-                    params!["photos", 0, "photos", "/photo/", "/photo0"],
-                    |row| row.get::<_, String>(3),
-                )?
+                .query_map(rusqlite::params_from_iter(bindings), |row| {
+                    row.get::<_, String>(3)
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             assert!(
                 plan.iter()
-                    .any(|step| step.contains("catalog_physical_files_asset")
-                        && step.contains("asset_id=?")),
+                    .any(|step| step.contains("catalog_asset_directories_directory")
+                        && step.contains("directory=?")),
                 "{plan:?}"
             );
             assert!(
                 plan.iter().any(|step| step.contains("LIST SUBQUERY")),
                 "{plan:?}"
             );
-            assert!(
-                plan.iter()
-                    .any(|step| step.contains("path>?") && step.contains("path<?")),
-                "{plan:?}"
-            );
+            if recursive {
+                assert!(
+                    plan.iter()
+                        .any(|step| step.contains("directory>?") && step.contains("directory<?")),
+                    "{plan:?}"
+                );
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn directory_reads_match_schema_25_across_path_boundaries_and_withdrawals() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("catalog.sqlite");
+        let store = Store::open(&path, true)?;
+        let (before, revision) = {
+            let mut connection = store.lock()?;
+            let db = connection.transaction()?;
+            db.execute_batch(
+                "DROP INDEX catalog_asset_directories_directory; PRAGMA user_version=25;",
+            )?;
+            for (id, file, role, trash) in [
+                ("root", "/root.jpg", "jpeg_original", 0),
+                ("direct", "/照片/a.jpg", "jpeg_original", 0),
+                ("child", "/照片/子目录/b.jpg", "jpeg_original", 0),
+                ("sibling", "/照片-/c.jpg", "jpeg_original", 0),
+                ("trash", "/照片/trash.jpg", "jpeg_original", 1),
+                ("sidecar", "/照片/only.xmp", "sidecar", 0),
+                ("missing", "/照片/missing.jpg", "jpeg_original", 0),
+            ] {
+                db.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,trashed) VALUES('lib',?1,json_object('id',?1),'hash','','2026','photo.jpg',0,'unflagged',?2)", params![id,trash])?;
+                crate::physical_files::publish(
+                    &db,
+                    "lib",
+                    id,
+                    file,
+                    "hash",
+                    role,
+                    id == "missing",
+                )?;
+            }
+            crate::physical_files::publish(
+                &db,
+                "lib",
+                "direct",
+                "/照片/a.raw",
+                "raw",
+                "raw_original",
+                true,
+            )?;
+            crate::physical_files::withdraw(&db, "lib", "/照片/missing.jpg")?;
+            let before = db.prepare("SELECT asset_id FROM catalog_asset_locations WHERE library_id='lib' ORDER BY asset_id")?
+                .query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            crate::revisions::flush(&db)?;
+            let revision = crate::revisions::read(&db, "lib", None)?;
+            db.commit()?;
+            (before, revision)
+        };
+        drop(store);
+        let store = Store::open(&path, true)?;
+        let db = store.read()?;
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
+            VERSION
+        );
+        assert!(
+            db.prepare("PRAGMA foreign_key_check")?
+                .query([])?
+                .next()?
+                .is_none()
+        );
+        let visible = db.prepare(&format!("SELECT a.id FROM catalog_assets a WHERE library_id='lib' AND {LIVE_ASSET} ORDER BY id"))?
+            .query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(visible, before);
+        assert_eq!(directory_photo_counts(&db, "lib", "/")?, (1, 4));
+        assert_eq!(directory_photo_counts(&db, "lib", "/照片/")?, (1, 2));
+        assert_eq!(directory_photo_counts(&db, "lib", "/not-found")?, (0, 0));
+        assert_eq!(crate::revisions::read(&db, "lib", None)?, revision);
+        drop(db);
+        store.set_hidden_directory("lib", "/照片", true)?;
+        store.set_hidden_directory("lib", "/照片/子目录", true)?;
+        let query = |directory: Option<&str>, recursive| AssetQuery {
+            directory: directory.map(str::to_owned),
+            recursive: Some(recursive),
+            ..Default::default()
+        };
+        let page = store.query_assets("lib", &query(Some("/照片/"), true))?;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["items"][0]["id"], "direct");
+        assert_eq!(
+            page["items"][0]["paths"],
+            json!(["/照片/a.jpg", "/照片/a.raw"])
+        );
+        assert_eq!(store.query_assets("lib", &query(None, true))?["total"], 2);
+        assert_eq!(
+            store.query_assets("lib", &query(Some("/"), false))?["total"],
+            1
+        );
+        assert_eq!(
+            store.query_assets("lib", &query(Some("/照片/子目录"), false))?["total"],
+            1
+        );
+        let with_media = store.query_assets_with_media("lib", &query(Some("/照片"), false))?;
+        assert_eq!(
+            with_media["items"][0]["_media"],
+            store.media_snapshot("lib", "direct")?
+        );
         Ok(())
     }
 }
