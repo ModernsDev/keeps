@@ -2,7 +2,7 @@
 use crate::{
     api::{ApiError, AppState},
     jobs::Jobs,
-    store::StoreError,
+    store::{Store, StoreError},
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -289,7 +289,7 @@ fn existing_batch(
     }
     Ok(None)
 }
-fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
+fn prepare(jobs: &Jobs, store: &Store, library: &str, mut input: Prepare) -> Result<Batch> {
     let _guard = jobs.directory_mutation.read().unwrap();
     crate::directory_move::ensure_reconciled(jobs)?;
     ensure!(
@@ -356,6 +356,7 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
     }
     let reservations = reserved_batches(&db)?;
     drop(db);
+    let catalog = store.read()?;
     let mut files = Vec::new();
     for (parent, groups) in directories {
         let directory = destination.join(&parent);
@@ -364,7 +365,7 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
             &directory,
             &groups,
             false,
-            &BTreeMap::new(),
+            &destination_files(&catalog, library, &directory)?,
             None,
         )? {
             if file.duplicate_path.is_none() {
@@ -400,15 +401,17 @@ fn plan_files(
     destination: &FsPath,
     groups: &SourceGroups,
     deduplicate: bool,
-    existing_groups: &ExistingGroups,
+    existing: &[DestinationFile],
     matching_batch: Option<&str>,
 ) -> Result<Vec<File>> {
-    let mut reserved: HashSet<String> = if destination.exists() {
-        std::fs::read_dir(destination)?
-            .map(|e| e.map(|e| e.file_name().to_string_lossy().to_lowercase()))
-            .collect::<std::io::Result<_>>()?
+    let mut reserved: HashSet<String> = existing
+        .iter()
+        .map(|file| file.name.to_lowercase())
+        .collect();
+    let existing_groups = if deduplicate {
+        existing_groups(existing)
     } else {
-        HashSet::new()
+        BTreeMap::new()
     };
     let source_ids: HashSet<_> = groups
         .values()
@@ -482,13 +485,12 @@ fn plan_files(
                 invalid("case-insensitive duplicate filenames within source group")
             );
             if let Some(matches) = matching_existing_group(
-                destination,
                 entries,
                 &suffixes,
                 &pending_names,
                 &reserved,
-                existing_groups,
-            )? {
+                &existing_groups,
+            ) {
                 for ((input, _, _), (name, skipped)) in entries.iter().zip(matches) {
                     reserved.insert(name.to_lowercase());
                     pending_names.insert(name.to_lowercase());
@@ -613,18 +615,50 @@ fn import_directory(root: &FsPath, relative: &FsPath, create: bool) -> Result<st
     Ok(path)
 }
 
-type ExistingGroups = BTreeMap<String, BTreeMap<String, (String, String)>>;
-fn existing_groups(destination: &FsPath) -> Result<ExistingGroups> {
-    let mut groups: BTreeMap<String, BTreeMap<String, (String, String)>> = BTreeMap::new();
-    for entry in std::fs::read_dir(destination)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
+struct DestinationFile {
+    name: String,
+    digest: String,
+    size: Option<i64>,
+}
+
+fn destination_files(
+    db: &rusqlite::Connection,
+    library: &str,
+    path: &FsPath,
+) -> Result<Vec<DestinationFile>> {
+    let directory = path
+        .to_str()
+        .context("destination directory must be UTF-8")?;
+    let stem = directory.trim_end_matches('/');
+    let directory = if stem.is_empty() { "/" } else { stem };
+    let mut query = db.prepare_cached(
+        "SELECT p.basename,p.content_hash,f.size FROM catalog_physical_files p
+         LEFT JOIN catalog_files f ON f.library_id=p.library_id AND f.asset_id=p.asset_id
+           AND f.content_hash=p.content_hash AND f.role=p.role AND f.holder='keeps-nas'
+         WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND p.directory=?4
+         ORDER BY p.path",
+    )?;
+    Ok(query
+        .query_map(
+            params![library, format!("{stem}/"), format!("{stem}0"), directory],
+            |row| {
+                Ok(DestinationFile {
+                    name: row.get(0)?,
+                    digest: row.get(1)?,
+                    size: row.get(2)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+type ExistingGroups<'a> = BTreeMap<String, BTreeMap<String, (&'a DestinationFile, String)>>;
+fn existing_groups(files: &[DestinationFile]) -> ExistingGroups<'_> {
+    let mut groups = ExistingGroups::new();
+    for file in files {
         let input = InputFile {
             id: String::new(),
-            relative_path: name.clone(),
+            relative_path: file.name.clone(),
             size: 0,
             sha256: None,
         };
@@ -632,34 +666,31 @@ fn existing_groups(destination: &FsPath) -> Result<ExistingGroups> {
             groups
                 .entry(key)
                 .or_default()
-                .insert(suffix.to_lowercase(), (name, stem));
+                .insert(suffix.to_lowercase(), (file, stem));
         }
     }
-    Ok(groups)
+    groups
 }
 // A whole source group follows an existing original only when every overlapping
 // companion agrees, so a differing sidecar can never attach to the wrong original.
 fn matching_existing_group(
-    destination: &FsPath,
     entries: &[(InputFile, String, String)],
     suffixes: &[String],
     pending_names: &HashSet<String>,
     occupied: &HashSet<String>,
-    groups: &ExistingGroups,
-) -> Result<Option<Vec<(String, bool)>>> {
+    groups: &ExistingGroups<'_>,
+) -> Option<Vec<(String, bool)>> {
     for existing in groups.values() {
         let mut anchor = None;
         let mut matches = true;
         for ((input, _, _), suffix) in entries.iter().zip(suffixes) {
-            if let Some((name, stem)) = existing.get(&suffix.to_lowercase()) {
-                let path = destination.join(name);
-                if pending_names.contains(&name.to_lowercase())
-                    || std::fs::metadata(&path)?.len() != input.size
+            if let Some((file, stem)) = existing.get(&suffix.to_lowercase()) {
+                if pending_names.contains(&file.name.to_lowercase())
+                    || file
+                        .size
+                        .is_some_and(|size| u64::try_from(size).ok() != Some(input.size))
+                    || Some(&file.digest) != input.sha256.as_ref()
                 {
-                    matches = false;
-                    break;
-                }
-                if Some(crate::media::sha256_file(&path)?) != input.sha256 {
                     matches = false;
                     break;
                 }
@@ -676,13 +707,13 @@ fn matching_existing_group(
         };
         let mut result = Vec::new();
         for suffix in suffixes {
-            if let Some((name, _)) = existing.get(&suffix.to_lowercase()) {
-                result.push((name.clone(), true));
+            if let Some((file, _)) = existing.get(&suffix.to_lowercase()) {
+                result.push((file.name.clone(), true));
             } else {
                 let name = suffix
                     .strip_suffix(".xmp")
                     .and_then(|original_suffix| existing.get(&original_suffix.to_lowercase()))
-                    .map(|(name, _)| format!("{name}.xmp"))
+                    .map(|(file, _)| format!("{}.xmp", file.name))
                     .unwrap_or_else(|| format!("{stem}{suffix}"));
                 if occupied.contains(&name.to_lowercase())
                     || pending_names.contains(&name.to_lowercase())
@@ -695,10 +726,10 @@ fn matching_existing_group(
             }
         }
         if matches {
-            return Ok(Some(result));
+            return Some(result);
         }
     }
-    Ok(None)
+    None
 }
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -733,7 +764,7 @@ async fn prepare_handler(
     let batch = tokio::task::spawn_blocking(move || -> Result<Batch> {
         let _guard = state.jobs.import_mutation.lock().unwrap();
         let input: Prepare = serde_json::from_value(body.clone())?;
-        let batch = prepare(&state.jobs, &library, input)?;
+        let batch = prepare(&state.jobs, &state.store, &library, input)?;
         if let Some(worker) = body["workerID"].as_str() {
             reserve_compute(&state, &library, &batch, worker)?;
         }
@@ -756,7 +787,7 @@ struct MatchGroup {
 // Match one complete photo, keeping its original and sidecars together.
 fn match_group(
     jobs: &Jobs,
-    catalog: Option<(&crate::store::Store, Option<uuid::Uuid>)>,
+    (store, photo_id): (&Store, Option<uuid::Uuid>),
     library: &str,
     id: &str,
     file_id: &str,
@@ -846,9 +877,7 @@ fn match_group(
         indices.iter().all(|index| !batch.files[*index].uploaded),
         conflict("cannot rematch a partially uploaded photo")
     );
-    let claimed_identity = catalog
-        .and_then(|(_, photo_id)| photo_id)
-        .map(|id| id.to_string());
+    let claimed_identity = photo_id.map(|id| id.to_string());
     {
         let db = jobs.db.lock().unwrap();
         let mut query = db.prepare("SELECT EXISTS(SELECT 1 FROM import_match_claims WHERE library_id=? AND kind=? AND value=? AND (batch_id<>? OR group_id<>?))")?;
@@ -881,12 +910,7 @@ fn match_group(
         entries.push((input.clone(), stem, suffix));
     }
     let groups = BTreeMap::from([(key.clone(), entries)]);
-    let duplicate = match catalog {
-        Some((store, photo_id)) => {
-            cross_directory_duplicate(jobs, store, library, &directory, &inputs, photo_id)?
-        }
-        None => None,
-    };
+    let duplicate = cross_directory_duplicate(jobs, store, library, &directory, &inputs, photo_id)?;
     let planned = if let Some(path) = duplicate {
         indices
             .iter()
@@ -904,11 +928,7 @@ fn match_group(
             })
             .collect()
     } else {
-        let existing = if directory.exists() {
-            existing_groups(&directory)?
-        } else {
-            BTreeMap::new()
-        };
+        let existing = destination_files(&store.read()?, library, &directory)?;
         let reservations = reserved_batches(&jobs.db.lock().unwrap())?;
         plan_files(
             &reservations,
@@ -919,29 +939,16 @@ fn match_group(
             Some(&batch.id),
         )?
     };
-    if let Some((store, _)) = catalog {
-        let db = store.read()?;
-        for file in planned
-            .iter()
-            .filter(|file| file.skipped && file.duplicate_path.is_none())
-        {
-            let path = directory.join(&file.file_name);
-            let path = path.to_str().context("UTF-8 import path")?;
-            let hash = file
-                .received_sha256
-                .as_deref()
-                .context("matched file lacks digest")?;
-            let managed = if file.file_name.to_ascii_lowercase().ends_with(".xmp") {
-                db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_physical_files WHERE library_id=? AND path=? AND content_hash=? AND role='sidecar')",
-                    params![library,path,hash], |r| r.get(0))?
-            } else {
-                store.original_is_online(library, path, hash)?
-            };
-            ensure!(
-                managed,
-                conflict("目标目录存在尚未登记的相同文件，请先核对图库")
-            );
-        }
+    for file in planned
+        .iter()
+        .filter(|file| file.skipped && file.duplicate_path.is_none())
+    {
+        let path = directory.join(&file.file_name);
+        ensure!(
+            DigestStamp::read(&path)?.size == file.input.size
+                && Some(&file_digest(jobs, library, &path)?) == file.input.sha256.as_ref(),
+            conflict(format!("已登记文件的内容发生变化：{}", path.display()))
+        );
     }
     let mut db = jobs.db.lock().unwrap();
     let tx = db.transaction()?;
@@ -1100,7 +1107,7 @@ async fn match_handler(
         let _guard = state.jobs.import_mutation.lock().unwrap();
         let batch = match_group(
             &state.jobs,
-            Some((&state.store, body.photo_id)),
+            (&state.store, body.photo_id),
             &library,
             &id,
             &file,
@@ -1139,11 +1146,13 @@ fn resume_pipeline(state: &AppState, library: &str, id: &str) -> Result<()> {
     let paths: Vec<_> = batch
         .files
         .iter()
-        .map(|f| {
-            FsPath::new(&batch.target_path)
-                .join(&f.file_name)
-                .to_string_lossy()
-                .into_owned()
+        .map(|file| {
+            file.duplicate_path.clone().unwrap_or_else(|| {
+                FsPath::new(&batch.target_path)
+                    .join(&file.file_name)
+                    .to_string_lossy()
+                    .into_owned()
+            })
         })
         .collect();
     state.store.lock()?.execute("UPDATE media_cache SET status=CASE WHEN status='failed' THEN 'pending' ELSE status END,attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=?1 AND asset_id IN (SELECT p.asset_id FROM json_each(?2) wanted CROSS JOIN catalog_paths p ON p.library_id=?1 AND p.path=wanted.value) AND (status='failed' OR browse_attempts>=4)",params![library,serde_json::to_string(&paths)?])?;
@@ -1535,19 +1544,13 @@ async fn finish(
     let retry_id = id.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let _import = retry_state.jobs.import_mutation.lock().unwrap();
-        if pipeline_status(&retry_state,&retry_library,&retry_id)?["status"] != "failed" { return Ok(()); }
-        let mut batch = load(&retry_state.jobs.db.lock().unwrap(),&retry_library,&retry_id)?;
-        if !batch.finished { return Ok(()); }
-        let destination = FsPath::new(&batch.target_path);
-        let folder = retry_state.jobs.folders()?.into_iter().filter(|f|f.active && f.library_id==retry_library && destination.starts_with(&f.path)).max_by_key(|f|f.path.len()).context("import folder no longer tracked")?;
-        let job = if batch.preserve_structure { retry_state.jobs.enqueue_reconcile_scope(&folder.id,destination)? } else { retry_state.jobs.enqueue_manual_directory(&folder.id,destination)? };
-        batch.job_id=Some(job.id);
-        batch.group_jobs.clear();
-        save(&retry_state.jobs.db.lock().unwrap(),&retry_library,&batch)?;
-        let paths: Vec<_> = batch.files.iter().map(|f|destination.join(&f.file_name).to_string_lossy().into_owned()).collect();
-        retry_state.store.lock()?.execute("UPDATE media_cache SET status=CASE WHEN status='failed' THEN 'pending' ELSE status END,attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=?1 AND asset_id IN (SELECT p.asset_id FROM json_each(?2) wanted CROSS JOIN catalog_paths p ON p.library_id=?1 AND p.path=wanted.value)",params![retry_library,serde_json::to_string(&paths)?])?;
+        if pipeline_status(&retry_state, &retry_library, &retry_id)?["status"] == "failed" {
+            resume_pipeline(&retry_state, &retry_library, &retry_id)?;
+        }
         Ok(())
-    }).await.map_err(anyhow::Error::from)??;
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
     let (jobs, lib, batch_id) = (state.jobs.clone(), library.clone(), id.clone());
     tokio::task::spawn_blocking(move || -> Result<()> {
         let _import = jobs.import_mutation.lock().unwrap();
@@ -2131,6 +2134,38 @@ fn same_file(first: &FsPath, second: &FsPath) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_catalog(jobs: &Jobs) -> Store {
+        let db = jobs.db.lock().unwrap();
+        let path = FsPath::new(db.path().unwrap()).with_file_name("catalog.sqlite");
+        Store::open(&path, true).unwrap()
+    }
+
+    fn fixture_original(store: &Store, path: &FsPath) -> String {
+        let bytes = std::fs::read(path).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let role = if crate::media::is_raw(path) {
+            "raw_original"
+        } else {
+            "jpeg_original"
+        };
+        store.ingest_original(
+            "lib", path.to_str().unwrap(),
+            &json!({"contentHash":digest,"sizeBytes":bytes.len(),"role":role}),
+            &json!({"originalFilename":name,"contentFingerprint":digest,"metadataFingerprint":"test","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"}),
+        ).unwrap();
+        store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT asset_id FROM catalog_physical_files WHERE library_id='lib' AND path=?",
+                [path.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
     fn structure_input(root: &FsPath, paths: &[&str], deduplicate: bool) -> Prepare {
         Prepare {
             id: uuid::Uuid::new_v4().to_string(),
@@ -2160,17 +2195,19 @@ mod tests {
         jobs.add_folder("lib", ".")?;
         let first = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             structure_input(jobs.root(), &["first/photo.jpg"], true),
         )?;
         let second = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             structure_input(jobs.root(), &["second/photo.jpg"], true),
         )?;
         let mut third_input = structure_input(jobs.root(), &["third/photo.jpg"], true);
         third_input.files[0].sha256 = None;
-        let third = prepare(&jobs, "lib", third_input)?;
+        let third = prepare(&jobs, &fixture_catalog(&jobs), "lib", third_input)?;
         let hash = format!("{:x}", Sha256::digest(b"original"));
         let identity = uuid::Uuid::new_v4();
         let match_file = |jobs: &Jobs, batch: &Batch, sha256: &str, id| {
@@ -2178,7 +2215,7 @@ mod tests {
             input.sha256 = Some(sha256.to_owned());
             match_group(
                 jobs,
-                Some((&store, id)),
+                (&store, id),
                 "lib",
                 &batch.id,
                 &input.id.clone(),
@@ -2219,6 +2256,7 @@ mod tests {
             let sidecar = format!("{name}.xmp");
             let batch = prepare(
                 &jobs,
+                &fixture_catalog(&jobs),
                 "lib",
                 structure_input(jobs.root(), &[&name, &sidecar, "clip.xmp"], false),
             )?;
@@ -2237,6 +2275,7 @@ mod tests {
         assert!(
             prepare(
                 &jobs,
+                &fixture_catalog(&jobs),
                 "lib",
                 structure_input(jobs.root(), &["orphan.mp4.xmp"], false)
             )
@@ -2291,7 +2330,7 @@ mod tests {
         let mut input = structure_input(state.jobs.root(), &["clip.MP4"], false);
         input.files[0].size = bytes.len() as u64;
         input.files[0].sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
-        let batch = prepare(&state.jobs, "lib", input)?;
+        let batch = prepare(&state.jobs, &state.store, "lib", input)?;
         reserve_compute(&state, "lib", &batch, "mac")?;
         let leases: i64 = state.store.lock()?.query_row(
             "SELECT count(*) FROM import_compute_leases",
@@ -2363,6 +2402,7 @@ mod tests {
         jobs.add_folder("lib", ".").unwrap();
         let batch = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             structure_input(jobs.root(), &["image.CR3"], false),
         )
@@ -2403,6 +2443,7 @@ mod tests {
         jobs.add_folder("lib", ".").unwrap();
         let mut batch = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             structure_input(jobs.root(), &["image.CR3"], false),
         )
@@ -2456,7 +2497,7 @@ mod tests {
             &["card/day/IMG.CR3", "card/day/IMG.CR3.xmp", "other/IMG.CR3"],
             true,
         );
-        let batch = prepare(&jobs, "lib", input.clone()).unwrap();
+        let batch = prepare(&jobs, &fixture_catalog(&jobs), "lib", input.clone()).unwrap();
         assert!(
             batch
                 .files
@@ -2465,7 +2506,7 @@ mod tests {
         );
         match_group(
             &jobs,
-            Some((&store, None)),
+            (&store, None),
             "lib",
             &batch.id,
             &input.files[0].id,
@@ -2474,7 +2515,7 @@ mod tests {
         .unwrap();
         match_group(
             &jobs,
-            Some((&store, None)),
+            (&store, None),
             "lib",
             &batch.id,
             &input.files[2].id,
@@ -2498,18 +2539,19 @@ mod tests {
         let mut changed = input.clone();
         changed.preserve_structure = false;
         assert!(
-            prepare(&jobs, "lib", changed)
+            prepare(&jobs, &fixture_catalog(&jobs), "lib", changed)
                 .unwrap_err()
                 .to_string()
                 .contains("another manifest")
         );
         drop(jobs);
         let jobs = Jobs::open(&db, &root).unwrap();
-        let resumed = prepare(&jobs, "lib", input).unwrap();
+        let resumed = prepare(&jobs, &fixture_catalog(&jobs), "lib", input).unwrap();
         assert!(resumed.preserve_structure);
         assert_eq!(resumed.files[1].file_name, "card/day/IMG.CR3.xmp");
         let next = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             structure_input(jobs.root(), &["card/day/IMG.CR3", "other/IMG.CR3"], false),
         )
@@ -2524,7 +2566,10 @@ mod tests {
         let mut direct = structure_input(&jobs.root().join("card/day"), &["IMG.CR3"], false);
         direct.preserve_structure = false;
         assert_eq!(
-            prepare(&jobs, "lib", direct).unwrap().files[0].file_name,
+            prepare(&jobs, &fixture_catalog(&jobs), "lib", direct)
+                .unwrap()
+                .files[0]
+                .file_name,
             "IMG (2).CR3"
         );
     }
@@ -2545,7 +2590,13 @@ mod tests {
             "#recycle/IMG.CR3",
         ] {
             assert!(
-                prepare(&jobs, "lib", structure_input(jobs.root(), &[path], false)).is_err(),
+                prepare(
+                    &jobs,
+                    &fixture_catalog(&jobs),
+                    "lib",
+                    structure_input(jobs.root(), &[path], false)
+                )
+                .is_err(),
                 "{path}"
             );
         }
@@ -2581,6 +2632,7 @@ mod tests {
         state.jobs.add_folder("lib", ".")?;
         let mut batch = prepare(
             &state.jobs,
+            &state.store,
             "lib",
             structure_input(
                 state.jobs.root(),
@@ -2694,6 +2746,7 @@ mod tests {
         state.jobs.add_folder("lib", ".").unwrap();
         let batch = prepare(
             &state.jobs,
+            &state.store,
             "lib",
             structure_input(
                 state.jobs.root(),
@@ -2796,6 +2849,7 @@ mod tests {
         jobs.add_folder("lib", ".").unwrap();
         let mut batch = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             structure_input(
                 jobs.root(),
@@ -2895,7 +2949,7 @@ mod tests {
         });
         state.jobs.add_folder("lib", ".").unwrap();
         let input = structure_input(state.jobs.root(), &["first.CR3", "second.CR3"], false);
-        let mut batch = prepare(&state.jobs, "lib", input.clone()).unwrap();
+        let mut batch = prepare(&state.jobs, &state.store, "lib", input.clone()).unwrap();
         let first = batch
             .files
             .iter_mut()
@@ -2940,6 +2994,7 @@ mod tests {
         jobs.add_folder("lib", ".").unwrap();
         let mut batch = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             structure_input(jobs.root(), &["image.CR3"], false),
         )
@@ -2968,7 +3023,13 @@ mod tests {
         jobs.add_folder("lib", ".").unwrap();
         let names: Vec<_> = (0..256).map(|index| format!("image-{index}.CR3")).collect();
         let paths: Vec<_> = names.iter().map(String::as_str).collect();
-        let mut batch = prepare(&jobs, "lib", structure_input(jobs.root(), &paths, false)).unwrap();
+        let mut batch = prepare(
+            &jobs,
+            &fixture_catalog(&jobs),
+            "lib",
+            structure_input(jobs.root(), &paths, false),
+        )
+        .unwrap();
         for file in &mut batch.files {
             std::fs::write(staging(&root, &batch.id, &file.input.id), b"original").unwrap();
             file.uploaded = true;
@@ -3032,6 +3093,7 @@ mod tests {
             .collect();
         let batch = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             Prepare {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -3061,6 +3123,10 @@ mod tests {
             std::fs::write(&original, b"existing").unwrap();
             let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
             jobs.add_folder("lib", ".").unwrap();
+            fixture_original(
+                &fixture_catalog(&jobs),
+                &jobs.root().join(original.file_name().unwrap()),
+            );
             let paths = [
                 format!("deep/nested/IMG.{extension}"),
                 "deep/nested/img.XMP".into(),
@@ -3068,6 +3134,7 @@ mod tests {
             ];
             let batch = prepare(
                 &jobs,
+                &fixture_catalog(&jobs),
                 "lib",
                 Prepare {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -3110,6 +3177,7 @@ mod tests {
         let db = dir.path().join("jobs.sqlite");
         let jobs = Jobs::open(&db, &root).unwrap();
         jobs.add_folder("lib", ".").unwrap();
+        fixture_original(&fixture_catalog(&jobs), &jobs.root().join("IMG.CR3"));
         let input = Prepare {
             id: uuid::Uuid::new_v4().to_string(),
             target_path: jobs.root().to_str().unwrap().into(),
@@ -3122,16 +3190,19 @@ mod tests {
                 sha256: Some("a".repeat(64)),
             }],
         };
-        let batch = prepare(&jobs, "lib", input.clone()).unwrap();
+        let batch = prepare(&jobs, &fixture_catalog(&jobs), "lib", input.clone()).unwrap();
         assert_eq!(batch.files[0].file_name, "IMG (1).HEIC");
         drop(jobs);
         let jobs = Jobs::open(&db, &root).unwrap();
-        let resumed = prepare(&jobs, "lib", input.clone()).unwrap();
+        let resumed = prepare(&jobs, &fixture_catalog(&jobs), "lib", input.clone()).unwrap();
         assert_eq!(resumed.files[0].file_name, batch.files[0].file_name);
         let mut other = input;
         other.id = uuid::Uuid::new_v4().to_string();
         assert_eq!(
-            prepare(&jobs, "lib", other).unwrap().files[0].file_name,
+            prepare(&jobs, &fixture_catalog(&jobs), "lib", other)
+                .unwrap()
+                .files[0]
+                .file_name,
             "IMG (2).HEIC"
         );
     }
@@ -3143,6 +3214,8 @@ mod tests {
         std::fs::create_dir(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join("elsewhere.CR3"), b"original").unwrap();
         std::fs::write(dir.path().join("target/first.CR3"), b"original").unwrap();
+        let store = fixture_catalog(&jobs);
+        fixture_original(&store, &jobs.root().join("target/first.CR3"));
         let mut input = structure_input(
             &jobs.root().join("target"),
             &["first.CR3", "first.xmp", "second.CR3"],
@@ -3152,7 +3225,7 @@ mod tests {
         for file in &mut input.files {
             file.sha256 = None;
         }
-        let initial = prepare(&jobs, "lib", input.clone()).unwrap();
+        let initial = prepare(&jobs, &fixture_catalog(&jobs), "lib", input.clone()).unwrap();
         assert!(
             initial
                 .files
@@ -3166,7 +3239,7 @@ mod tests {
         assert!(
             match_group(
                 &jobs,
-                None,
+                (&fixture_catalog(&jobs), None),
                 "lib",
                 &initial.id,
                 &matching[0].id,
@@ -3176,7 +3249,7 @@ mod tests {
         );
         let matched = match_group(
             &jobs,
-            None,
+            (&fixture_catalog(&jobs), None),
             "lib",
             &initial.id,
             &matching[0].id,
@@ -3186,13 +3259,13 @@ mod tests {
         assert_eq!(matched.files.len(), 2);
         assert!(matched.files[0].skipped);
         assert!(!matched.files[1].skipped);
-        let resumed = prepare(&jobs, "lib", input.clone()).unwrap();
+        let resumed = prepare(&jobs, &fixture_catalog(&jobs), "lib", input.clone()).unwrap();
         assert!(!resumed.files[2].matched);
         matching[0].sha256 = Some("0".repeat(64));
         assert!(
             match_group(
                 &jobs,
-                None,
+                (&fixture_catalog(&jobs), None),
                 "lib",
                 &initial.id,
                 &input.files[0].id,
@@ -3202,11 +3275,12 @@ mod tests {
         );
         // The next photo sees destination changes made after batch creation.
         std::fs::write(dir.path().join("target/late.CR3"), b"latefile").unwrap();
+        fixture_original(&store, &jobs.root().join("target/late.CR3"));
         let mut second = input.files[2].clone();
         second.sha256 = Some(format!("{:x}", Sha256::digest(b"latefile")));
         let result = match_group(
             &jobs,
-            None,
+            (&fixture_catalog(&jobs), None),
             "lib",
             &initial.id,
             &second.id,
@@ -3218,11 +3292,12 @@ mod tests {
         // Another destination must not use identical files outside that directory.
         std::fs::create_dir(dir.path().join("empty")).unwrap();
         let mut other = structure_input(&jobs.root().join("empty"), &["new.CR3"], true);
+        other.files[0].sha256 = Some(format!("{:x}", Sha256::digest(b"outside!")));
         other.preserve_structure = false;
-        let prepared = prepare(&jobs, "lib", other.clone()).unwrap();
+        let prepared = prepare(&jobs, &fixture_catalog(&jobs), "lib", other.clone()).unwrap();
         let result = match_group(
             &jobs,
-            None,
+            (&fixture_catalog(&jobs), None),
             "lib",
             &prepared.id,
             &other.files[0].id,
@@ -3263,6 +3338,20 @@ mod tests {
             }
             let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
             jobs.add_folder("lib", ".").unwrap();
+            let store = fixture_catalog(&jobs);
+            let id = fixture_original(&store, &jobs.root().join("IMG.CR3"));
+            if let Some(data) = existing_sidecar {
+                crate::physical_files::publish(
+                    &store.lock().unwrap(),
+                    "lib",
+                    &id,
+                    jobs.root().join("IMG.xmp").to_str().unwrap(),
+                    &format!("{:x}", Sha256::digest(data)),
+                    "sidecar",
+                    false,
+                )
+                .unwrap();
+            }
             let mut contents = vec![("IMG.CR3", b"original".as_slice())];
             if include_heif {
                 contents.extend([
@@ -3286,12 +3375,12 @@ mod tests {
                 preserve_structure: false,
                 files,
             };
-            let mut batch = prepare(&jobs, "lib", input.clone()).unwrap();
+            let mut batch = prepare(&jobs, &fixture_catalog(&jobs), "lib", input.clone()).unwrap();
             assert!(batch.files.iter().all(|file| !file.skipped));
             if enabled {
                 batch = match_group(
                     &jobs,
-                    None,
+                    (&fixture_catalog(&jobs), None),
                     "lib",
                     &batch.id,
                     &input.files[0].id,
@@ -3300,7 +3389,7 @@ mod tests {
                 .unwrap();
                 let resumed = match_group(
                     &jobs,
-                    None,
+                    (&fixture_catalog(&jobs), None),
                     "lib",
                     &batch.id,
                     &input.files[0].id,
@@ -3319,7 +3408,10 @@ mod tests {
                 skipped
             );
             assert_eq!(
-                prepare(&jobs, "lib", input).unwrap().files[0].file_name,
+                prepare(&jobs, &fixture_catalog(&jobs), "lib", input)
+                    .unwrap()
+                    .files[0]
+                    .file_name,
                 expected
             );
             assert_eq!(std::fs::read(root.join("IMG.CR3")).unwrap(), b"original");
@@ -3346,6 +3438,7 @@ mod tests {
             .collect();
         let error = prepare(
             &jobs,
+            &fixture_catalog(&jobs),
             "lib",
             Prepare {
                 id: uuid::Uuid::new_v4().to_string(),

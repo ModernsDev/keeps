@@ -363,6 +363,7 @@ mod tests {
         state.jobs.add_folder("lib", ".")?;
         let mut batch = prepare(
             &state.jobs,
+            &state.store,
             "lib",
             Prepare {
                 id: uuid::Uuid::new_v4().to_string(),

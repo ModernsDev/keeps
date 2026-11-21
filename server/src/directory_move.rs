@@ -48,6 +48,16 @@ pub(crate) fn catalog(
     source: &str,
     destination: &str,
 ) -> Result<()> {
+    rewrite(
+        db,
+        "folders",
+        "path",
+        "library_id=?1",
+        library,
+        source,
+        destination,
+    )?;
+    crate::navigation::move_tree(db, library, source, destination)?;
     for (table, column) in [
         ("catalog_asset_directories", "directory"),
         ("catalog_physical_files", "path"),
@@ -81,20 +91,32 @@ pub(crate) fn tracking(
     source: &str,
     destination: &str,
 ) -> Result<()> {
-    rewrite(
-        db,
-        "folders",
-        "path",
-        "library_id=?1",
-        library,
-        source,
-        destination,
+    let legacy = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='folders')",
+        [],
+        |r| r.get::<_, bool>(0),
     )?;
-    for (table, column) in [
-        ("files", "path"),
-        ("jobs", "scope_path"),
-        ("jobs", "current_path"),
-    ] {
+    if legacy {
+        rewrite(
+            db,
+            "folders",
+            "path",
+            "library_id=?1",
+            library,
+            source,
+            destination,
+        )?;
+        rewrite(
+            db,
+            "files",
+            "path",
+            "folder_id IN (SELECT id FROM folders WHERE library_id=?1)",
+            library,
+            source,
+            destination,
+        )?;
+    }
+    for (table, column) in [("jobs", "scope_path"), ("jobs", "current_path")] {
         rewrite(
             db,
             table,
@@ -120,7 +142,7 @@ pub(crate) fn tracking(
             destination,
         )?;
     }
-    if Path::new(source).is_file() || Path::new(destination).is_file() {
+    if legacy && (Path::new(source).is_file() || Path::new(destination).is_file()) {
         db.execute("UPDATE files SET folder_id=(SELECT id FROM folders WHERE library_id=?1 AND active=1 AND (?2>=path || '/' AND ?2<path || '0') ORDER BY length(path) DESC LIMIT 1) WHERE path=?2 AND folder_id IN (SELECT id FROM folders WHERE library_id=?1)",params![library,destination])?;
     }
     db.execute("UPDATE jobs SET checkpoint=NULL WHERE folder_id IN (SELECT id FROM folders WHERE library_id=?1) AND status IN ('pending','running')",[library])?;
@@ -173,11 +195,11 @@ pub(crate) fn reconcile(
     tracking(&tx, library, source, destination)?;
     tx.commit()?;
     drop(db);
-    crate::sync_navigation::refresh(store, jobs, library)?;
     jobs.db
         .lock()
         .unwrap()
         .execute("UPDATE directory_moves SET completed=1 WHERE id=?1", [id])?;
+    store.finish_revision_batch(id, false)?;
     Ok(())
 }
 
@@ -259,7 +281,8 @@ pub(crate) fn recover_locked(jobs: &Jobs, store: &Store) -> Result<()> {
                 jobs.db
                     .lock()
                     .unwrap()
-                    .execute("DELETE FROM directory_moves WHERE id=?1", [id])?;
+                    .execute("DELETE FROM directory_moves WHERE id=?1", [&id])?;
+                store.finish_revision_batch(&id, false)?;
             }
             (false, true) if Path::new(&destination).is_file() => {
                 files
@@ -359,6 +382,14 @@ pub(crate) fn move_directory(
             "Cannot move the originals root or a directory into itself or its descendants"
         )
     );
+    if jobs.manages_catalog() {
+        let db = store.read()?;
+        ensure!(
+            crate::navigation::registered(&db, library, &source)?
+                && crate::navigation::registered(&db, library, &parent)?,
+            error(404, "Both directories must be registered in this library")
+        );
+    }
     let destination = requested_destination;
     ensure!(
         fs::symlink_metadata(&destination).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
@@ -414,12 +445,15 @@ pub(crate) fn move_directory(
         "INSERT INTO directory_moves(id,library_id,source,destination) VALUES(?1,?2,?3,?4)",
         params![id, library, path, dest],
     )?;
+    store.note_revision_activity(library, &id, path)?;
+    store.note_revision_activity(library, &id, dest)?;
     transition(jobs, &id, "moving", None)?;
     if let Err(failure) = rename_exclusive(&source, &destination) {
         jobs.db
             .lock()
             .unwrap()
             .execute("DELETE FROM directory_moves WHERE id=?1", [&id])?;
+        store.finish_revision_batch(&id, false)?;
         return Err(failure);
     }
     reconcile(jobs, store, &id, library, path, dest).context(
@@ -1012,14 +1046,14 @@ mod tests {
         let source = jobs.root().join("source");
         let dest = jobs.root().join("dest");
         fs::create_dir(&source)?;
-        crate::sync_navigation::refresh(&store, &jobs, "lib")?;
+        crate::navigation::fixture_directories(&store, &jobs, "lib")?;
         let id = uuid::Uuid::new_v4().to_string();
         jobs.db.lock().unwrap().execute(
             "INSERT INTO directory_moves(id,library_id,source,destination) VALUES(?1,'lib',?2,?3)",
             params![id, source.to_str(), dest.to_str()],
         )?;
         rename_exclusive(&source, &dest)?;
-        store.lock()?.execute_batch("CREATE TRIGGER fail_navigation BEFORE INSERT ON catalog_sync_navigation BEGIN SELECT RAISE(ABORT,'fixture projection failure'); END;")?;
+        store.lock()?.execute_batch("CREATE TRIGGER fail_navigation BEFORE UPDATE ON directories BEGIN SELECT RAISE(ABORT,'fixture projection failure'); END;")?;
         let error = recover(&jobs, &store).unwrap_err();
         assert!(format!("{error:#}").contains("fixture projection failure"));
         assert!(ensure_reconciled(&jobs).is_err());
@@ -1028,7 +1062,13 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_navigation")?;
         recover(&jobs, &store)?;
         ensure_reconciled(&jobs)?;
-        let pages = crate::sync_navigation::pages(&store.read()?, "lib")?;
+        let pages = crate::navigation::pages(
+            &store.read()?,
+            "lib",
+            jobs.root(),
+            &crate::navigation::roots(&store.read()?, "lib")?,
+            &Default::default(),
+        )?;
         assert!(pages.contains_key(dest.to_str().unwrap()));
         assert!(!pages.contains_key(source.to_str().unwrap()));
         Ok(())

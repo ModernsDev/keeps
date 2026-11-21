@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 26;
+const VERSION: i64 = 27;
 const DIRECTORY_EXACT: &str = "SELECT library_id,asset_id,directory FROM catalog_asset_directories WHERE library_id=? AND directory=?";
 const DIRECTORY_RANGE: &str = "SELECT library_id,asset_id,directory FROM catalog_asset_directories WHERE library_id=? AND directory>=? AND directory<?";
 const LIVE_ASSET: &str = "EXISTS(SELECT 1 FROM catalog_physical_files live
@@ -121,7 +121,6 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
             "SELECT library_id,asset_id,created_at FROM catalog_missing_capture_dates LIMIT 0",
         )?;
         db.prepare("SELECT library_id,generation,floor FROM catalog_sync_state LIMIT 0")?;
-        db.prepare("SELECT library_id,path,page_json FROM catalog_sync_navigation LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,revision,deleted,changed_at FROM catalog_sync_assets LIMIT 0")?;
         db.prepare("SELECT library_id,replica_id,generation,ack_revision,delivered_revision,expires_at FROM catalog_replicas LIMIT 0")?;
         db.prepare("SELECT library_id,name FROM catalog_tags LIMIT 0")?;
@@ -144,6 +143,10 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         db.prepare("SELECT library_id,id,snapshot FROM photos LIMIT 0")?;
         db.prepare("SELECT library_id,id,snapshot FROM videos LIMIT 0")?;
         db.prepare("SELECT library_id,path,parent_path FROM directories LIMIT 0")?;
+        db.prepare("SELECT library_id,path,active FROM folders LIMIT 0")?;
+        db.prepare("SELECT id FROM directory_inventory_pending LIMIT 0")?;
+        db.prepare("SELECT library_id,path FROM directory_creations LIMIT 0")?;
+        db.prepare("SELECT library_id,path,verified_hash FROM catalog_file_checks LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,source_hash,spec,status,attempts,available_at,last_error,thumbnail,standard,updated_at,audited_at,published_source_hash,published_spec,thumbnail_operation_id,browse_operation_id FROM media_cache LIMIT 0")?;
         db.prepare("SELECT next_batch_at,last_batch_count,last_batch_at,last_error,free_bytes FROM cache_runtime LIMIT 0")?;
         db.prepare("SELECT snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed FROM catalog_assets LIMIT 0")?;
@@ -175,6 +178,14 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         allow_migrate,
         "database migration required: stop the service, back up SQLite, then run keeps-server migrate"
     );
+    let foreign_keys: bool = db.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    db.pragma_update(None, "foreign_keys", false)?;
+    let migration = migrate_schema(db, version);
+    db.pragma_update(None, "foreign_keys", foreign_keys)?;
+    migration
+}
+
+fn migrate_schema(db: &mut Connection, version: i64) -> Result<()> {
     tracing::info!(from = version, to = VERSION, "migrating NAS catalog");
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if version == 0 {
@@ -301,9 +312,151 @@ CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NUL
             "catalog paths violate SQLite foreign keys"
         );
     }
+    if version < 27 {
+        crate::navigation::migrate(&tx)?;
+        crate::physical_files::enforce_directory_references(&tx)?;
+        let mut check = tx.prepare("PRAGMA foreign_key_check")?;
+        ensure!(
+            check.query([])?.next()?.is_none(),
+            "directory migration violates SQLite foreign keys"
+        );
+        drop(check);
+        if version != 0 {
+            tx.execute(
+                "INSERT OR IGNORE INTO directory_inventory_pending VALUES(1)",
+                [],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM catalog_revision_dirty WHERE kind='navigation'",
+            [],
+        )?;
+    }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
     Ok(())
+}
+
+pub(crate) struct SidecarPublication<'a> {
+    pub media: &'a str,
+    pub path: &'a str,
+    pub hash: &'a str,
+    pub identity: Option<&'a str>,
+    pub authorized_import: bool,
+}
+
+pub(crate) fn register_sidecar(
+    db: &Connection,
+    lib: &str,
+    asset: &str,
+    input: SidecarPublication<'_>,
+) -> Result<()> {
+    let SidecarPublication {
+        media: media_path,
+        path,
+        hash,
+        identity,
+        authorized_import,
+    } = input;
+    let root: String = db.query_row(
+        "SELECT i.root_id FROM catalog_physical_files p JOIN catalog_identity_roots i USING(library_id,asset_id)
+         WHERE p.library_id=? AND p.asset_id=? AND p.path=? AND p.role<>'sidecar'",
+        params![lib,asset,media_path], |r| r.get(0),
+    )?;
+    ensure!(
+        identity == Some(root.as_str()) || identity.is_none() && authorized_import,
+        invalid("XMP 照片身份与原片不一致")
+    );
+    let current: Option<(String, String)> = db
+        .query_row(
+            "SELECT asset_id,role FROM catalog_physical_files WHERE library_id=? AND path=?",
+            params![lib, path],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    ensure!(
+        current.is_none_or(|(id, role)| id == asset && role == "sidecar"),
+        invalid("XMP 已关联其他照片")
+    );
+    crate::physical_files::publish(db, lib, asset, path, hash, "sidecar", false)?;
+    Ok(())
+}
+
+pub(crate) fn ingest_original_in_transaction(
+    db: &Connection,
+    lib: &str,
+    path: &str,
+    file: &Value,
+    snapshot: &Value,
+    evidence: &crate::versions::VersionEvidence,
+) -> Result<String> {
+    let hash = text(file, "contentHash")?;
+
+    let root = snapshot["photoID"]
+        .as_str()
+        .map(|value| Uuid::parse_str(value).map(|id| id.to_string()))
+        .transpose()
+        .context("invalid photoID")?;
+    let previous_path_asset: Option<String> = db
+        .query_row(
+            "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=? AND content_hash=?",
+            params![lib, path, hash],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let id = match identified_photo(db, lib, snapshot, root.as_deref(), previous_path_asset)? {
+        Some(id) => id,
+        None => crate::photo_relations::filename_match(db, lib, path, snapshot)?
+            .unwrap_or_else(|| capture_uuid(snapshot)),
+    };
+    if existing(db, lib, &id)?.is_none() {
+        let mut snapshot = snapshot.clone();
+        snapshot
+            .as_object_mut()
+            .context("snapshot is not an object")?
+            .remove("assetID");
+        snapshot["id"] = json!(id);
+        snapshot["trashed"] = json!(false);
+        save(db, lib, &snapshot)?;
+    }
+    let canonical = root.as_deref().unwrap_or(&id);
+    db.execute(
+        "INSERT OR IGNORE INTO catalog_identity_aliases VALUES(?,?,?)",
+        params![lib, canonical, id],
+    )?;
+    db.execute(
+        "INSERT OR IGNORE INTO catalog_identity_roots VALUES(?,?,?)",
+        params![lib, id, canonical],
+    )?;
+    register_file(db, lib, &id, file, "online")?;
+    crate::versions::register(db, lib, &id, path, file, snapshot, evidence)?;
+    for (kind, value) in photo_source_keys(snapshot) {
+        db.execute(
+            "INSERT OR IGNORE INTO catalog_photo_sources VALUES(?,?,?,?)",
+            params![lib, kind, value, id],
+        )?;
+    }
+    if let Some(time) = snapshot["captureTime"].as_str() {
+        db.execute("UPDATE catalog_assets SET snapshot=json_set(snapshot,'$.captureTime',?),sort_time=? WHERE library_id=? AND id=? AND json_extract(snapshot,'$.captureTime') IS NULL",params![time,time,lib,id])?;
+    }
+    let known_date: bool = db.query_row("SELECT json_extract(snapshot,'$.captureTime') IS NOT NULL FROM catalog_assets WHERE library_id=? AND id=?",params![lib,id],|r|r.get(0))?;
+    if known_date {
+        db.execute(
+            "DELETE FROM catalog_missing_capture_dates WHERE library_id=? AND asset_id=?",
+            params![lib, id],
+        )?;
+    } else {
+        db.execute(
+            "INSERT OR IGNORE INTO catalog_missing_capture_dates VALUES(?,?,?)",
+            params![lib, id, Utc::now().to_rfc3339()],
+        )?;
+    }
+    let id = db.query_row(
+        "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=?",
+        params![lib, path],
+        |r| r.get::<_, String>(0),
+    )?;
+    Ok(id)
 }
 
 pub(crate) fn photo_source_keys(
@@ -411,7 +564,7 @@ pub(crate) fn register_derivative(db: &Connection, lib: &str, id: &str, d: &Valu
     Ok(())
 }
 
-fn register_file(
+pub(crate) fn register_file(
     db: &Connection,
     lib: &str,
     id: &str,
@@ -1009,6 +1162,7 @@ impl Store {
         );
         Ok(true)
     }
+    #[cfg(test)]
     pub(crate) fn publish_identity_sidecar(
         &self,
         lib: &str,
@@ -1026,29 +1180,20 @@ impl Store {
         );
         let mut db = self.lock()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let root: String = tx.query_row(
-            "SELECT i.root_id FROM catalog_physical_files p JOIN catalog_identity_roots i USING(library_id,asset_id)
-             WHERE p.library_id=? AND p.asset_id=? AND p.path=? AND p.role<>'sidecar'",
-            params![lib,asset,media_path], |r| r.get(0),
-        )?;
         let identity = crate::identity::file_sidecar_photo_id(sidecar)?;
-        ensure!(
-            identity.as_deref() == Some(root.as_str()) || identity.is_none() && batch_id.is_some(),
-            invalid("XMP 照片身份与原片不一致")
-        );
-        let current: Option<(String, String)> = tx
-            .query_row(
-                "SELECT asset_id,role FROM catalog_physical_files WHERE library_id=? AND path=?",
-                params![lib, path],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        ensure!(
-            current.is_none_or(|(id, role)| id == asset && role == "sidecar"),
-            invalid("XMP 已关联其他照片")
-        );
         let hash = crate::media::sha256_file(sidecar)?;
-        crate::physical_files::publish(&tx, lib, asset, path, &hash, "sidecar", false)?;
+        register_sidecar(
+            &tx,
+            lib,
+            asset,
+            SidecarPublication {
+                media: media_path,
+                path,
+                hash: &hash,
+                identity: identity.as_deref(),
+                authorized_import: batch_id.is_some(),
+            },
+        )?;
         crate::revisions::flush_for_batch(&tx, batch_id)?;
         tx.commit()?;
         Ok(())
@@ -1087,72 +1232,7 @@ impl Store {
     ) -> Result<String> {
         let mut db = self.lock()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let hash = text(file, "contentHash")?;
-
-        let root = snapshot["photoID"]
-            .as_str()
-            .map(|value| Uuid::parse_str(value).map(|id| id.to_string()))
-            .transpose()
-            .context("invalid photoID")?;
-        let previous_path_asset: Option<String> = tx
-            .query_row(
-                "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=? AND content_hash=?",
-                params![lib, path, hash],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let id = match identified_photo(&tx, lib, snapshot, root.as_deref(), previous_path_asset)? {
-            Some(id) => id,
-            None => crate::photo_relations::filename_match(&tx, lib, path, snapshot)?
-                .unwrap_or_else(|| capture_uuid(snapshot)),
-        };
-        if existing(&tx, lib, &id)?.is_none() {
-            let mut snapshot = snapshot.clone();
-            snapshot
-                .as_object_mut()
-                .context("snapshot is not an object")?
-                .remove("assetID");
-            snapshot["id"] = json!(id);
-            snapshot["trashed"] = json!(false);
-            save(&tx, lib, &snapshot)?;
-        }
-        let canonical = root.as_deref().unwrap_or(&id);
-        tx.execute(
-            "INSERT OR IGNORE INTO catalog_identity_aliases VALUES(?,?,?)",
-            params![lib, canonical, id],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO catalog_identity_roots VALUES(?,?,?)",
-            params![lib, id, canonical],
-        )?;
-        register_file(&tx, lib, &id, file, "online")?;
-        crate::versions::register(&tx, lib, &id, path, file, snapshot, evidence)?;
-        for (kind, value) in photo_source_keys(snapshot) {
-            tx.execute(
-                "INSERT OR IGNORE INTO catalog_photo_sources VALUES(?,?,?,?)",
-                params![lib, kind, value, id],
-            )?;
-        }
-        if let Some(time) = snapshot["captureTime"].as_str() {
-            tx.execute("UPDATE catalog_assets SET snapshot=json_set(snapshot,'$.captureTime',?),sort_time=? WHERE library_id=? AND id=? AND json_extract(snapshot,'$.captureTime') IS NULL",params![time,time,lib,id])?;
-        }
-        let known_date: bool = tx.query_row("SELECT json_extract(snapshot,'$.captureTime') IS NOT NULL FROM catalog_assets WHERE library_id=? AND id=?",params![lib,id],|r|r.get(0))?;
-        if known_date {
-            tx.execute(
-                "DELETE FROM catalog_missing_capture_dates WHERE library_id=? AND asset_id=?",
-                params![lib, id],
-            )?;
-        } else {
-            tx.execute(
-                "INSERT OR IGNORE INTO catalog_missing_capture_dates VALUES(?,?,?)",
-                params![lib, id, Utc::now().to_rfc3339()],
-            )?;
-        }
-        let id = tx.query_row(
-            "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=?",
-            params![lib, path],
-            |r| r.get::<_, String>(0),
-        )?;
+        let id = ingest_original_in_transaction(&tx, lib, path, file, snapshot, evidence)?;
         crate::revisions::flush_for_batch(&tx, batch_id)?;
         tx.commit()?;
         Ok(id)
@@ -1275,6 +1355,9 @@ impl Store {
                 register_file(&tx, lib, &id, &file, "missing")?;
             }
             missing += 1;
+        }
+        if scope == "recursive" {
+            crate::navigation::withdraw_missing(&tx, lib, std::path::Path::new(directory))?;
         }
         for directory in changed_directories {
             crate::photo_relations::reconcile_directory(&tx, lib, &directory)?;
@@ -2106,6 +2189,7 @@ mod tests {
         {
             let mut db = store.lock()?;
             let tx = db.transaction()?;
+            crate::navigation::record(&tx, "lib", new.parent().unwrap())?;
             tx.execute("UPDATE catalog_asset_directories SET directory=? WHERE library_id='lib' AND asset_id=?", params![new.parent().unwrap().to_str(), id])?;
             tx.execute(
                 "UPDATE catalog_physical_files SET path=? WHERE library_id='lib' AND path=?",

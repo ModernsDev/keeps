@@ -1,6 +1,6 @@
 # Keeps Rust 服务
 
-NAS 常驻服务使用 Rust、Axum 和 SQLite，负责资产查询、评分/标签/软回收站、目录追踪、增量扫描、EXIF、HEIC 预览及持久化任务。macOS/iOS 只调用业务 API。旧事件表保留为内部审计和历史迁移来源；客户端事件上传、心跳和预览上传路由已关闭。
+NAS 常驻服务使用 Rust、Axum 和 SQLite，负责资产查询、评分/标签/软回收站、目录追踪、EXIF、HEIC 预览及持久化任务。macOS/iOS 只调用业务 API。旧事件表保留为内部审计和历史迁移来源；客户端事件上传、心跳和预览上传路由已关闭。
 
 ```bash
 cargo test --manifest-path server/Cargo.toml
@@ -12,8 +12,8 @@ python3 deploy/spk/pack.py --payload /tmp/keeps-native-payload --output /tmp/Kee
 
 配置：
 
-- `KEEPS_ROOT`：服务状态目录；`db/control_plane.sqlite` 保存资产，`db/jobs.sqlite` 保存扫描任务。
-- `ORIGINAL_ROOT`：NAS 上已存在的原片根目录，与服务状态目录分离；显式导入需要目标目录可写，扫描继续只读原片。
+- `KEEPS_ROOT`：服务状态目录；`db/control_plane.sqlite` 保存资产，`db/jobs.sqlite` 保存文件操作和照片任务。
+- `ORIGINAL_ROOT`：NAS 上已存在的原片根目录，与服务状态目录分离；显式导入需要目标目录可写，原片字节不可变。
 - `CONTROL_PLANE_PUBLIC_BASE_URL`：客户端可达的服务地址。
 - `KEEPS_ACCESS_TOKEN`：至少 32 字节的共享访问凭据。
 - `CONTROL_PLANE_AUTO_CREATE_SCHEMA=1`：新空库初始化；现有库设 `0`，升级前备份并执行 `keeps-server migrate`。
@@ -27,13 +27,13 @@ python3 deploy/spk/pack.py --payload /tmp/keeps-native-payload --output /tmp/Kee
 
 `GET /libraries/{library}/tags` 返回 `{tags:[String]}` 标签库；`POST` 同路径接收 `{tags:[String]}` 添加并返回完整标签库，每次 1–100 个非空标签，每个不超过 128 字节。标签去除首尾空格并去重。schema 17 迁移回填已有照片标签，后续照片标签写入自动收录；从照片移除标签不删除库条目。沿用 Bearer 鉴权与已有备份、`keeps-server migrate` 升级流程。
 
-SQLite 使用 WAL。后台扫描只读原片，文件哈希或精确 JPEG 图像指纹可以自动归组；EXIF 匹配仅作为待视觉确认的候选。普通核对通过原片 size/mtime 与 XMP 状态签名跳过未变文件。扫描仅由用户显式触发；添加目录只登记配置，启动、文件变化和后台维护均不发起扫描。启动取消历史非人工扫描，将未完成的人工任务标记中断并保留断点供诊断；外部新增、修改、删除和重命名需手动扫描同步。显式导入、移动、默认版本切换与重试继续完成各自必需的索引和预览处理；详见 [架构文档](../docs/ARCHITECTURE.md)。日常媒体解码在 NAS 原生套件执行；Linux 远端 worker 仅用于显式启用的一次性批量处理（`KEEPS_REMOTE_WORKER_ENABLED=1`，默认关闭）。解码依赖 ExifTool、LibRaw、ImageMagick 与 libheif；每个外部进程有时限和内存限制。错误保留完整上下文，任一步失败停止当前任务，等待人工重试。
+SQLite 使用 WAL。在线导航和离线包从 catalog 读取同一目录树和追踪根。导入、移动和回收只处理明确授权的目录、文件与照片组。重试沿用原任务清单，媒体处理失败保留完整错误。日常编码在 NAS 套件运行；Linux worker 由 `KEEPS_REMOTE_WORKER_ENABLED=1` 显式启用。
 
-SIGTERM 停止领取任务并等待当前处理阶段结束。未完成的运行任务在下次启动恢复；停止追踪仅修改数据库。数据库和文件 I/O 在阻塞线程执行，查询接口不会承担媒体解码。元数据读取使用独立 WAL 快照；交互短事务优先于排队的后台事务，照片身份写入不占数据库锁。NAS 接口保持正常 CPU/I/O 优先级；扫描、编码、导入发布、移动、回收与离线导出使用独立低优先级线程，避免把优先级带入 HTTP 线程池。
+SIGTERM 停止领取任务并等待当前处理阶段结束。未完成的运行任务在下次启动恢复；停止追踪仅修改数据库。数据库和文件 I/O 在阻塞线程执行，查询接口不会承担媒体解码。元数据读取使用独立 WAL 快照；交互短事务优先于排队的后台事务，照片身份写入不占数据库锁。NAS 接口保持正常 CPU/I/O 优先级；照片处理、编码、导入发布、移动、回收与离线导出使用独立低优先级线程，避免把优先级带入 HTTP 线程池。
 
 NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现场验收见 [套件说明](../deploy/spk/README.md)。旧 Docker Compose 部署已退役，不得用于启动 NAS 服务。同一资料库只能有一个服务进程管理。
 
-版本机制需要 catalog schema 3，迁移只增加表，不回填或重组历史照片。升级前备份两个 SQLite 数据库。`mechanisms_smoke.py` 使用一次性 Linux Docker volume 和临时样本，不访问 NAS 照片；验收覆盖新增文件等待手动扫描、重启不自动补扫及显式扫描后的索引更新。Docker smoke 脚本仅用于隔离测试，不是 NAS 部署入口。
+目录表升级流程及成对备份要求见 [套件说明](../deploy/spk/README.md#schema-27-目录迁移)。
 
 离线逐文件夹精确重复整理使用 [批量整理脚本](../docs/folder-merge.md)。镜像包含只读 NDJSON 媒体检查命令 `keeps-inspect`；新文件归组仅匹配同一直接父目录内的原片证据，已有路径关联保留。
 
@@ -41,9 +41,9 @@ NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现
 
 `POST /libraries/{library}/directories/trash` 接收 `{path,confirmationName,requestID}`，`requestID` 必须为客户端持久化的 UUID，必须输入与目录名完全相同的确认文字。仅允许当前资料库追踪范围内的子目录；原片根、NAS 共享根、系统目录、符号链接和与其他资料库重叠的目录均拒绝。
 
-服务读取 DSM `/etc/samba/smb.share.conf`，按最长匹配的共享路径确认 `enable recycle bin=yes`，随后通过参数数组调用 NAS 原生 `/usr/syno/bin/synorecycle --rmdir share=<共享名> rpath=<相对目录>`。回收位置、重名处理和删除时间记录由 DSM 管理；Keeps 不手工移动到 `#recycle`、不生成恢复记录，也不以 `rm` 或文件系统删除兜底。配置不可读、回收站未启用或原生程序不可用时明确失败。立即返回 `202` 任务对象 `{id,path,status,phase,error,createdAt,updatedAt,finishedAt}`（时间为 Unix 秒），不等待文件回收。`GET /libraries/{library}/directories/trash/{requestID}` 查询任务；未提交为 404。相同 ID 与参数重复提交返回原任务，参数不同或同一资料库已有其他删除任务为 409；缺少 ID 的旧客户端收到 422 升级提示。任务存于 `jobs.sqlite`，由进程级独立 worker 执行；状态查询使用独立连接，不等待目录执行锁或扫描事务。`status` 为 `pending/running/completed/failed`，真实阶段 `phase` 为 `waiting/recycling/reconciling/completed/failed`，没有推测百分比。客户端断连不取消操作。重启后未完成任务标记失败，waiting 等待用户明确重试，reconciling 仅协调已发生结果；recycling 中断只检查原路径是否消失，已消失则继续对账，仍存在则对账并明确失败、提醒检查部分回收，绝不盲目重放原生回收。恢复使用 File Station 的标准回收站操作，保留期限由 NAS 设置决定。
+服务读取 DSM `/etc/samba/smb.share.conf`，按最长匹配的共享路径确认 `enable recycle bin=yes`，随后通过参数数组调用 NAS 原生 `/usr/syno/bin/synorecycle --rmdir share=<共享名> rpath=<相对目录>`。回收位置、重名处理和删除时间记录由 DSM 管理；Keeps 不手工移动到 `#recycle`、不生成恢复记录，也不以 `rm` 或文件系统删除兜底。配置不可读、回收站未启用或原生程序不可用时明确失败。立即返回 `202` 任务对象 `{id,path,status,phase,error,createdAt,updatedAt,finishedAt}`（时间为 Unix 秒），不等待文件回收。`GET /libraries/{library}/directories/trash/{requestID}` 查询任务；未提交为 404。相同 ID 与参数重复提交返回原任务，参数不同或同一资料库已有其他删除任务为 409；缺少 ID 的旧客户端收到 422 升级提示。任务存于 `jobs.sqlite`，由进程级独立 worker 执行；状态查询使用独立连接，不等待目录执行锁或照片处理事务。`status` 为 `pending/running/completed/failed`，真实阶段 `phase` 为 `waiting/recycling/reconciling/completed/failed`，没有推测百分比。客户端断连不取消操作。重启后未完成任务标记失败，waiting 等待用户明确重试，reconciling 仅协调已发生结果；recycling 中断只检查原路径是否消失，已消失则继续对账，仍存在则对账并明确失败、提醒检查部分回收，绝不盲目重放原生回收。恢复使用 File Station 的标准回收站操作，保留期限由 NAS 设置决定。
 
-扫描、身份核对与导入发布同目录移动互斥，原生删除后核对并移除已消失的原路径索引、更新修订并停用被移动的追踪根；没有其他可用原片路径的资产从普通列表和计数排除，按 ID 的资产历史保留，不加入 Keeps 软件回收站；仍有其他路径的资产保留。通过 File Station 恢复后重新扫描（若追踪根已停用则重新追踪）才恢复可用。原生程序失败也会核对已消失的路径，避免部分完成后索引不一致；错误提醒检查 NAS 回收站，不能将错误理解为文件均仍在原目录。此接口只支持可读取真实 DSM 共享配置的 NAS 原生部署；配置不可读时会明确失败。
+身份核对与导入发布同目录移动互斥，原生删除后核对并移除已消失的原路径索引、更新修订并停用被移动的追踪根；没有其他可用原片路径的资产从普通列表和计数排除，按 ID 的资产历史保留，不加入 Keeps 软件回收站；仍有其他路径的资产保留。通过 File Station 恢复的文件须停服核对并登记。原生程序失败也会核对已消失的路径，避免部分完成后索引不一致；错误提醒检查 NAS 回收站，不能将错误理解为文件均仍在原目录。此接口只支持可读取真实 DSM 共享配置的 NAS 原生部署；配置不可读时会明确失败。
 
 ## 显式回收所有弃用照片
 
@@ -53,7 +53,7 @@ NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现
 
 `GET` / `PUT /libraries/{library}/trash/settings` 读取或保存 `{enabled,retentionDays}`。默认关闭，用户启用后保留 30 天，可设为 1–3650 天或关闭；从进入 Keeps 回收站起计时，恢复即取消计时，再入站重新计时。schema 16 迁移时已有回收站照片从迁移当天起计时。NAS 后台每小时检查到期清单，客户端关闭不影响执行；任务开始前再次检查当前保留期限和启用状态。
 
-任务与逐文件断点保存在 `jobs.sqlite`，API 返回 `{id,count,status,phase,completedFiles,totalFiles,error,createdAt,updatedAt,finishedAt}`。回收与扫描、目录移动、照片状态修改及曝光提交互斥。中断原生调用不盲目重放；原文件消失则继续剩余清单。失败对账消失路径，未回收文件和照片资料保留；失败任务不重试，需核实 NAS 回收站后重新预览。全部文件确认回收后，清除照片图库资料及编辑记录，专属生成缓存进入现有安全 GC 队列；NAS 回收站恢复后需重新扫描索引。
+任务与逐文件断点保存在 `jobs.sqlite`，API 返回 `{id,count,status,phase,completedFiles,totalFiles,error,createdAt,updatedAt,finishedAt}`。回收与扫描、目录移动、照片状态修改及曝光提交互斥。中断原生调用不盲目重放；原文件消失则继续剩余清单。失败对账消失路径，未回收文件和照片资料保留；失败任务不重试，需核实 NAS 回收站后重新预览。全部文件确认回收后，清除照片图库资料及编辑记录，专属生成缓存进入现有安全 GC 队列；NAS 回收站恢复后须停服核对并登记。
 
 ## 按版本归并与回收
 

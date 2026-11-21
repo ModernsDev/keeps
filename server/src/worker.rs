@@ -7,7 +7,6 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     fs,
@@ -19,7 +18,6 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-/// User-submitted work runs on one low-priority thread and resumes persisted scan checkpoints.
 pub fn run(
     store: Arc<Store>,
     jobs: Arc<Jobs>,
@@ -30,7 +28,7 @@ pub fn run(
         .probe()
         .context("NAS media runtime unavailable")?;
     while !stop.load(Ordering::Relaxed) {
-        if let Some(job) = jobs.claim_class("manual")? {
+        if let Some(job) = jobs.claim_photo_processing()? {
             run_claimed(&store, &jobs, &previews, &job, &stop)?;
         } else {
             jobs.wait_for_scan_work(jobs.scan_wait_duration()?);
@@ -46,8 +44,13 @@ fn run_claimed(
     job: &Job,
     stop: &AtomicBool,
 ) -> Result<()> {
-    jobs.set_phase(&job.id, "scanning")?;
-    let mut result = run_slice(store, jobs, previews, job, stop, 1);
+    let parent = Path::new(&job.path)
+        .parent()
+        .and_then(Path::to_str)
+        .context("photo work requires a parent directory")?;
+    store.note_revision_activity(&job.library_id, &job.id, parent)?;
+    jobs.set_phase(&job.id, "processing")?;
+    let mut result = run_one(store, jobs, previews, job, stop);
     let terminal = !matches!(result, Ok(false))
         || stop.load(Ordering::Relaxed)
         || jobs
@@ -58,24 +61,11 @@ fn run_claimed(
             if matches!(result, Ok(true)) && !stop.load(Ordering::Relaxed) {
                 jobs.set_phase(&job.id, "publishing")?;
             }
-            let _directory_guard = jobs.directory_mutation.write().unwrap();
-            if job.scope_kind == "file" {
-                crate::sync_navigation::refresh_file(
-                    store,
-                    jobs,
-                    &job.library_id,
-                    Path::new(&job.path),
-                )?;
-            } else {
-                crate::sync_navigation::refresh(store, jobs, &job.library_id)?;
-            }
             store.finish_revision_batch(&job.id, false)
         })();
         if let Err(error) = publication {
             result = Err(match result {
-                Err(original) => {
-                    original.context(format!("publish directory projection: {error:#}"))
-                }
+                Err(original) => original.context(format!("finish photo revision: {error:#}")),
                 Ok(_) => error,
             });
         }
@@ -129,7 +119,6 @@ struct Progress {
     processed: i64,
     skipped: i64,
     failed: i64,
-    last_error: Option<String>,
 }
 
 pub fn run_one(
@@ -139,172 +128,21 @@ pub fn run_one(
     job: &Job,
     stop: &AtomicBool,
 ) -> Result<bool> {
-    run_slice(store, jobs, previews, job, stop, usize::MAX)
-}
-
-fn run_slice(
-    store: &Store,
-    jobs: &Jobs,
-    previews: &PreviewStorage,
-    job: &Job,
-    stop: &AtomicBool,
-    limit: usize,
-) -> Result<bool> {
     let _directory_guard = jobs.directory_mutation.read().unwrap();
     crate::directory_move::ensure_reconciled(jobs)?;
     let current = jobs.job(&job.id)?.context("claimed job disappeared")?;
-    let job = &current;
-    if stopped(jobs, job, stop)? {
+    if stopped(jobs, &current, stop)? {
         return Ok(false);
     }
-    let mut units = 0;
-    let root = jobs.validate_scan_path(Path::new(&job.path), &job.scope_kind)?;
-    let mut progress = Progress {
-        processed: job.processed,
-        skipped: job.skipped,
-        failed: job.failed,
-        last_error: None,
-    };
-    if job.scope_kind == "file" {
-        match fs::symlink_metadata(&root) {
-            Ok(metadata) if metadata.is_file() => {
-                process_entry(store, jobs, previews, job, &root, stop, &mut progress)?
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("inspect changed file"),
-        }
-        publish(jobs, job, &progress, None)?;
-    } else {
-        let mut cursor: ScanCursor = match jobs.load_checkpoint(&job.id)? {
-            Some(value) => serde_json::from_str(&value).context("read scan checkpoint")?,
-            None => ScanCursor {
-                pending: vec![root.clone()],
-                current: None,
-                last_name: None,
-            },
-        };
-        loop {
-            if stopped(jobs, job, stop)? {
-                return Ok(false);
-            }
-            if cursor.current.is_none() {
-                cursor.current = cursor.pending.pop();
-                cursor.last_name = None;
-                save_cursor(jobs, job, &cursor, &progress)?;
-            }
-            let Some(directory) = cursor.current.clone() else {
-                break;
-            };
-            if !directory.try_exists()? {
-                cursor.current = None;
-                save_cursor(jobs, job, &cursor, &progress)?;
-                continue;
-            }
-            jobs.validate_scan_path(&directory, "directory")?;
-            let entries = match fs::read_dir(&directory) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    cursor.current = None;
-                    save_cursor(jobs, job, &cursor, &progress)?;
-                    continue;
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("read directory {}", directory.display()));
-                }
-            };
-            store.record_directory(&job.library_id, &directory)?;
-            let mut entries = entries.collect::<std::io::Result<Vec<_>>>()?;
-            entries.sort_by_key(|entry| entry.file_name());
-            for entry in entries {
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("original filename must be UTF-8"))?;
-                if cursor.last_name.as_ref().is_some_and(|last| name <= *last) {
-                    continue;
-                }
-                if stopped(jobs, job, stop)? {
-                    return Ok(false);
-                }
-                if units >= limit || (limit == usize::MAX && jobs.should_yield(job)?) {
-                    jobs.yield_job(&job.id)?;
-                    return Ok(false);
-                }
-                if !excluded(&name) {
-                    let kind = match entry.file_type() {
-                        Ok(kind) => Some(kind),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(error) => {
-                            return Err(error)
-                                .with_context(|| format!("read entry {}", entry.path().display()));
-                        }
-                    };
-                    if kind.is_some_and(|kind| kind.is_dir()) && job.scope_kind == "recursive" {
-                        cursor.pending.push(entry.path());
-                    } else if kind.is_some_and(|kind| kind.is_file())
-                        && (media::is_photo(&entry.path()) || media::is_video(&entry.path()))
-                    {
-                        process_entry(
-                            store,
-                            jobs,
-                            previews,
-                            job,
-                            &entry.path(),
-                            stop,
-                            &mut progress,
-                        )?;
-                        units += 1;
-                    }
-                }
-                cursor.last_name = Some(name);
-                save_cursor(jobs, job, &cursor, &progress)?;
-            }
-            cursor.current = None;
-            save_cursor(jobs, job, &cursor, &progress)?;
-        }
-    }
-    if stopped(jobs, job, stop)? {
-        return Ok(false);
-    }
-    if store.mark_missing_scope_with_revision(
-        &job.library_id,
-        &job.path,
-        &job.scope_kind,
-        Some(&job.id),
-    )? > 0
-    {
-        store.reconcile_cache()?;
-    }
-    if job.scope_kind == "file" && progress.failed > 0 {
-        bail!(
-            "{} files failed; latest failure: {}",
-            progress.failed,
-            progress
-                .last_error
-                .as_deref()
-                .unwrap_or("see earlier scan errors")
-        );
-    }
+    ensure!(
+        current.scope_kind == "file",
+        "directory scanning has been retired"
+    );
+    let path = jobs.validate_scan_path(Path::new(&current.path), "file")?;
+    let mut progress = Progress::default();
+    process_entry(store, jobs, previews, &current, &path, &mut progress)?;
+    publish(jobs, &current, &progress, None)?;
     Ok(true)
-}
-
-#[derive(Serialize, Deserialize)]
-struct ScanCursor {
-    pending: Vec<PathBuf>,
-    current: Option<PathBuf>,
-    last_name: Option<String>,
-}
-
-fn save_cursor(jobs: &Jobs, job: &Job, cursor: &ScanCursor, progress: &Progress) -> Result<()> {
-    jobs.save_scan_progress(
-        &job.id,
-        &serde_json::to_string(cursor)?,
-        progress.processed,
-        progress.skipped,
-        progress.failed,
-    )
 }
 
 fn process_entry(
@@ -313,7 +151,6 @@ fn process_entry(
     previews: &PreviewStorage,
     job: &Job,
     path: &Path,
-    _stop: &AtomicBool,
     progress: &mut Progress,
 ) -> Result<()> {
     publish(
@@ -326,12 +163,10 @@ fn process_entry(
     match result {
         Ok(true) => progress.processed += 1,
         Ok(false) => progress.skipped += 1,
-        Err(_) if !path.try_exists()? => progress.skipped += 1,
         Err(error) => {
             let trace = format!("processing {}: {error:#}", path.display());
             tracing::error!(job_id = %job.id, error = %trace, "NAS photo processing failed");
             progress.failed += 1;
-            progress.last_error = Some(trace);
             publish(
                 jobs,
                 job,
@@ -346,9 +181,6 @@ fn process_entry(
 
 fn stopped(jobs: &Jobs, job: &Job, stop: &AtomicBool) -> Result<bool> {
     Ok(stop.load(Ordering::Relaxed) || !jobs.is_active(&job.folder_id)?)
-}
-fn excluded(name: &str) -> bool {
-    name.starts_with('.') || name == "@eaDir" || name == "#recycle"
 }
 fn publish(jobs: &Jobs, job: &Job, progress: &Progress, path: Option<&str>) -> Result<()> {
     jobs.update_progress(
@@ -412,9 +244,7 @@ fn photo_paths(store: &Store, jobs: &Jobs, library: &str, path: &Path) -> Result
             r.get::<_, String>(0)
         })? {
             let p = PathBuf::from(item?);
-            if p.parent() == Some(Path::new(parent))
-                && fs::symlink_metadata(&p).is_ok_and(|info| info.is_file())
-            {
+            if p.parent() == Some(Path::new(parent)) {
                 paths.push(p);
             }
         }
@@ -452,7 +282,7 @@ fn managed_sidecars(
     use rusqlite::OptionalExtension;
     let catalog = store.read()?;
     let mut managed = Vec::new();
-    for sidecar in media::sidecars(path)? {
+    for sidecar in media::sidecar_candidates(path) {
         let publication = jobs.file_publication(library, &sidecar)?;
         let hash: Option<String> = if let Some((hash, _)) = publication {
             Some(hash)
@@ -474,31 +304,6 @@ fn managed_sidecars(
     Ok(managed)
 }
 
-fn publish_import_sidecars(
-    store: &Store,
-    jobs: &Jobs,
-    library: &str,
-    id: &str,
-    path: &Path,
-) -> Result<()> {
-    for sidecar in media::sidecars(path)? {
-        if let Some((hash, batch)) = jobs.file_publication(library, &sidecar)? {
-            ensure!(
-                crate::imports::file_digest(jobs, library, &sidecar)? == hash,
-                "已导入的 XMP 在图库之外发生变更：{}",
-                sidecar.display()
-            );
-            store.publish_identity_sidecar(library, id, path, &sidecar, batch.as_deref())?;
-            jobs.complete_file_publication(
-                library,
-                sidecar.to_str().context("sidecar path must be UTF-8")?,
-                &hash,
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn process_photo(
     store: &Store,
     jobs: &Jobs,
@@ -506,9 +311,11 @@ fn process_photo(
     job: &Job,
     path: &Path,
 ) -> Result<bool> {
-    if managed_source_hash(store, jobs, &job.library_id, path)?.is_none() {
-        return Ok(false);
-    }
+    ensure!(
+        managed_source_hash(store, jobs, &job.library_id, path)?.is_some(),
+        "file is not registered for processing: {}",
+        path.display()
+    );
     let paths = photo_paths(store, jobs, &job.library_id, path)?;
     // Metadata writers may replace inodes. Keep the whole photo group untouched
     // until import checkpoints make every published link independently recoverable.
@@ -516,31 +323,9 @@ fn process_photo(
         bail!("照片组尚未完成发布，请完成导入后重试：{}", path.display());
     }
     crate::tasks::begin_photo(jobs, &job.library_id, &job.work_class, path, &paths)?;
-    let uninterrupted = AtomicBool::new(false);
     let result = (|| {
-        let mut changed = false;
         jobs.set_phase(&job.id, "indexing")?;
-        for source in &paths {
-            changed |= process_file(store, jobs, previews, job, source, &uninterrupted)?;
-        }
-        let assets = {
-            let db = store.lock()?;
-            let mut ids = std::collections::BTreeSet::new();
-            for source in &paths {
-                use rusqlite::OptionalExtension;
-                if let Some(id) = db
-                    .query_row(
-                        "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=?",
-                        rusqlite::params![job.library_id, source.to_str()],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()?
-                {
-                    ids.insert(id);
-                }
-            }
-            ids
-        };
+        let (mut changed, assets) = process_files(store, jobs, job, &paths)?;
         for id in assets {
             store.initialize_negative(&job.library_id, &id)?;
             jobs.set_phase(&job.id, "media")?;
@@ -565,252 +350,518 @@ fn process_photo(
     result
 }
 
+struct SidecarWrite {
+    previous_hash: Option<String>,
+    hash: String,
+    packet: Vec<u8>,
+}
+
+fn apply_sidecar_write(path: &Path, write: &SidecarWrite) -> Result<()> {
+    let existing = match path.symlink_metadata() {
+        Ok(info) if info.is_file() => Some(media::sha256_file(path)?),
+        Ok(_) => bail!("XMP is not a regular file: {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("check XMP {}", path.display())),
+    };
+    if existing.as_deref() != Some(write.hash.as_str()) {
+        ensure!(
+            existing == write.previous_hash,
+            "XMP changed outside Keeps: {}",
+            path.display()
+        );
+        crate::identity::install_sidecar_packet(path, &write.packet, existing.is_some())?;
+    }
+    Ok(())
+}
+
+fn recover_sidecar_write(
+    jobs: &Jobs,
+    library: &str,
+    path: &Path,
+    original_hash: &str,
+) -> Result<()> {
+    use rusqlite::{OptionalExtension, params};
+    let planned: Option<(String, SidecarWrite)> = jobs.db.lock()?.query_row(
+        "SELECT source_hash,previous_hash,hash,packet FROM identity_sidecar_writes WHERE library_id=? AND path=?",
+        params![library,path.to_str()],
+        |r| Ok((r.get(0)?,SidecarWrite { previous_hash:r.get(1)?, hash:r.get(2)?, packet:r.get(3)? })),
+    ).optional()?;
+    if let Some((source, write)) = planned {
+        ensure!(
+            source == original_hash,
+            "XMP write does not belong to this source version"
+        );
+        apply_sidecar_write(path, &write)?;
+    }
+    Ok(())
+}
+
+fn plan_sidecar_write(
+    jobs: &Jobs,
+    library: &str,
+    source: &FileWork,
+    path: &Path,
+    root: &str,
+) -> Result<String> {
+    use rusqlite::params;
+    use sha2::{Digest, Sha256};
+
+    let previous_hash = if source.sidecars.iter().any(|sidecar| sidecar == path) {
+        Some(media::sha256_file(path)?)
+    } else {
+        ensure!(
+            !path.try_exists()?,
+            "既有的 XMP 尚未登记，请先核对图库：{}",
+            path.display()
+        );
+        None
+    };
+    let packet = crate::identity::sidecar_packet(
+        path,
+        root,
+        &source
+            .metadata
+            .as_ref()
+            .context("new XMP needs metadata")?
+            .source,
+    )?;
+    let hash = format!("{:x}", Sha256::digest(&packet));
+    let write = SidecarWrite {
+        previous_hash,
+        hash,
+        packet,
+    };
+    {
+        let mut db = jobs.db.lock()?;
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO identity_sidecar_writes VALUES(?,?,?,?,?,?)",
+            params![
+                library,
+                path.to_str(),
+                source.hash,
+                write.previous_hash,
+                write.hash,
+                write.packet
+            ],
+        )?;
+        Jobs::permit_file(&tx, library, path, &write.hash, None)?;
+        tx.commit()?;
+    }
+    apply_sidecar_write(path, &write)?;
+    Ok(write.hash)
+}
+
+struct Extracted {
+    source: media::Metadata,
+    snapshot: serde_json::Value,
+    file: serde_json::Value,
+    evidence: VersionEvidence,
+}
+
+struct FileWork {
+    path: PathBuf,
+    hash: String,
+    size: i64,
+    mtime: i64,
+    pending: bool,
+    sidecars: Vec<PathBuf>,
+    stamp: String,
+    previous: Option<crate::jobs::FileState>,
+    metadata: Option<Extracted>,
+}
+
+fn prepare_file(store: &Store, jobs: &Jobs, job: &Job, path: &Path) -> Result<FileWork> {
+    jobs.validate_path(path.parent().context("original has no parent")?)?;
+    let text = path.to_str().context("original path must be UTF-8")?;
+    let library = &job.library_id;
+    let (hash, pending) = managed_source_hash(store, jobs, library, path)?
+        .with_context(|| format!("file is not registered for processing: {text}"))?;
+    let (size, mtime) = file_stamp(path)?;
+    let asset = store.existing_asset_for_path(library, text)?;
+    let canonical = crate::identity::sidecar_path(path);
+    if jobs.file_publication(library, &canonical)?.is_some() {
+        ensure!(
+            crate::imports::file_digest(jobs, library, path)? == hash,
+            "原片内容在图库之外发生变更：{text}"
+        );
+        recover_sidecar_write(jobs, library, &canonical, &hash)?;
+    }
+    let sidecars = managed_sidecars(store, jobs, library, asset.as_deref(), path)?;
+    let stamp = media::sidecar_paths_stamp(&sidecars)?;
+    let previous = jobs.file_state(&job.folder_id, text)?;
+    let root = asset
+        .as_ref()
+        .map(|id| store.root_id(library, id))
+        .transpose()?;
+    let reuse = if let Some(previous) = &previous {
+        (!job.refresh_metadata
+            || job.metadata_operation_id.is_some()
+                && previous.metadata_operation_id == job.metadata_operation_id)
+            && previous.size == size
+            && previous.mtime_ns == mtime
+            && previous.metadata_stamp == stamp
+            && previous.error.is_none()
+            && previous.version == hash
+            && root.is_some()
+            && (!pending || crate::imports::file_digest(jobs, library, path)? == hash)
+            && store.original_is_online(library, text, &hash)?
+            && ((!sidecars.contains(&canonical) && !pending)
+                || (sidecars.contains(&canonical)
+                    && crate::identity::standard_sidecar_photo_id(path)? == root))
+    } else {
+        false
+    };
+    let metadata = if reuse {
+        None
+    } else {
+        ensure!(
+            crate::imports::file_digest(jobs, library, path)? == hash,
+            "原片内容在图库之外发生变更：{text}"
+        );
+        let source = MediaProcessor::new().extract_with_sidecars(path, &sidecars)?;
+        ensure!(
+            file_stamp(path)? == (size, mtime),
+            "original changed during metadata extraction: {text}"
+        );
+        ensure!(
+            media::sidecar_paths_stamp(&sidecars)? == stamp,
+            "XMP changed during metadata extraction: {text}"
+        );
+        let now = Utc::now().to_rfc3339();
+        let mut snapshot = json!({
+            "cameraMake":source.camera_make,"cameraModel":source.camera_model,"lensModel":source.lens_model,
+            "originalFilename":source.original_filename.as_deref().unwrap_or(path.file_name().and_then(|name| name.to_str()).context("original filename missing")?),
+            "contentFingerprint":hash,"metadataFingerprint":source.fingerprint(path),"rating":source.rating,
+            "flagState":"unflagged","tags":[],"createdAt":now,"updatedAt":now,
+        });
+        for (key, value) in [
+            ("captureTime", source.capture_time.as_deref()),
+            ("photoID", root.as_deref().or(source.photo_id.as_deref())),
+            ("cameraImageID", source.camera_image_id.as_deref()),
+            ("documentID", source.document_id.as_deref()),
+            ("originalDocumentID", source.original_document_id.as_deref()),
+        ] {
+            if let Some(value) = value {
+                snapshot[key] = json!(value);
+            }
+        }
+        let file = json!({"contentHash":hash,"sizeBytes":size,"role":if media::is_raw(path){"raw_original"}else{"jpeg_original"}});
+        let evidence = VersionEvidence {
+            visual_hash: None,
+            width: source.width,
+            height: source.height,
+            edited: source.edited && !media::is_raw(path),
+            camera_serial: source.camera_serial.clone(),
+            capture_original: source.capture_original.clone(),
+        };
+        Some(Extracted {
+            source,
+            snapshot,
+            file,
+            evidence,
+        })
+    };
+    Ok(FileWork {
+        path: path.to_path_buf(),
+        hash,
+        size,
+        mtime,
+        pending,
+        sidecars,
+        stamp,
+        previous,
+        metadata,
+    })
+}
+
+struct IndexedFile {
+    path: PathBuf,
+    state: crate::jobs::FileState,
+    completed: Vec<(PathBuf, String)>,
+    identity_ready: bool,
+}
+
+fn publish_file(
+    db: &rusqlite::Connection,
+    jobs: &Jobs,
+    job: &Job,
+    work: FileWork,
+) -> Result<IndexedFile> {
+    use crate::catalog::{SidecarPublication, ingest_original_in_transaction, register_sidecar};
+    use rusqlite::params;
+
+    let library = &job.library_id;
+    let text = work.path.to_str().context("original path must be UTF-8")?;
+    ensure!(
+        file_stamp(&work.path)? == (work.size, work.mtime),
+        "original changed before catalog publication: {text}"
+    );
+    ensure!(
+        media::sidecar_paths_stamp(&work.sidecars)? == work.stamp,
+        "XMP changed before catalog publication: {text}"
+    );
+    let asset: String = if let Some(metadata) = &work.metadata {
+        ingest_original_in_transaction(
+            db,
+            library,
+            text,
+            &metadata.file,
+            &metadata.snapshot,
+            &metadata.evidence,
+        )?
+    } else {
+        db.query_row(
+            "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=? AND content_hash=?",
+            params![library, text, work.hash],
+            |r| r.get(0),
+        )?
+    };
+    let root: String = db.query_row(
+        "SELECT root_id FROM catalog_identity_roots WHERE library_id=? AND asset_id=?",
+        params![library, asset],
+        |r| r.get(0),
+    )?;
+    let canonical = crate::identity::sidecar_path(&work.path);
+    let mut sidecars = work.sidecars.clone();
+    let canonical_valid = sidecars.contains(&canonical)
+        && crate::identity::standard_sidecar_photo_id(&work.path)?.as_deref() == Some(&root);
+    if !canonical_valid && (work.pending || job.refresh_metadata && sidecars.contains(&canonical)) {
+        plan_sidecar_write(jobs, library, &work, &canonical, &root)?;
+        if !sidecars.contains(&canonical) {
+            sidecars.push(canonical);
+        }
+    }
+    let mut identity_ready = false;
+    let mut completed = Vec::new();
+    for path in &sidecars {
+        let identity = crate::identity::file_sidecar_photo_id(path)?;
+        if identity.as_deref() == Some(root.as_str()) {
+            identity_ready = true;
+        }
+        if let Some((hash, batch)) = jobs.file_publication(library, path)? {
+            ensure!(
+                crate::imports::file_digest(jobs, library, path)? == hash,
+                "已导入的 XMP 在图库之外发生变更：{}",
+                path.display()
+            );
+            register_sidecar(
+                db,
+                library,
+                &asset,
+                SidecarPublication {
+                    media: text,
+                    path: path.to_str().context("XMP path must be UTF-8")?,
+                    hash: &hash,
+                    identity: identity.as_deref(),
+                    authorized_import: batch.is_some(),
+                },
+            )?;
+            completed.push((path.clone(), hash));
+        }
+    }
+    if work.pending {
+        ensure!(identity_ready, "缺少与照片身份一致的 XMP：{text}");
+        completed.push((work.path.clone(), work.hash.clone()));
+    }
+    let state = crate::jobs::FileState {
+        size: work.size,
+        mtime_ns: work.mtime,
+        asset_id: asset,
+        version: work.hash,
+        error: None,
+        metadata_stamp: media::sidecar_paths_stamp(&sidecars)?,
+        metadata_operation_id: if work.metadata.is_none() {
+            work.previous
+                .and_then(|previous| previous.metadata_operation_id)
+        } else if job.refresh_metadata {
+            job.metadata_operation_id.clone()
+        } else {
+            None
+        },
+    };
+    Ok(IndexedFile {
+        path: work.path,
+        state,
+        completed,
+        identity_ready,
+    })
+}
+
+fn process_files(
+    store: &Store,
+    jobs: &Jobs,
+    job: &Job,
+    paths: &[PathBuf],
+) -> Result<(bool, std::collections::BTreeSet<String>)> {
+    use rusqlite::params;
+
+    let mut work = Vec::with_capacity(paths.len());
+    for path in paths {
+        match prepare_file(store, jobs, job, path) {
+            Ok(prepared) => work.push(prepared),
+            Err(error) => {
+                let text = path.to_str().context("original path must be UTF-8")?;
+                if let Some(mut previous) = jobs.file_state(&job.folder_id, text)? {
+                    previous.error = Some(format!("{error:#}"));
+                    previous.metadata_operation_id = None;
+                    jobs.record_metadata_result(&job.folder_id, text, &previous)?;
+                }
+                return Err(error).with_context(|| format!("inspect {}", path.display()));
+            }
+        }
+    }
+    let changed = work.iter().any(|work| work.metadata.is_some());
+    let indexed = {
+        let _source = store
+            .source_mutation
+            .write()
+            .map_err(|_| anyhow::anyhow!("source mutation lock poisoned"))?;
+        let mut db = store.lock()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let indexed = work
+            .into_iter()
+            .map(|work| publish_file(&tx, jobs, job, work))
+            .collect::<Result<Vec<_>>>()?;
+        if jobs.manages_catalog() {
+            for item in &indexed {
+                Jobs::record_catalog_check(
+                    &tx,
+                    &job.library_id,
+                    item.path.to_str().context("indexed path must be UTF-8")?,
+                    &item.state,
+                    item.identity_ready,
+                )?;
+            }
+        }
+        crate::revisions::flush_for_batch(&tx, Some(&job.id))?;
+        tx.commit()?;
+        indexed
+    };
+    let mut db = jobs.db.lock()?;
+    let tx = db.transaction()?;
+    let mut assets = std::collections::BTreeSet::new();
+    for indexed in indexed {
+        let path = indexed
+            .path
+            .to_str()
+            .context("original path must be UTF-8")?;
+        if !jobs.manages_catalog() {
+            Jobs::record_metadata_result_in(&tx, &job.folder_id, path, &indexed.state)?;
+            if indexed.identity_ready {
+                tx.execute("UPDATE files SET identity_status='ready',identity_error=NULL WHERE folder_id=? AND path=?",params![job.folder_id,path])?;
+            }
+        }
+        for (path, hash) in indexed.completed {
+            let path = path.to_str().context("publication path must be UTF-8")?;
+            Jobs::complete_file_publication_in(&tx, &job.library_id, path, &hash)?;
+        }
+        assets.insert(indexed.state.asset_id);
+    }
+    tx.commit()?;
+    Ok((changed, assets))
+}
+
+#[cfg(test)]
 fn process_file(
     store: &Store,
     jobs: &Jobs,
     _previews: &PreviewStorage,
     job: &Job,
     path: &Path,
-    stop: &AtomicBool,
+    _stop: &AtomicBool,
 ) -> Result<bool> {
-    jobs.validate_path(path.parent().context("original has no parent")?)?;
-    let text = path.to_str().context("original path must be UTF-8")?;
-    let Some((expected_hash, pending_publication)) =
-        managed_source_hash(store, jobs, &job.library_id, path)?
-    else {
-        return Ok(false);
-    };
-    let (size, mtime) = file_stamp(path)?;
-    let current_asset = store.existing_asset_for_path(&job.library_id, text)?;
-    let sidecar = crate::identity::sidecar_path(path);
-    let authorized =
-        managed_sidecars(store, jobs, &job.library_id, current_asset.as_deref(), path)?;
-    let mut sidecars = media::sidecar_paths_stamp(&authorized)?;
-    let previous = jobs.file_state(&job.folder_id, text)?;
-    let mut asset_id = previous
-        .as_ref()
-        .map(|p| p.asset_id.clone())
-        .unwrap_or_default();
-    let mut hash = previous
-        .as_ref()
-        .map(|p| p.version.clone())
-        .unwrap_or_default();
-    let force = job.work_class == "manual" && job.refresh_metadata;
-    if let Some(previous) = &previous
-        && (!force
-            || (job.metadata_operation_id.is_some()
-                && previous.metadata_operation_id == job.metadata_operation_id))
-        && previous.size == size
-        && previous.mtime_ns == mtime
-        && previous.metadata_stamp == sidecars
-        && previous.error.is_none()
-        && previous.version == expected_hash
-        && (!pending_publication
-            || crate::imports::file_digest(jobs, &job.library_id, path)? == expected_hash)
-        && !previous.asset_id.is_empty()
-        && store.original_is_online(&job.library_id, text, &previous.version)?
-        && let Some(current_asset_id) = &current_asset
-        && ((!authorized.contains(&sidecar) && !pending_publication)
-            || (authorized.contains(&sidecar)
-                && crate::identity::standard_sidecar_photo_id(path)?.as_deref()
-                    == Some(store.root_id(&job.library_id, current_asset_id)?.as_str())))
-    {
-        // Identity merges can replace the asset without changing the indexed file.
-        if previous.asset_id != *current_asset_id {
-            let mut checkpoint = previous.clone();
-            checkpoint.asset_id = current_asset_id.clone();
-            jobs.record_metadata_result(&job.folder_id, text, &checkpoint)?;
-        }
-        publish_import_sidecars(store, jobs, &job.library_id, current_asset_id, path)?;
-        if pending_publication {
-            jobs.complete_file_publication(&job.library_id, text, &expected_hash)?;
-        }
-        return Ok(false);
-    }
-    let mut identity_checked = false;
-    let result: Result<bool> = (|| {
-        let processor = MediaProcessor::new();
-        let started = std::time::Instant::now();
-        hash = crate::imports::file_digest(jobs, &job.library_id, path)?;
-        ensure!(
-            hash == expected_hash,
-            "原片内容在图库之外发生变更：{}",
-            path.display()
-        );
-        let digest_ms = started.elapsed().as_millis();
-        let extracted = std::time::Instant::now();
-        let metadata = processor.extract_with_sidecars(path, &authorized)?;
-        let metadata_ms = extracted.elapsed().as_millis();
-        if stopped(jobs, job, stop)? {
-            return Ok(false);
-        }
-        ensure!(
-            file_stamp(path)? == (size, mtime),
-            "original changed during metadata extraction"
-        );
-        let now = Utc::now().to_rfc3339();
-        let mut snapshot = json!({
-            "cameraMake": metadata.camera_make, "cameraModel": metadata.camera_model,
-            "lensModel": metadata.lens_model, "originalFilename": metadata.original_filename.as_deref().unwrap_or(path.file_name().context("original filename missing")?.to_str().context("original filename must be UTF-8")?),
-            "contentFingerprint": hash, "metadataFingerprint": metadata.fingerprint(path),
-            "rating": metadata.rating, "flagState":"unflagged", "tags":[], "createdAt":now, "updatedAt":now,
-        });
-        if let Some(capture_time) = &metadata.capture_time {
-            snapshot["captureTime"] = json!(capture_time);
-        }
-        if let Some(asset) = &current_asset {
-            snapshot["photoID"] = json!(store.root_id(&job.library_id, asset)?);
-        } else if let Some(id) = &metadata.photo_id {
-            snapshot["photoID"] = json!(id);
-        }
-        if let Some(id) = &metadata.camera_image_id {
-            snapshot["cameraImageID"] = json!(id);
-        }
-        if let Some(id) = &metadata.document_id {
-            snapshot["documentID"] = json!(id);
-        }
-        if let Some(id) = &metadata.original_document_id {
-            snapshot["originalDocumentID"] = json!(id);
-        }
-        let file = json!({"contentHash":hash,"sizeBytes":size,"role":if media::is_raw(path){"raw_original"}else{"jpeg_original"}});
-        let evidence = VersionEvidence {
-            visual_hash: None,
-            width: metadata.width,
-            height: metadata.height,
-            edited: metadata.edited && !media::is_raw(path),
-            camera_serial: metadata.camera_serial.clone(),
-            capture_original: metadata.capture_original.clone(),
-        };
-        ensure!(
-            file_stamp(path)? == (size, mtime),
-            "original changed during identity extraction"
-        );
-        ensure!(
-            media::sidecar_paths_stamp(&authorized)? == sidecars,
-            "sidecar changed during metadata extraction"
-        );
-        let ingested = std::time::Instant::now();
-        asset_id = store.ingest_original_with_revision(
-            &job.library_id,
-            text,
-            &file,
-            &snapshot,
-            &evidence,
-            Some(&job.id),
-        )?;
-        let ingest_ms = ingested.elapsed().as_millis();
-        let root = store.root_id(&job.library_id, &asset_id)?;
-        publish_import_sidecars(store, jobs, &job.library_id, &asset_id, path)?;
-        if authorized.contains(&sidecar)
-            && crate::identity::standard_sidecar_photo_id(path)?.as_deref() == Some(root.as_str())
-        {
-            tracing::info!(
-                path = text,
-                digest_ms,
-                metadata_ms,
-                ingest_ms,
-                total_ms = started.elapsed().as_millis(),
-                "indexed photo metadata"
-            );
-            identity_checked = true;
-            return Ok(true);
-        }
-        if !(pending_publication || job.refresh_metadata && authorized.contains(&sidecar)) {
-            return Ok(true);
-        }
-        if sidecar.try_exists()? && !authorized.contains(&sidecar) {
-            if pending_publication {
-                bail!("既有的 XMP 尚未登记，请先核对图库：{}", sidecar.display());
-            }
-            return Ok(true);
-        }
-        let updated = store.with_identity_update(&job.library_id, text, &hash, || {
-            crate::identity::ensure_metadata(path, &root, &metadata)?;
-            Ok(())
-        })?;
-        if !updated {
-            return Ok(false);
-        }
-        let generated_hash = crate::imports::file_digest(jobs, &job.library_id, &sidecar)?;
-        Jobs::permit_file(
-            &jobs.db.lock().unwrap(),
-            &job.library_id,
-            &sidecar,
-            &generated_hash,
-            None,
-        )?;
-        publish_import_sidecars(store, jobs, &job.library_id, &asset_id, path)?;
-        sidecars = media::sidecar_paths_stamp(&managed_sidecars(
-            store,
-            jobs,
-            &job.library_id,
-            Some(&asset_id),
-            path,
-        )?)?;
-        tracing::info!(
-            path = text,
-            digest_ms,
-            metadata_ms,
-            ingest_ms,
-            total_ms = started.elapsed().as_millis(),
-            "indexed photo metadata"
-        );
-        identity_checked = true;
-        Ok(true)
-    })();
-    if stopped(jobs, job, stop)? {
-        return Ok(false);
-    }
-    match &result {
-        Ok(true) => {
-            jobs.record_metadata_result(
-                &job.folder_id,
-                text,
-                &crate::jobs::FileState {
-                    size,
-                    mtime_ns: mtime,
-                    asset_id: asset_id.clone(),
-                    version: hash.clone(),
-                    error: None,
-                    metadata_stamp: sidecars.clone(),
-                    metadata_operation_id: if force {
-                        job.metadata_operation_id.clone()
-                    } else {
-                        None
-                    },
-                },
-            )?;
-            if identity_checked {
-                jobs.identity_result(&job.folder_id, text, None)?;
-                if pending_publication {
-                    jobs.complete_file_publication(&job.library_id, text, &hash)?;
-                }
-            }
-        }
-        Err(error) => {
-            jobs.record_metadata_result(
-                &job.folder_id,
-                text,
-                &crate::jobs::FileState {
-                    size,
-                    mtime_ns: mtime,
-                    asset_id: asset_id.clone(),
-                    version: hash.clone(),
-                    error: Some(format!("{error:#}")),
-                    metadata_stamp: sidecars.clone(),
-                    metadata_operation_id: None,
-                },
-            )?;
-        }
-        Ok(false) => {}
-    }
-    result
+    process_files(store, jobs, job, &[path.to_path_buf()]).map(|result| result.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    #[test]
+    fn group_failure_rolls_back_catalog_and_reuses_durable_xmp_on_retry() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let originals = fixture.path().join("originals");
+        fs::create_dir(&originals)?;
+        let store = Store::open(&fixture.path().join("catalog.sqlite"), true)?;
+        let jobs = Jobs::open(&fixture.path().join("jobs.sqlite"), &originals)?;
+        let folder = jobs.add_folder("photos", ".")?;
+        let first = jobs.root().join("new/pair.png");
+        let second = jobs.root().join("new/pair.jpg");
+        fs::create_dir(first.parent().unwrap())?;
+        let image = [
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 3,
+            8, 2, 0, 0, 0, 54, 136, 73, 214, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 192, 2,
+            0, 0, 21, 0, 1, 170, 101, 151, 196, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        let paths = [first.clone(), second.clone()];
+        let jpeg = include_bytes!("../../macos/scripts/runtime-sample/sample.jpg");
+        let identity = "a98d1952-980d-4867-a85d-1c9a8b3a6103";
+        let stem_xmp = first.with_extension("xmp");
+        fs::write(
+            &stem_xmp,
+            format!(
+                r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xmp="http://ns.adobe.com/xap/1.0/"><rdf:Description xmp:Identifier="https://keeps.photos/photo/{identity}"/></rdf:RDF>"#
+            ),
+        )?;
+        fs::write(&first, image)?;
+        fs::write(&second, jpeg)?;
+        for path in [&first, &second, &stem_xmp] {
+            let hash = media::sha256_file(path)?;
+            Jobs::permit_file(
+                &jobs.db.lock().unwrap(),
+                "photos",
+                path,
+                &hash,
+                Some("batch"),
+            )?;
+        }
+        let job = jobs.enqueue_manual_file(&folder.id, &first)?;
+        store.lock()?.execute_batch("CREATE TRIGGER abort_second BEFORE INSERT ON catalog_physical_files
+            WHEN substr(NEW.path,-9)='/pair.jpg' BEGIN SELECT RAISE(ABORT,'fixture second version rejected'); END")?;
+        let before = store.library_revision("photos")?;
+        let failed = process_files(&store, &jobs, &job, &paths).unwrap_err();
+        assert!(
+            format!("{failed:#}").contains("fixture second version rejected"),
+            "{failed:#}"
+        );
+        assert_eq!(store.library_revision("photos")?, before);
+        assert_eq!(store.counts("photos", false)?["all"], 0);
+        assert!(!crate::navigation::registered(
+            &store.read()?,
+            "photos",
+            first.parent().unwrap()
+        )?);
+        let first_xmp = crate::identity::sidecar_path(&first);
+        let packet = fs::read(&first_xmp)?;
+        let root = crate::identity::file_sidecar_photo_id(&first_xmp)?
+            .context("generated XMP identity")?;
+        assert!(jobs.file_publication("photos", &first_xmp)?.is_some());
+        store.lock()?.execute_batch("DROP TRIGGER abort_second")?;
+        let (_, assets) = process_files(&store, &jobs, &job, &paths)?;
+        assert_eq!(assets.len(), 1);
+        let asset = assets.first().unwrap();
+        assert_eq!(store.root_id("photos", asset)?, root);
+        assert_eq!(fs::read(&first_xmp)?, packet);
+        for (path, expected) in paths.iter().zip([image.as_slice(), jpeg.as_slice()]) {
+            assert_eq!(fs::read(path)?, expected);
+            let xmp = crate::identity::sidecar_path(path);
+            assert_eq!(
+                crate::identity::file_sidecar_photo_id(&xmp)?.as_deref(),
+                Some(root.as_str())
+            );
+            assert!(jobs.file_publication("photos", path)?.is_none());
+            assert!(jobs.file_publication("photos", &xmp)?.is_none());
+        }
+        assert_eq!(
+            store.asset("photos", asset)?["paths"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        Ok(())
+    }
 
     #[test]
     fn ordinary_file_reuses_index_but_metadata_override_reextracts() -> Result<()> {
@@ -910,7 +961,7 @@ mod tests {
         let hash = media::sha256_file(&path)?;
         Jobs::permit_file(&jobs.db.lock().unwrap(), "library", &path, &hash, None)?;
         let folder = jobs.add_folder("library", ".")?;
-        let initial = jobs.enqueue_manual_metadata_refresh(&folder.id, jobs.root())?;
+        let initial = jobs.enqueue_import_repair(&folder.id, &path)?;
         let job = jobs.claim_next()?.unwrap();
         let stop = AtomicBool::new(false);
         assert!(process_file(&store, &jobs, &previews, &job, &path, &stop)?);
@@ -928,7 +979,7 @@ mod tests {
         assert!(!process_file(
             &store, &jobs, &previews, &resumed, &path, &stop
         )?);
-        let next = jobs.enqueue_manual_metadata_refresh(&folder.id, jobs.root())?;
+        let next = jobs.enqueue_import_repair(&folder.id, &path)?;
         assert_ne!(next.metadata_operation_id, resumed.metadata_operation_id);
         assert!(process_file(&store, &jobs, &previews, &next, &path, &stop)?);
         assert!(!process_file(
@@ -1022,382 +1073,6 @@ mod tests {
     }
 
     #[test]
-    fn bad_file_fails_parent_without_automatic_child_retry() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir(&originals)?;
-        let bad = originals.join("bad.jpg");
-        fs::write(&bad, b"")?;
-        fs::File::open(&bad)?
-            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let jobs_path = directory.path().join("jobs.sqlite");
-        let jobs = Jobs::open(&jobs_path, &originals)?;
-        let previews = PreviewStorage::new(
-            &directory.path().join("keeps"),
-            Some(&originals),
-            "http://localhost:2283",
-            "test-key",
-        )?;
-        let folder = jobs.add_folder("library", ".")?;
-        let bad = bad.canonicalize()?;
-        Jobs::permit_file(
-            &jobs.db.lock().unwrap(),
-            "library",
-            &bad,
-            &media::sha256_file(&bad)?,
-            None,
-        )?;
-        let parent = jobs.enqueue_external_scan(&folder.id)?;
-        let job = jobs.claim_next()?.unwrap();
-        let error = run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false)).unwrap_err();
-        jobs.finish(&job.id, Some(&format!("{error:#}")))?;
-        let parent = jobs.job(&parent.id)?.unwrap();
-        assert_eq!(parent.status, "failed");
-        assert!(parent.error.as_deref().unwrap().contains("bad.jpg"));
-        assert!(jobs.claim_next()?.is_none());
-        assert_eq!(jobs.jobs(100)?.len(), 1);
-        assert!(
-            jobs.file_state(&folder.id, bad.canonicalize()?.to_str().unwrap())?
-                .unwrap()
-                .error
-                .is_some()
-        );
-        jobs.retry(&parent.id)?;
-        let retry = jobs.claim_next()?.unwrap();
-        assert_eq!(retry.id, parent.id);
-        let error = run_one(&store, &jobs, &previews, &retry, &AtomicBool::new(false)).unwrap_err();
-        jobs.finish(&retry.id, Some(&format!("{error:#}")))?;
-        assert_eq!(jobs.job(&parent.id)?.unwrap().status, "failed");
-        assert!(jobs.claim_next()?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn historical_error_fails_explicit_scan_without_background_compensation() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir(&originals)?;
-        let bad = originals.join("interrupted.jpg");
-        fs::write(&bad, b"")?;
-        let bad = bad.canonicalize()?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let jobs = Jobs::open(&directory.path().join("jobs.sqlite"), &originals)?;
-        let previews = PreviewStorage::new(
-            &directory.path().join("keeps"),
-            Some(&originals),
-            "http://localhost:2283",
-            "test-key",
-        )?;
-        let folder = jobs.add_folder("library", ".")?;
-        let bad = bad.canonicalize()?;
-        Jobs::permit_file(
-            &jobs.db.lock().unwrap(),
-            "library",
-            &bad,
-            &media::sha256_file(&bad)?,
-            None,
-        )?;
-        let (size, mtime) = file_stamp(&bad)?;
-        jobs.record_file(
-            &folder.id,
-            bad.to_str().unwrap(),
-            size,
-            mtime,
-            "",
-            "",
-            Some("external tool interrupted by SIGTERM"),
-        )?;
-        jobs.record_metadata_stamp(
-            &folder.id,
-            bad.to_str().unwrap(),
-            &media::sidecar_stamp(&bad)?,
-        )?;
-        jobs.enqueue_external_scan(&folder.id)?;
-        let parent = jobs.claim_next()?.unwrap();
-        let error =
-            run_one(&store, &jobs, &previews, &parent, &AtomicBool::new(false)).unwrap_err();
-        jobs.finish(&parent.id, Some(&format!("{error:#}")))?;
-        assert_eq!(jobs.job(&parent.id)?.unwrap().status, "failed");
-        assert!(jobs.claim_next()?.is_none());
-        assert_eq!(jobs.jobs(100)?.len(), 1);
-        assert!(
-            jobs.file_state(&folder.id, bad.to_str().unwrap())?
-                .unwrap()
-                .error
-                .is_some()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cancelled_media_failure_does_not_persist_file_error() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir(&originals)?;
-        let bad = originals.join("bad.jpg");
-        fs::write(&bad, b"")?;
-        fs::File::open(&bad)?
-            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let jobs = Jobs::open(&directory.path().join("jobs.sqlite"), &originals)?;
-        let previews = PreviewStorage::new(
-            &directory.path().join("keeps"),
-            Some(&originals),
-            "http://localhost:2283",
-            "test-key",
-        )?;
-        let folder = jobs.add_folder("library", ".")?;
-        let bad = bad.canonicalize()?;
-        Jobs::permit_file(
-            &jobs.db.lock().unwrap(),
-            "library",
-            &bad,
-            &media::sha256_file(&bad)?,
-            None,
-        )?;
-        jobs.enqueue_external_scan(&folder.id)?;
-        let job = jobs.claim_next()?.unwrap();
-        assert!(!process_file(
-            &store,
-            &jobs,
-            &previews,
-            &job,
-            &bad.canonicalize()?,
-            &AtomicBool::new(true)
-        )?);
-        assert!(
-            jobs.file_state(&folder.id, bad.canonicalize()?.to_str().unwrap())?
-                .is_none()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn traversal_excludes_hidden_recycle_and_symlinks_without_touching_files() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir(&originals)?;
-        for name in [".hidden", "@eaDir", "#recycle"] {
-            fs::create_dir(originals.join(name))?;
-            fs::write(
-                originals.join(name).join("not-a-real-photo.jpg"),
-                b"original",
-            )?;
-        }
-        fs::write(originals.join("unmanaged.jpg"), b"manually copied original")?;
-        let outside = directory.path().join("outside.jpg");
-        fs::write(&outside, b"outside")?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, originals.join("linked.jpg"))?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let jobs = Jobs::open(&directory.path().join("jobs.sqlite"), &originals)?;
-        let previews = PreviewStorage::new(
-            &directory.path().join("keeps"),
-            Some(&originals),
-            "http://localhost:2283",
-            "test-key",
-        )?;
-        let folder = jobs.add_folder("library", ".")?;
-        jobs.enqueue_external_scan(&folder.id)?;
-        let job = jobs.claim_next()?.unwrap();
-        run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false))?;
-        assert_eq!(store.counts("library", false)?["all"], 0);
-        assert!(
-            jobs.file_state(
-                &folder.id,
-                jobs.root().join("unmanaged.jpg").to_str().unwrap()
-            )?
-            .is_none()
-        );
-        assert!(!crate::identity::sidecar_path(&jobs.root().join("unmanaged.jpg")).exists());
-        assert_eq!(fs::read(outside)?, b"outside");
-        for name in [".hidden", "@eaDir", "#recycle"] {
-            assert_eq!(
-                fs::read(originals.join(name).join("not-a-real-photo.jpg"))?,
-                b"original"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn restart_keeps_indexed_file_state_and_resumes_scan() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir(&originals)?;
-        let original = originals.join("photo.jpg");
-        fs::write(&original, b"original fixture deliberately not decodable")?;
-        // The worker starts from Jobs' canonical root; seed exactly that path,
-        // including macOS's /var -> /private/var resolution.
-        let original = original.canonicalize()?;
-        let path = original.to_str().unwrap();
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let jobs_path = directory.path().join("jobs.sqlite");
-        let jobs = Jobs::open(&jobs_path, &originals)?;
-        let previews = PreviewStorage::new(
-            &directory.path().join("keeps"),
-            Some(&originals),
-            "http://localhost:2283",
-            "test-key",
-        )?;
-        let folder = jobs.add_folder("library", ".")?;
-        let (size, mtime) = file_stamp(&original)?;
-        let hash = media::sha256_file(&original)?;
-        let file = json!({"contentHash":hash,"sizeBytes":size,"role":"jpeg_original"});
-        let snapshot = json!({"cameraMake":"Test","cameraModel":"Test","lensModel":"Test","originalFilename":"photo.jpg","contentFingerprint":hash,"metadataFingerprint":"fixture","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"});
-        let id = store.ingest_original("library", path, &file, &snapshot)?;
-        let fake_preview = directory.path().join("preview.heic");
-        fs::write(&fake_preview, b"preview fixture")?;
-        let object = previews.put_generated("library", &id, "preview-hash", &fake_preview)?;
-        store.declare_generated_preview("library", &id, &json!({"assetID":id,"role":"preview","fileObject":{"contentHash":"preview-hash","sizeBytes":15,"role":"preview"},"objectRef":object,"pixelSize":{"width":100,"height":100}}))?;
-        jobs.record_file(&folder.id, path, size, mtime, &id, &hash, None)?;
-        store.reconcile_cache()?;
-        store.lock()?.execute(
-            "UPDATE media_cache SET status='ready',thumbnail='{}',standard='{}'",
-            [],
-        )?;
-        jobs.enqueue_external_scan(&folder.id)?;
-        let claimed = jobs.claim_next()?.unwrap();
-        drop(jobs);
-        let jobs = Jobs::open(&jobs_path, &originals)?;
-        assert_eq!(jobs.claim_next()?.unwrap().id, claimed.id);
-        assert_eq!(jobs.job(&claimed.id)?.unwrap().status, "running");
-        assert_eq!(jobs.file_state(&folder.id, path)?.unwrap().version, hash);
-        assert_eq!(media::sha256_file(&original)?, hash);
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires the Linux media runtime (ExifTool and ImageMagick)"]
-    fn manual_recursive_refresh_reloads_unchanged_metadata_in_nested_directory() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir_all(originals.join("selected/nested"))?;
-        let jobs = Jobs::open(&directory.path().join("jobs.sqlite"), &originals)?;
-        let path = jobs.root().join("selected/nested/photo.jpg");
-        media::run(
-            std::process::Command::new("convert")
-                .args(["-size", "8x8", "xc:red"])
-                .arg(&path),
-        )?;
-        media::run(
-            std::process::Command::new("exiftool")
-                .args([
-                    "-overwrite_original",
-                    "-Make=ActualCamera",
-                    "-Model=ActualModel",
-                    "-XMP-xmpMM:OriginalDocumentID=xmp.did:metadata-refresh-fixture",
-                ])
-                .arg(&path),
-        )?;
-        fs::File::open(&path)?.set_modified(
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
-        )?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let previews = PreviewStorage::new(
-            &directory.path().join("keeps"),
-            Some(&originals),
-            "http://localhost",
-            "test-key",
-        )?;
-        let folder = jobs.add_folder("library", ".")?;
-        let (size, mtime) = file_stamp(&path)?;
-        let hash = media::sha256_file(&path)?;
-        let file = json!({"contentHash":hash,"sizeBytes":size,"role":"jpeg_original"});
-        let snapshot = json!({"cameraMake":"StaleCamera","cameraModel":"StaleModel","originalFilename":"photo.jpg","contentFingerprint":hash,"metadataFingerprint":"stale","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"});
-        let id = store.ingest_original("library", path.to_str().unwrap(), &file, &snapshot)?;
-        jobs.record_file(
-            &folder.id,
-            path.to_str().unwrap(),
-            size,
-            mtime,
-            &id,
-            &hash,
-            None,
-        )?;
-        jobs.record_metadata_stamp(
-            &folder.id,
-            path.to_str().unwrap(),
-            &media::sidecar_stamp(&path)?,
-        )?;
-        jobs.enqueue_manual_metadata_refresh(&folder.id, &jobs.root().join("selected"))?;
-        let job = jobs.claim_class("manual")?.unwrap();
-        run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false))?;
-        assert!(store.browse_descriptor("library", &id)?.is_some());
-        let refreshed = store.asset("library", &id)?;
-        assert_eq!(refreshed["cameraMake"], "ActualCamera");
-        assert_eq!(refreshed["cameraModel"], "ActualModel");
-        let progress = jobs.job(&job.id)?.unwrap();
-        assert_eq!(
-            (progress.processed, progress.skipped, progress.failed),
-            (1, 0, 0)
-        );
-        assert_eq!(media::sha256_file(&path)?, hash);
-        assert_eq!(file_stamp(&path)?, (size, mtime));
-        Ok(())
-    }
-
-    #[test]
-    fn restart_resumes_checkpoint_without_reprocessing_completed_files() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir(&originals)?;
-        fs::write(
-            originals.join("already.jpg"),
-            b"invalid media must never be parsed",
-        )?;
-        fs::write(originals.join("z.txt"), b"ignored")?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let jobs_path = directory.path().join("jobs.sqlite");
-        let jobs = Jobs::open(&jobs_path, &originals)?;
-        let previews = PreviewStorage::new(
-            &directory.path().join("keeps"),
-            Some(&originals),
-            "http://localhost:2283",
-            "test-key",
-        )?;
-        let folder = jobs.add_folder("library", ".")?;
-        jobs.enqueue_external_scan(&folder.id)?;
-        let job = jobs.claim_next()?.unwrap();
-        jobs.update_progress(&job.id, 7, 11, 0, None)?;
-        save_cursor(
-            &jobs,
-            &job,
-            &ScanCursor {
-                pending: vec![jobs.root().join("removed-directory")],
-                current: Some(jobs.root().to_path_buf()),
-                last_name: Some("already.jpg".into()),
-            },
-            &Progress {
-                processed: 7,
-                skipped: 11,
-                ..Progress::default()
-            },
-        )?;
-        drop(jobs);
-        let jobs = Jobs::open(&jobs_path, &originals)?;
-        let resumed = jobs.claim_next()?.unwrap();
-        assert_eq!(resumed.id, job.id);
-        assert_eq!((resumed.processed, resumed.skipped), (7, 11));
-        let cursor: ScanCursor = serde_json::from_str(&jobs.load_checkpoint(&job.id)?.unwrap())?;
-        assert_eq!(cursor.last_name.as_deref(), Some("already.jpg"));
-        assert!(run_one(
-            &store,
-            &jobs,
-            &previews,
-            &resumed,
-            &AtomicBool::new(false)
-        )?);
-        jobs.finish(&job.id, None)?;
-        let completed = jobs.job(&job.id)?.unwrap();
-        assert_eq!(completed.status, "completed");
-        assert_eq!(completed.processed, 7);
-        assert_eq!(completed.failed, 0);
-        Ok(())
-    }
-
-    #[test]
     fn missing_file_task_does_not_scan_siblings_or_descendants() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
@@ -1413,210 +1088,23 @@ mod tests {
             "test-key",
         )?;
         let folder = jobs.add_folder("library", ".")?;
-        jobs.enqueue_file_change(&folder.id, &jobs.root().join("missing.jpg"), 0)?;
+        let missing = jobs.root().join("missing.jpg");
+        Jobs::permit_file(
+            &*jobs.db.lock()?,
+            "library",
+            &missing,
+            &"a".repeat(64),
+            None,
+        )?;
+        jobs.enqueue_manual_file(&folder.id, &missing)?;
         let job = jobs.claim_next()?.unwrap();
-        assert!(run_one(
-            &store,
-            &jobs,
-            &previews,
-            &job,
-            &AtomicBool::new(false)
-        )?);
+        let error = run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false)).unwrap_err();
+        assert!(format!("{error:#}").contains("missing.jpg"));
         let finished = jobs.job(&job.id)?.unwrap();
         assert_eq!(
             (finished.processed, finished.skipped, finished.failed),
-            (0, 0, 0)
+            (0, 0, 1)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn startup_preserves_resumed_owner_until_task_completes() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir(&originals)?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let jobs_path = directory.path().join("jobs.sqlite");
-        let jobs = Jobs::open(&jobs_path, &originals)?;
-        let folder = jobs.add_folder("library", ".")?;
-        let queued = jobs.enqueue_external_scan(&folder.id)?;
-        store.note_revision_activity("library", &queued.id, &folder.path)?;
-        jobs.claim_next()?.unwrap();
-        jobs.yield_job(&queued.id)?;
-        rusqlite::Connection::open(directory.path().join("catalog.sqlite"))?
-            .execute("UPDATE catalog_revision_updates SET last_changed_at=0", [])?;
-        maintain_revisions(&store, &jobs)?;
-        assert!(store.revision_batch_ids()?.contains(&queued.id));
-        jobs.claim_next()?.unwrap();
-        drop(jobs);
-        let jobs = Jobs::open(&jobs_path, &originals)?;
-        maintain_revisions(&store, &jobs)?;
-        assert_eq!(jobs.job(&queued.id)?.unwrap().status, "pending");
-        assert!(store.revision_batch_ids()?.contains(&queued.id));
-        assert_eq!(
-            store.catalog_revision("library", None, false)?["isUpdating"],
-            true
-        );
-        let resumed = jobs.claim_next()?.unwrap();
-        assert_eq!(resumed.id, queued.id);
-        jobs.finish(&resumed.id, None)?;
-        maintain_revisions(&store, &jobs)?;
-        assert!(!store.revision_batch_ids()?.contains(&queued.id));
-        assert!(jobs.claim_next()?.is_none());
-        assert_eq!(
-            store.catalog_revision("library", None, false)?["isUpdating"],
-            false
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn known_completion_preserves_other_queued_owner_at_shared_root() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let originals = directory.path().join("originals");
-        fs::create_dir_all(originals.join("child"))?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
-        let jobs = Jobs::open(&directory.path().join("jobs.sqlite"), &originals)?;
-        let folder = jobs.add_folder("library", ".")?;
-        let manual = jobs.enqueue_scan(&folder.id)?;
-        jobs.claim_next()?.unwrap();
-        let child = jobs.root().join("child");
-        let pending = jobs.enqueue_change(&folder.id, &child, 0)?;
-        store.note_revision_activity("library", &manual.id, &folder.path)?;
-        store.note_revision_activity("library", &pending.id, child.to_str().unwrap())?;
-        jobs.finish(&manual.id, None)?;
-        maintain_revisions(&store, &jobs)?;
-        assert!(!store.revision_batch_ids()?.contains(&manual.id));
-        assert!(store.revision_batch_ids()?.contains(&pending.id));
-        assert_eq!(
-            store.catalog_revision("library", None, false)?["isUpdating"],
-            true
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn failed_and_cancelled_jobs_settle_immediately_without_retry() -> Result<()> {
-        for cancel in [false, true] {
-            let directory = tempfile::tempdir()?;
-            let originals = directory.path().join("originals");
-            fs::create_dir(&originals)?;
-            let catalog_path = directory.path().join("catalog.sqlite");
-            let store = Store::open(&catalog_path, true)?;
-            let jobs_path = directory.path().join("jobs.sqlite");
-            let jobs = Jobs::open(&jobs_path, &originals)?;
-            let folder = jobs.add_folder("library", ".")?;
-            let queued = jobs.enqueue_external_scan(&folder.id)?;
-            store.note_revision_activity("library", &queued.id, &folder.path)?;
-            rusqlite::Connection::open(&catalog_path)?
-                .execute("UPDATE catalog_revision_updates SET last_changed_at=0", [])?;
-            assert_eq!(jobs.claim_next()?.unwrap().id, queued.id);
-            if cancel {
-                jobs.remove_folder(&folder.id)?;
-            } else {
-                jobs.finish(&queued.id, Some("fixture scan failed"))?;
-            }
-            maintain_revisions(&store, &jobs)?;
-            assert!(jobs.claim_next()?.is_none());
-            assert_eq!(
-                jobs.job(&queued.id)?.unwrap().status,
-                if cancel { "cancelled" } else { "failed" }
-            );
-            assert!(!store.revision_batch_ids()?.contains(&queued.id));
-            assert_eq!(
-                store.catalog_revision("library", None, false)?["isUpdating"],
-                false
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn terminal_file_job_publishes_only_its_directory_branch() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let originals = fixture.path().join("originals");
-        fs::create_dir_all(originals.join("unrelated/child/deep"))?;
-        let jobs = Jobs::open(&fixture.path().join("jobs.sqlite"), &originals)?;
-        let store = Store::open(&fixture.path().join("catalog.sqlite"), true)?;
-        let previews = PreviewStorage::new(
-            &fixture.path().join("keeps"),
-            Some(&originals),
-            "http://localhost:2283",
-            "test-key",
-        )?;
-        let folder = jobs.add_folder("library", ".")?;
-        crate::sync_navigation::refresh(&store, &jobs, "library")?;
-        let unrelated_path = jobs.root().join("unrelated/child/deep");
-        let unrelated = crate::sync_navigation::pages(&store.read()?, "library")?
-            [unrelated_path.to_str().unwrap()]
-        .clone();
-        fs::create_dir(unrelated_path.join("new"))?;
-        let file = jobs.root().join("2024/trip/gone.ARW");
-        fs::create_dir_all(file.parent().unwrap())?;
-        let queued = jobs.enqueue_manual_file(&folder.id, &file)?;
-        store.note_revision_activity("library", &queued.id, file.to_str().unwrap())?;
-        let job = jobs.claim_next()?.unwrap();
-        run_claimed(&store, &jobs, &previews, &job, &AtomicBool::new(false))?;
-        assert_eq!(jobs.job(&job.id)?.unwrap().status, "completed");
-        assert!(
-            crate::sync_navigation::pages(&store.read()?, "library")?
-                .contains_key(file.parent().unwrap().to_str().unwrap())
-        );
-        assert_eq!(
-            crate::sync_navigation::pages(&store.read()?, "library")?
-                [unrelated_path.to_str().unwrap()],
-            unrelated
-        );
-        assert!(!store.revision_batch_ids()?.contains(&job.id));
-        Ok(())
-    }
-
-    #[test]
-    fn terminal_scan_publishes_new_directories_after_failure_cancel_or_shutdown() -> Result<()> {
-        for outcome in ["failed", "cancelled", "shutdown"] {
-            let fixture = tempfile::tempdir()?;
-            let originals = fixture.path().join("originals");
-            fs::create_dir(&originals)?;
-            let jobs = Jobs::open(&fixture.path().join("jobs.sqlite"), &originals)?;
-            let store = Store::open(&fixture.path().join("catalog.sqlite"), true)?;
-            let previews = PreviewStorage::new(
-                &fixture.path().join("keeps"),
-                Some(&originals),
-                "http://localhost:2283",
-                "test-key",
-            )?;
-            let folder = jobs.add_folder("library", ".")?;
-            crate::sync_navigation::refresh(&store, &jobs, "library")?;
-            let child = jobs.root().join("discovered");
-            fs::create_dir(&child)?;
-            jobs.enqueue_scan(&folder.id)?;
-            let job = jobs.claim_next()?.unwrap();
-            if outcome == "cancelled" {
-                jobs.db
-                    .lock()
-                    .unwrap()
-                    .execute("UPDATE jobs SET status='cancelled' WHERE id=?", [&job.id])?;
-            } else if outcome == "failed" {
-                jobs.db.lock().unwrap().execute(
-                    "UPDATE jobs SET scope_path=?1 WHERE id=?2",
-                    rusqlite::params![fixture.path().join("outside").to_str(), job.id],
-                )?;
-            }
-            run_claimed(
-                &store,
-                &jobs,
-                &previews,
-                &job,
-                &AtomicBool::new(outcome == "shutdown"),
-            )?;
-            assert!(
-                crate::sync_navigation::pages(&store.read()?, "library")?
-                    .contains_key(child.to_str().unwrap())
-            );
-            if outcome != "shutdown" {
-                assert_eq!(jobs.job(&job.id)?.unwrap().status, outcome);
-            }
-        }
         Ok(())
     }
 
@@ -1635,7 +1123,7 @@ mod tests {
             "test-key",
         )?;
         let folder = jobs.add_folder("library", ".")?;
-        jobs.enqueue_external_scan(&folder.id)?;
+        jobs.enqueue_manual_file(&folder.id, &jobs.root().join("unprocessed.jpg"))?;
         let job = jobs.claim_next()?.unwrap();
         jobs.remove_folder(&folder.id)?;
         assert!(!run_one(

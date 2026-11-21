@@ -51,38 +51,6 @@ import KeepsAPI
 
     }
 
-    @Test func metadataRefreshTargetsRightClickedDirectoryWithoutChangingSelection() async throws {
-        _ = NSApplication.shared
-        let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://tree.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
-        store.refreshNavigation()
-        try await waitUntil { !store.isLoadingNavigation }
-        store.query.directory = "root"
-        let outline = DirectoryOutlineView.DirectoryOutline()
-        let column = NSTableColumn(identifier: .init("directory"))
-        outline.addTableColumn(column)
-        outline.outlineTableColumn = column
-        let coordinator = DirectoryOutlineView.Coordinator(library: store)
-        coordinator.outline = outline
-        outline.dataSource = coordinator
-        outline.delegate = coordinator
-        coordinator.update()
-        var openedTracking = false
-        coordinator.openTaskWindow = { openedTracking = true }
-        let clicked = try #require(outline.item(atRow: 1))
-        let menu = try #require(coordinator.contextMenu(for: clicked))
-        let entry = try #require(menu.items.first { $0.title == "刷新" })
-        #expect(menu.items.filter { $0.title.contains("刷新") }.count == 1)
-        #expect(!openedTracking)
-        let initialChildReads = LibraryStubProtocol.treeRequests.count(for: "other")
-        #expect(NSApp.sendAction(try #require(entry.action), to: entry.target, from: entry))
-        try await waitUntil { openedTracking && !store.isLoadingNavigation && !store.loadingDirectories.contains("other") }
-        #expect(LibraryStubProtocol.treeRequests.count(for: "other") > initialChildReads)
-        #expect(store.query.directory == "root")
-        #expect(outline.selectedRow == -1)
-        #expect(store.submittingMetadataRefreshPaths.isEmpty)
-        #expect(!store.isDirectoryOperationBlocking)
-    }
-
     @Test func startupPublishesLibraryOnlyAfterSuccessfulLoad() async {
         let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://nas.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
         #expect(!store.isStartupReady)
@@ -792,28 +760,6 @@ private final class LibraryStubProtocol: URLProtocol, @unchecked Sendable {
         let path = request.url!.path
         let body: String
         let status = request.url?.host == "unauthorized.invalid" || (request.url?.host == "sources-unavailable.invalid" && path.hasSuffix("/navigation")) ? 401 : 200
-        if path.hasSuffix("/directories/refresh"), request.httpMethod == "POST" {
-            var data = request.httpBody ?? Data()
-            if let stream = request.httpBodyStream {
-                stream.open()
-                defer { stream.close() }
-                var buffer = [UInt8](repeating: 0, count: 4096)
-                while stream.hasBytesAvailable {
-                    let count = stream.read(&buffer, maxLength: buffer.count)
-                    if count <= 0 { break }
-                    data.append(buffer, count: count)
-                }
-            }
-            struct RefreshRequest: Decodable {
-                let path: String
-                let override: Bool
-            }
-            let submitted = try! JSONDecoder().decode(RefreshRequest.self, from: data)
-            #expect(submitted.path == "other")
-            #expect(submitted.override == false)
-            deliver(body: "{\"id\":\"refresh-1\",\"folderID\":\"folder-1\",\"libraryID\":\"test\",\"path\":\"other\",\"status\":\"pending\"}", status: 202)
-            return
-        }
         if status == 401 { body = "access denied" }
         else if request.url?.host == "invalid-api.invalid" && path.hasSuffix("/assets") { body = "{}" }
         else if request.httpMethod == "PATCH" { body = second }

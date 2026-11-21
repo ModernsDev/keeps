@@ -112,6 +112,60 @@ pub(crate) fn migrate(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn enforce_directory_references(db: &Connection) -> Result<()> {
+    db.execute_batch(r#"
+        DROP TRIGGER IF EXISTS catalog_physical_files_directory_insert;
+        DROP TRIGGER IF EXISTS catalog_physical_files_directory_update;
+        DROP TRIGGER IF EXISTS catalog_physical_files_directory_delete;
+        DROP TRIGGER IF EXISTS catalog_physical_files_record_parents;
+        CREATE TABLE catalog_asset_directories_new(
+            library_id TEXT NOT NULL, asset_id TEXT NOT NULL, directory TEXT NOT NULL,
+            PRIMARY KEY(library_id,asset_id), UNIQUE(library_id,asset_id,directory),
+            FOREIGN KEY(library_id,asset_id) REFERENCES catalog_assets(library_id,id) ON DELETE CASCADE,
+            FOREIGN KEY(library_id,directory) REFERENCES directories(library_id,path)
+                DEFERRABLE INITIALLY DEFERRED
+        );
+        INSERT INTO catalog_asset_directories_new
+        SELECT d.library_id,d.asset_id,d.directory FROM catalog_asset_directories d
+        WHERE EXISTS(SELECT 1 FROM catalog_physical_files p WHERE p.library_id=d.library_id AND p.asset_id=d.asset_id);
+        DROP TABLE catalog_asset_directories;
+        ALTER TABLE catalog_asset_directories_new RENAME TO catalog_asset_directories;
+        CREATE INDEX catalog_asset_directories_directory ON catalog_asset_directories(library_id,directory,asset_id);
+        CREATE TRIGGER catalog_physical_files_record_parents BEFORE INSERT ON catalog_physical_files
+        WHEN NOT EXISTS(SELECT 1 FROM directories WHERE library_id=NEW.library_id AND path=NEW.directory)
+        BEGIN
+            INSERT OR IGNORE INTO directories(library_id,path,parent_path)
+            WITH RECURSIVE split(path,name) AS (
+                SELECT NEW.directory,json_extract(replace(json_array(NEW.directory), '/', '","'), '$[#-1]')
+                UNION ALL
+                SELECT CASE WHEN length(path)=length(name)+1 THEN '/' ELSE substr(path,1,length(path)-length(name)-1) END,
+                       json_extract(replace(json_array(substr(path,1,length(path)-length(name)-1)), '/', '","'), '$[#-1]')
+                FROM split WHERE path<>'/'
+            )
+            SELECT NEW.library_id,path,
+                   CASE WHEN path='/' THEN NULL WHEN length(path)=length(name)+1 THEN '/'
+                        ELSE substr(path,1,length(path)-length(name)-1) END
+            FROM split;
+        END;
+        CREATE TRIGGER catalog_physical_files_directory_insert AFTER INSERT ON catalog_physical_files BEGIN
+            INSERT INTO catalog_asset_directories VALUES(NEW.library_id,NEW.asset_id,NEW.directory)
+                ON CONFLICT(library_id,asset_id) DO NOTHING;
+        END;
+        CREATE TRIGGER catalog_physical_files_directory_update AFTER UPDATE OF asset_id ON catalog_physical_files
+        WHEN NEW.asset_id<>OLD.asset_id BEGIN
+            INSERT INTO catalog_asset_directories VALUES(NEW.library_id,NEW.asset_id,NEW.directory)
+                ON CONFLICT(library_id,asset_id) DO NOTHING;
+            DELETE FROM catalog_asset_directories WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id
+              AND NOT EXISTS(SELECT 1 FROM catalog_physical_files WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id);
+        END;
+        CREATE TRIGGER catalog_physical_files_directory_delete AFTER DELETE ON catalog_physical_files BEGIN
+            DELETE FROM catalog_asset_directories WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id
+              AND NOT EXISTS(SELECT 1 FROM catalog_physical_files WHERE library_id=OLD.library_id AND asset_id=OLD.asset_id);
+        END;
+    "#)?;
+    Ok(())
+}
+
 pub(crate) fn publish(
     db: &Connection,
     lib: &str,
@@ -148,6 +202,39 @@ pub(crate) fn withdraw(db: &Connection, lib: &str, path: &str) -> Result<bool> {
         "DELETE FROM catalog_physical_files WHERE library_id=? AND path=?",
         params![lib, path],
     )? > 0)
+}
+
+pub(crate) fn shared_sidecar(
+    db: &Connection,
+    library: &str,
+    moving: &std::collections::BTreeSet<std::path::PathBuf>,
+    sidecars: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> Result<bool> {
+    use std::{collections::BTreeSet, path::PathBuf};
+
+    let parents: BTreeSet<_> = sidecars.iter().filter_map(|path| path.parent()).collect();
+    let mut siblings = db.prepare_cached(
+        "SELECT path FROM catalog_physical_files
+         WHERE library_id=?1 AND path>=?2 AND path<?3 AND directory=?4 AND role<>'sidecar'",
+    )?;
+    for parent in parents {
+        let text = parent.to_str().context("directory path must be UTF-8")?;
+        let stem = text.trim_end_matches('/');
+        let entries = siblings.query_map(
+            params![library, format!("{stem}/"), format!("{stem}0"), text],
+            |row| row.get::<_, String>(0),
+        )?;
+        for entry in entries {
+            let path = PathBuf::from(entry?);
+            if !moving.contains(&path)
+                && crate::media::sidecar_candidates(&path)
+                    .any(|candidate| sidecars.contains(&candidate))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn parent(path: &str) -> Result<&str> {

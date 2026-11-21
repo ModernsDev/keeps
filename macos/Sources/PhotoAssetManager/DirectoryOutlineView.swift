@@ -4,13 +4,7 @@ import KeepsAPI
 
 struct DirectoryOutlineView: NSViewRepresentable {
     @ObservedObject var library: LibraryStore
-    @Environment(\.openWindow) private var openWindow
-
-    func makeCoordinator() -> Coordinator {
-        let coordinator = Coordinator(library: library)
-        coordinator.openTaskWindow = { openWindow(id: "nas-tasks") }
-        return coordinator
-    }
+    func makeCoordinator() -> Coordinator { Coordinator(library: library) }
 
     func makeNSView(context: Context) -> NSScrollView {
         let outline = DirectoryOutline()
@@ -229,7 +223,6 @@ struct DirectoryOutlineView: NSViewRepresentable {
         static let directoryDragType = NSPasteboard.PasteboardType("com.keeps.directory")
         private var dragGeneration: Int?
         var library: LibraryStore
-        var openTaskWindow: (() -> Void)?
         weak var outline: NSOutlineView?
         private var nodes: [String: Node] = [:]
         private var statusNodes: [String: StatusNode] = [:]
@@ -421,14 +414,9 @@ struct DirectoryOutlineView: NSViewRepresentable {
                 entry.target = self
                 entry.representedObject = node
             }
-            for (title, action) in [("刷新", #selector(refreshMetadata(_:))), ("复制服务器路径", #selector(copyDirectoryPath(_:)))] {
-                let entry = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
-                entry.target = self
-                entry.representedObject = node
-                if action == #selector(refreshMetadata(_:)) {
-                    entry.isEnabled = library.client != nil && !library.submittingMetadataRefreshPaths.contains(node.path)
-                }
-            }
+            let copyPath = menu.addItem(withTitle: "复制服务器路径", action: #selector(copyDirectoryPath(_:)), keyEquivalent: "")
+            copyPath.target = self
+            copyPath.representedObject = node
             menu.addItem(.separator())
             let explicitlyHidden = library.hiddenDirectoryPaths.contains(node.path)
             let entry = menu.addItem(withTitle: explicitlyHidden ? "取消隐藏目录" : "设为隐藏目录", action: #selector(toggleHiddenDirectory(_:)), keyEquivalent: "")
@@ -480,14 +468,6 @@ struct DirectoryOutlineView: NSViewRepresentable {
             guard !library.isOperationBlocking, let node = sender.representedObject as? Node, let outline else { return }
             if outline.isItemExpanded(node) { outline.collapseItem(node) }
             else { outline.expandItem(node) }
-        }
-
-        @objc private func refreshMetadata(_ sender: NSMenuItem) {
-            guard !library.isDirectoryOperationBlocking, let node = sender.representedObject as? Node else { return }
-            let store = library
-            Task { @MainActor in
-                if await store.refreshDirectoryMetadata(path: node.path) { openTaskWindow?() }
-            }
         }
 
         @objc private func copyDirectoryPath(_ sender: NSMenuItem) {

@@ -13,12 +13,12 @@ pub mod previews;
 mod replicas;
 pub mod revisions;
 pub mod store;
-pub mod sync_navigation;
 pub mod versions;
 mod video_metadata;
 pub mod worker;
 
 pub mod remote_worker;
+pub mod restore;
 
 pub mod imports;
 

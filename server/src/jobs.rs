@@ -1,11 +1,14 @@
 //! Durable scan scheduling and incremental file state. Originals are never mutated.
-use crate::task_state::{Event, transition};
-use anyhow::{Context, Result, bail};
+use crate::{
+    store::Store,
+    task_state::{Event, transition},
+};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::{
     path::{Component, Path},
-    sync::{Condvar, Mutex, RwLock},
+    sync::{Arc, Condvar, Mutex, RwLock},
 };
 use uuid::Uuid;
 
@@ -64,6 +67,7 @@ pub struct Jobs {
     pub(crate) db: crate::database::Database,
     pub(crate) trash_db: Mutex<Connection>,
     root: std::path::PathBuf,
+    catalog: Option<Arc<Store>>,
 }
 
 fn folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<Folder> {
@@ -120,12 +124,14 @@ fn covers(parent: &Job, child: &Job) -> bool {
     }
 }
 
+#[cfg(test)]
 fn validate_work_class(work_class: &str) -> Result<()> {
     if !matches!(work_class, "automatic" | "manual" | "reconcile") {
         bail!("invalid work class");
     }
     Ok(())
 }
+#[cfg(test)]
 fn job_priority(job: &Job) -> (u8, u8, bool, bool) {
     (
         match job.work_class.as_str() {
@@ -143,22 +149,111 @@ fn job_priority(job: &Job) -> (u8, u8, bool, bool) {
     )
 }
 
-fn same_photo_stem(left: &Path, right: &Path) -> bool {
-    fn stem(path: &Path) -> Option<String> {
-        let without_xmp = path.with_extension("");
-        let path = if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("xmp"))
-            && crate::media::is_photo(&without_xmp)
+fn tracking_bound(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='catalog_tracking_binding')",
+        [], |row| row.get(0),
+    )?)
+}
+
+fn attach_catalog(db: &Connection, catalog: &Store) -> Result<()> {
+    let mut uri = url::Url::from_file_path(catalog.path())
+        .map_err(|_| anyhow::anyhow!("catalog path must be absolute"))?;
+    uri.query_pairs_mut().append_pair("mode", "ro");
+    db.execute("ATTACH DATABASE ? AS catalog", [uri.as_str()])?;
+    Ok(())
+}
+
+fn bind_tracking(db: &mut Connection, catalog_store: &Store) -> Result<()> {
+    attach_catalog(db, catalog_store)?;
+    let tx = db.transaction()?;
+    let mismatch: bool = tx.query_row(
+        "SELECT EXISTS(SELECT id,library_id,path,active FROM main.folders
+         EXCEPT SELECT id,library_id,path,active FROM catalog.folders)",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        !mismatch,
+        "tracking roots differ between the task and catalog databases"
+    );
+    let mut checks = tx.prepare(
+        "SELECT f.library_id,p.path,p.size,p.mtime_ns,p.version,p.error,p.metadata_stamp,p.metadata_operation_id,p.identity_status,p.identity_error
+         FROM main.files p JOIN main.folders f ON f.id=p.folder_id
+         JOIN catalog.catalog_physical_files c ON c.library_id=f.library_id AND c.path=p.path AND c.content_hash=p.version
+         ORDER BY f.active DESC,length(f.path) DESC,f.id",
+    )?;
+    let rows = checks
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, Option<String>>(9)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(checks);
+    if !rows.is_empty() {
+        let mut catalog = catalog_store.lock()?;
+        let write = catalog.transaction()?;
+        for (library, path, size, mtime, hash, error, stamp, operation, status, identity_error) in
+            rows
         {
-            &without_xmp
-        } else {
-            path
-        };
-        path.file_stem()
-            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            write.execute(
+                "INSERT OR IGNORE INTO catalog_file_checks VALUES(?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    library,
+                    path,
+                    size,
+                    mtime,
+                    hash,
+                    error,
+                    stamp,
+                    operation,
+                    status,
+                    identity_error
+                ],
+            )?;
+        }
+        write.commit()?;
     }
-    left.parent() == right.parent() && stem(left) == stem(right)
+    let table = "jobs";
+    let schema: String = tx.query_row(
+        "SELECT sql FROM main.sqlite_schema WHERE type='table' AND name=?",
+        [table],
+        |r| r.get(0),
+    )?;
+    let indexes = tx.prepare("SELECT sql FROM main.sqlite_schema WHERE type='index' AND tbl_name=? AND sql IS NOT NULL")?
+        .query_map([table], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        schema.contains(" REFERENCES folders(id)"),
+        "unexpected task schema for {table}"
+    );
+    let replacement = format!("{table}_no_tracking_fk");
+    let create = schema
+        .replace(
+            &format!("CREATE TABLE {table}"),
+            &format!("CREATE TABLE {replacement}"),
+        )
+        .replace(" REFERENCES folders(id)", "");
+    tx.execute_batch(&format!(
+        "{create};
+        INSERT INTO {replacement} SELECT * FROM {table} ORDER BY rowid;
+        DROP TABLE {table}; ALTER TABLE {replacement} RENAME TO {table};"
+    ))?;
+    for index in indexes {
+        tx.execute_batch(&index)?;
+    }
+    tx.execute_batch("DROP TABLE main.files; DROP TABLE main.folders; CREATE TABLE catalog_tracking_binding(version INTEGER PRIMARY KEY CHECK(version=1)); INSERT INTO catalog_tracking_binding VALUES(1);")?;
+    tx.commit()?;
+    Ok(())
 }
 
 impl Jobs {
@@ -170,7 +265,7 @@ impl Jobs {
 
     pub fn scan_wait_duration(&self) -> Result<std::time::Duration> {
         let available: Option<i64> = self.db.lock().unwrap().query_row(
-            "SELECT MIN(j.available_at) FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE j.status='pending' AND j.work_class='manual' AND f.active=1",
+            "SELECT MIN(j.available_at) FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE j.status='pending' AND j.work_class='manual' AND j.scope_kind='file' AND f.active=1",
             [], |row| row.get(0),
         )?;
         let seconds = available
@@ -204,6 +299,14 @@ impl Jobs {
     }
 
     pub fn open(path: &Path, original_root: &Path) -> Result<Self> {
+        Self::open_inner(path, original_root, None)
+    }
+
+    pub fn open_managed(path: &Path, original_root: &Path, catalog: Arc<Store>) -> Result<Self> {
+        Self::open_inner(path, original_root, Some(catalog))
+    }
+
+    fn open_inner(path: &Path, original_root: &Path, catalog: Option<Arc<Store>>) -> Result<Self> {
         let root = original_root
             .canonicalize()
             .context("resolve originals root")?;
@@ -214,17 +317,31 @@ impl Jobs {
         // Progress uses another WAL connection; reserve writes before a queue read can go stale.
         db.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         db.busy_timeout(std::time::Duration::from_secs(30))?;
+        let bound = tracking_bound(&db)?;
+        if bound {
+            attach_catalog(
+                &db,
+                catalog
+                    .as_ref()
+                    .context("task database requires its catalog")?,
+            )?;
+        } else {
+            db.execute_batch("CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,path TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,UNIQUE(library_id,path));")?;
+        }
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
           CREATE TABLE IF NOT EXISTS worker_activity(id INTEGER PRIMARY KEY CHECK(id=1),library_id TEXT NOT NULL,work_class TEXT NOT NULL,current_photo TEXT,last_error TEXT,active INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS import_file_digests(library_id TEXT NOT NULL,path TEXT NOT NULL,sha256 TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(library_id,path));
           CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,manifest TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS identity_sidecar_writes(
+            library_id TEXT NOT NULL, path TEXT NOT NULL, source_hash TEXT NOT NULL,
+            previous_hash TEXT, hash TEXT NOT NULL, packet BLOB NOT NULL,
+            PRIMARY KEY(library_id,path)
+          );
           CREATE TABLE IF NOT EXISTS file_publications(library_id TEXT NOT NULL,path TEXT NOT NULL,sha256 TEXT NOT NULL,batch_id TEXT,PRIMARY KEY(library_id,path));
           CREATE TABLE IF NOT EXISTS import_match_claims(library_id TEXT NOT NULL,kind TEXT NOT NULL,value TEXT NOT NULL,batch_id TEXT NOT NULL REFERENCES imports(id),group_id TEXT NOT NULL,path TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(library_id,kind,value));
           CREATE INDEX IF NOT EXISTS import_match_claims_publication ON import_match_claims(library_id,path,sha256);
-          CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,path TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,UNIQUE(library_id,path));
           CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,folder_id TEXT NOT NULL REFERENCES folders(id),status TEXT NOT NULL,error TEXT,processed INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,current_path TEXT,started_at INTEGER,finished_at INTEGER,created_at INTEGER NOT NULL DEFAULT(unixepoch()),updated_at INTEGER NOT NULL DEFAULT(unixepoch()));
-          CREATE TABLE IF NOT EXISTS files(folder_id TEXT NOT NULL REFERENCES folders(id),path TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,asset_id TEXT NOT NULL,version TEXT NOT NULL,error TEXT,PRIMARY KEY(folder_id,path));
 ")?;
         let columns: Vec<String> = db
             .prepare("PRAGMA table_info(jobs)")?
@@ -270,27 +387,30 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         if !columns.iter().any(|column| column == "work_class") {
             db.execute_batch("UPDATE jobs SET work_class=CASE WHEN wait_for_quiet=0 THEN 'manual' WHEN scope_kind='recursive' AND COALESCE(scope_path,(SELECT path FROM folders WHERE id=jobs.folder_id))=(SELECT path FROM folders WHERE id=jobs.folder_id) THEN 'reconcile' ELSE 'automatic' END")?;
         }
-        let file_columns: Vec<String> = db
-            .prepare("PRAGMA table_info(files)")?
-            .query_map([], |row| row.get(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        if !file_columns.iter().any(|column| column == "metadata_stamp") {
+        if !bound {
+            db.execute_batch("CREATE TABLE IF NOT EXISTS files(folder_id TEXT NOT NULL REFERENCES folders(id),path TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,asset_id TEXT NOT NULL,version TEXT NOT NULL,error TEXT,PRIMARY KEY(folder_id,path));")?;
+            let file_columns: Vec<String> = db
+                .prepare("PRAGMA table_info(files)")?
+                .query_map([], |row| row.get(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if !file_columns.iter().any(|column| column == "metadata_stamp") {
+                db.execute_batch(
+                    "ALTER TABLE files ADD COLUMN metadata_stamp TEXT NOT NULL DEFAULT ''",
+                )?;
+            }
+            for (name, definition) in [
+                ("identity_status", "TEXT NOT NULL DEFAULT 'pending'"),
+                ("identity_error", "TEXT"),
+                ("metadata_operation_id", "TEXT"),
+            ] {
+                if !file_columns.iter().any(|column| column == name) {
+                    db.execute_batch(&format!("ALTER TABLE files ADD COLUMN {name} {definition}"))?;
+                }
+            }
             db.execute_batch(
-                "ALTER TABLE files ADD COLUMN metadata_stamp TEXT NOT NULL DEFAULT ''",
+                "CREATE INDEX IF NOT EXISTS files_identity_pending ON files(identity_status)",
             )?;
         }
-        for (name, definition) in [
-            ("identity_status", "TEXT NOT NULL DEFAULT 'pending'"),
-            ("identity_error", "TEXT"),
-            ("metadata_operation_id", "TEXT"),
-        ] {
-            if !file_columns.iter().any(|column| column == name) {
-                db.execute_batch(&format!("ALTER TABLE files ADD COLUMN {name} {definition}"))?;
-            }
-        }
-        db.execute_batch(
-            "CREATE INDEX IF NOT EXISTS files_identity_pending ON files(identity_status)",
-        )?;
         db.execute_batch("DROP INDEX IF EXISTS jobs_live;
             UPDATE jobs SET scope_path=(SELECT path FROM folders WHERE id=jobs.folder_id) WHERE scope_path IS NULL;
             DROP INDEX IF EXISTS jobs_live_scope;
@@ -304,8 +424,23 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             "UPDATE jobs SET status=?1,phase='waiting',finished_at=NULL,updated_at=unixepoch() WHERE status='running' OR (status='pending' AND checkpoint IS NOT NULL)",
             [resumed],
         )?;
+        if let Some(catalog) = catalog.as_ref()
+            && !bound
+        {
+            let has_folders = db.query_row("SELECT EXISTS(SELECT 1 FROM folders)", [], |r| {
+                r.get::<_, bool>(0)
+            })?;
+            ensure!(
+                !has_folders,
+                "tracking migration required: run keeps-server migrate offline"
+            );
+            bind_tracking(&mut db, catalog)?;
+        }
         let trash_db = Connection::open(path)?;
         trash_db.busy_timeout(std::time::Duration::from_secs(5))?;
+        if let Some(catalog) = catalog.as_ref() {
+            attach_catalog(&trash_db, catalog)?;
+        }
         crate::directory_trash::initialize(&trash_db)?;
         crate::rejected_trash::initialize(&trash_db)?;
         let jobs = Self {
@@ -315,10 +450,20 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             import_mutation: Mutex::new(()),
             db: crate::database::Database::new(db),
             root,
+            catalog,
         };
         jobs.coalesce_pending()?;
         Ok(jobs)
     }
+    pub fn migrate_tracking(path: &Path, catalog: &Store) -> Result<()> {
+        let mut db = Connection::open(path)?;
+        db.busy_timeout(std::time::Duration::from_secs(30))?;
+        if !tracking_bound(&db)? {
+            bind_tracking(&mut db, catalog)?;
+        }
+        Ok(())
+    }
+
     pub fn validate_path(&self, path: &Path) -> Result<std::path::PathBuf> {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
@@ -360,13 +505,42 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         }
         let path = self.validate_path(Path::new(path))?;
         let path = path.to_str().context("folder path must be UTF-8")?;
-        let db = self.db.lock().unwrap();
-        db.execute("INSERT INTO folders(id,library_id,path) VALUES(?1,?2,?3) ON CONFLICT(library_id,path) DO UPDATE SET active=1",params![Uuid::new_v4().to_string(),library_id,path])?;
-        Ok(db.query_row(
-            "SELECT id,library_id,path,active FROM folders WHERE library_id=?1 AND path=?2",
-            params![library_id, path],
-            folder,
-        )?)
+        let upsert = |db: &Connection| -> Result<_> {
+            let changed = db.execute(
+                "INSERT INTO folders(id,library_id,path) VALUES(?1,?2,?3)
+                 ON CONFLICT(library_id,path) DO UPDATE SET active=1 WHERE active=0",
+                params![Uuid::new_v4().to_string(), library_id, path],
+            )?;
+            let folder = db.query_row(
+                "SELECT id,library_id,path,active FROM folders WHERE library_id=?1 AND path=?2",
+                params![library_id, path],
+                folder,
+            )?;
+            Ok((folder, changed))
+        };
+        if let Some(store) = &self.catalog {
+            let mut db = store.lock()?;
+            let tx = db.transaction()?;
+            if Path::new(path) == self.root {
+                crate::navigation::record(&tx, library_id, &self.root)?;
+            }
+            if !crate::navigation::registered(&tx, library_id, Path::new(path))? {
+                return Err(crate::store::StoreError {
+                    status: 409,
+                    code: "directory_not_registered".into(),
+                    message: "目录需要先通过 Keeps 创建或离线盘点登记".into(),
+                }
+                .into());
+            }
+            let (folder, changed) = upsert(&tx)?;
+            if changed > 0 {
+                crate::navigation::tracking_changed(&tx, library_id, path)?;
+            }
+            tx.commit()?;
+            Ok(folder)
+        } else {
+            Ok(upsert(&*self.db.lock()?)?.0)
+        }
     }
     pub fn folders(&self) -> Result<Vec<Folder>> {
         let db = self.db.lock().unwrap();
@@ -376,13 +550,31 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             .collect::<rusqlite::Result<_>>()?)
     }
     pub fn remove_folder(&self, id: &str) -> Result<bool> {
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        let found = tx.execute("UPDATE folders SET active=0 WHERE id=?1", [id])? > 0;
-        tx.execute("UPDATE jobs SET status='cancelled',finished_at=unixepoch(),updated_at=unixepoch() WHERE folder_id=?1 AND status IN ('pending','running')",[id])?;
-        tx.commit()?;
-        Ok(found)
+        let deactivate = |db: &Connection| -> Result<_> {
+            Ok(db
+                .query_row(
+                    "UPDATE folders SET active=0 WHERE id=? AND active=1 RETURNING library_id,path",
+                    [id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?)
+        };
+        let changed = if let Some(store) = &self.catalog {
+            let mut db = store.lock()?;
+            let tx = db.transaction()?;
+            let changed = deactivate(&tx)?;
+            if let Some((library, path)) = &changed {
+                crate::navigation::tracking_changed(&tx, library, path)?;
+            }
+            tx.commit()?;
+            changed
+        } else {
+            deactivate(&*self.db.lock()?)?
+        };
+        self.db.lock()?.execute("UPDATE jobs SET status='cancelled',finished_at=unixepoch(),updated_at=unixepoch() WHERE folder_id=?1 AND status IN ('pending','running')",[id])?;
+        Ok(changed.is_some())
     }
+    #[cfg(test)]
     pub fn cancel_automatic_scans(&self) -> Result<usize> {
         // Retire filesystem-triggered work from deployments before manual-only scanning.
         Ok(self.db.lock().unwrap().execute(
@@ -390,6 +582,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             [],
         )?)
     }
+    #[cfg(test)]
     pub fn enqueue_scan(&self, folder_id: &str) -> Result<Job> {
         self.enqueue_scan_with_quiet(folder_id, false)
     }
@@ -397,6 +590,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
     pub fn enqueue_external_scan(&self, folder_id: &str) -> Result<Job> {
         self.enqueue_scan_with_quiet(folder_id, true)
     }
+    #[cfg(test)]
     fn enqueue_scan_with_quiet(&self, folder_id: &str, wait_for_quiet: bool) -> Result<Job> {
         let path = self.db.lock().unwrap().query_row(
             "SELECT path FROM folders WHERE id=?1",
@@ -439,6 +633,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             "automatic",
         )
     }
+    #[cfg(test)]
     pub fn enqueue_reconcile_scope(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(
             folder_id,
@@ -570,23 +765,38 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             .optional()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_file_publication(
         &self,
         library: &str,
         path: &str,
         sha256: &str,
     ) -> Result<()> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.db.lock()?;
         let tx = db.transaction()?;
-        tx.execute(
+        Self::complete_file_publication_in(&tx, library, path, sha256)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_file_publication_in(
+        db: &Connection,
+        library: &str,
+        path: &str,
+        sha256: &str,
+    ) -> Result<()> {
+        db.execute(
             "DELETE FROM file_publications WHERE library_id=? AND path=? AND sha256=?",
             params![library, path, sha256],
         )?;
-        tx.execute(
+        db.execute(
             "DELETE FROM import_match_claims WHERE library_id=? AND path=? AND sha256=?",
             params![library, path, sha256],
         )?;
-        tx.commit()?;
+        db.execute(
+            "DELETE FROM identity_sidecar_writes WHERE library_id=? AND path=? AND hash=?",
+            params![library, path, sha256],
+        )?;
         Ok(())
     }
 
@@ -600,6 +810,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             folder_id, path, 0, false, true, false, true, "file", "manual",
         )
     }
+    #[cfg(test)]
     pub fn enqueue_manual_directory(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(
             folder_id,
@@ -613,6 +824,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             "manual",
         )
     }
+    #[cfg(test)]
     pub fn enqueue_manual_metadata_refresh(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(
             folder_id,
@@ -690,42 +902,28 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
                 _ => bail!("invalid scan component"),
             }
         }
-        let mut missing_child = None;
-        for ancestor in requested.ancestors() {
-            let resolved = match ancestor.canonicalize() {
-                Ok(path) => path,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound && ancestor != self.root =>
-                {
-                    missing_child = ancestor.file_name();
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if !resolved.starts_with(&self.root) {
-                bail!("scan scope must be under originals root");
-            }
-            if resolved != ancestor {
-                bail!("symlinks are not allowed");
-            }
-            if let Some(name) = missing_child {
-                for entry in std::fs::read_dir(&resolved)? {
-                    if entry?.file_name() == name {
-                        bail!("missing scan component is a symlink or changed during validation");
+        let mut current = self.root.clone();
+        let relative = requested.strip_prefix(&self.root)?;
+        for component in relative.components() {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    ensure!(!metadata.is_symlink(), "symlinks are not allowed");
+                    if current == requested && scope_kind == "file" {
+                        ensure!(metadata.is_file(), "file scope must be a regular file");
+                    } else {
+                        ensure!(metadata.is_dir(), "directory scope must be a directory");
                     }
                 }
-                return Ok(requested);
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(requested),
+                Err(error) => return Err(error).context("inspect requested path"),
             }
-            let metadata = std::fs::metadata(&resolved)?;
-            if scope_kind == "file" && !metadata.is_file() {
-                bail!("file scope must be a regular file");
-            }
-            if scope_kind != "file" && !metadata.is_dir() {
-                bail!("directory scope must be a directory");
-            }
-            return Ok(resolved);
         }
-        bail!("scan scope must be under originals root")
+        ensure!(
+            requested != self.root || scope_kind != "file",
+            "file scope must be a regular file"
+        );
+        Ok(requested)
     }
     #[allow(clippy::too_many_arguments)]
     fn enqueue_scope(
@@ -803,6 +1001,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         }
         Ok(())
     }
+    #[cfg(test)]
     pub fn load_checkpoint(&self, id: &str) -> Result<Option<String>> {
         Ok(self.db.lock().unwrap().query_row(
             "SELECT checkpoint FROM jobs WHERE id=?1",
@@ -810,6 +1009,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             |r| r.get(0),
         )?)
     }
+    #[cfg(test)]
     pub fn save_checkpoint(&self, id: &str, checkpoint: &str) -> Result<()> {
         self.db.lock().unwrap().execute(
             "UPDATE jobs SET checkpoint=?2,updated_at=unixepoch() WHERE id=?1 AND status='running'",
@@ -817,6 +1017,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         )?;
         Ok(())
     }
+    #[cfg(test)]
     pub fn save_scan_progress(
         &self,
         id: &str,
@@ -869,96 +1070,11 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
     pub fn has_pending_changes(&self, excluding_id: &str) -> Result<bool> {
         Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE j.refresh_metadata=1 AND j.available_at<=unixepoch() AND f.active=1 AND ((j.id<>?1 AND j.status='pending') OR (j.id=?1 AND j.status='running' AND j.rerun=1)))", [excluding_id], |row| row.get(0))?)
     }
-    pub fn directory_scan_pending(&self, library: &str, source: &Path) -> Result<bool> {
-        let parent = source.parent().context("cache source has no parent")?;
-        let scopes = {
-            let db = self.db.lock().unwrap();
-            let mut query = db.prepare("SELECT COALESCE(j.scope_path,f.path),j.scope_kind,j.folder_id FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE f.library_id=? AND f.active=1 AND j.work_class='automatic' AND j.status IN ('pending','running')")?;
-            query
-                .query_map([library], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (path, kind, folder) in scopes {
-            let path = Path::new(&path);
-            if kind == "file" {
-                if same_photo_stem(path, source) {
-                    return Ok(true);
-                }
-                continue;
-            }
-            let covers = if kind == "recursive" {
-                parent.starts_with(path)
-            } else {
-                parent == path
-            };
-            if covers && !self.photo_index_current(&folder, source)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-    fn photo_index_current(&self, folder: &str, source: &Path) -> Result<bool> {
-        let parent = source.parent().context("cache source has no parent")?;
-        let mut paths = vec![source.to_path_buf()];
-        let entries = match std::fs::read_dir(parent) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("read photo directory {}", parent.display()));
-            }
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if crate::media::is_photo(&path) && same_photo_stem(&path, source) {
-                paths.push(path);
-            }
-        }
-        paths.sort();
-        paths.dedup();
-        for path in paths {
-            let info = match std::fs::symlink_metadata(&path) {
-                Ok(info) => info,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(error) => {
-                    return Err(error).with_context(|| format!("stat {}", path.display()));
-                }
-            };
-            if !info.file_type().is_file() {
-                return Ok(false);
-            }
-            let Some(state) =
-                self.file_state(folder, path.to_str().context("photo path must be UTF-8")?)?
-            else {
-                return Ok(false);
-            };
-            if state.error.is_some()
-                || state.asset_id.is_empty()
-                || u64::try_from(state.size).ok() != Some(info.len())
-                || u128::try_from(state.mtime_ns).ok()
-                    != Some(
-                        info.modified()?
-                            .duration_since(std::time::UNIX_EPOCH)?
-                            .as_nanos(),
-                    )
-                || state.metadata_stamp != crate::media::sidecar_stamp(&path)?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
     pub fn path_sync_pending(&self, library: &str, path: &Path) -> Result<bool> {
         let text = path.to_str().context("asset path must be UTF-8")?;
         Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE f.library_id=?1 AND f.active=1 AND j.path_sync=1 AND j.status IN ('pending','running') AND (?2=j.scope_path OR (j.scope_kind<>'file' AND substr(?2,1,length(rtrim(j.scope_path,'/'))+1)=rtrim(j.scope_path,'/')||'/' AND (j.scope_kind='recursive' OR instr(substr(?2,length(rtrim(j.scope_path,'/'))+2),'/')=0))))", params![library,text], |r| r.get(0))?)
     }
+    #[cfg(test)]
     pub fn should_yield(&self, current: &Job) -> Result<bool> {
         let db = self.db.lock().unwrap();
         let pending = db.prepare(&format!("{JOB_SELECT} WHERE f.active=1 AND j.status='pending' AND j.id<>?1 AND j.available_at<=unixepoch()"))?
@@ -967,14 +1083,27 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             .iter()
             .any(|candidate| job_priority(candidate) > job_priority(current)))
     }
+    #[cfg(test)]
     pub fn has_due_class(&self, work_class: &str) -> Result<bool> {
         validate_work_class(work_class)?;
         Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE j.work_class=?1 AND j.status='pending' AND j.available_at<=unixepoch() AND f.active=1)", [work_class], |row| row.get(0))?)
     }
+    pub fn claim_photo_processing(&self) -> Result<Option<Job>> {
+        self.claim(Some("manual"), true)
+    }
+    pub fn retire_legacy_scan_tasks(&self) -> Result<usize> {
+        Ok(self.db.lock()?.execute(
+            "UPDATE jobs SET status='cancelled',checkpoint=NULL,rerun=0,finished_at=unixepoch(),updated_at=unixepoch()
+             WHERE (scope_kind<>'file' OR work_class<>'manual') AND status IN ('pending','running','failed')",
+            [],
+        )?)
+    }
+    #[cfg(test)]
     pub fn claim_class(&self, work_class: &str) -> Result<Option<Job>> {
         validate_work_class(work_class)?;
         self.claim(Some(work_class), false)
     }
+    #[cfg(test)]
     pub fn claim_next(&self) -> Result<Option<Job>> {
         self.claim(None, false)
     }
@@ -1068,24 +1197,57 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             .optional()?
             .unwrap_or(false))
     }
+    pub(crate) fn manages_catalog(&self) -> bool {
+        self.catalog.is_some()
+    }
+
     pub fn file_state(&self, folder_id: &str, path: &str) -> Result<Option<FileState>> {
-        Ok(self.db.lock().unwrap().query_row("SELECT size,mtime_ns,asset_id,version,error,metadata_stamp,metadata_operation_id FROM files WHERE folder_id=?1 AND path=?2",params![folder_id,path],|r|Ok(FileState {size:r.get(0)?,mtime_ns:r.get(1)?,asset_id:r.get(2)?,version:r.get(3)?,error:r.get(4)?,metadata_stamp:r.get(5)?,metadata_operation_id:r.get(6)?})).optional()?)
+        let db = self.db.lock()?;
+        let query = if self.manages_catalog() {
+            "SELECT c.size,c.mtime_ns,p.asset_id,c.verified_hash,c.error,c.metadata_stamp,c.metadata_operation_id
+             FROM catalog_file_checks c JOIN catalog_physical_files p USING(library_id,path)
+             JOIN folders f ON f.library_id=c.library_id WHERE f.id=?1 AND c.path=?2 AND p.content_hash=c.verified_hash"
+        } else {
+            "SELECT size,mtime_ns,asset_id,version,error,metadata_stamp,metadata_operation_id FROM files WHERE folder_id=?1 AND path=?2"
+        };
+        Ok(db
+            .query_row(query, params![folder_id, path], |r| {
+                Ok(FileState {
+                    size: r.get(0)?,
+                    mtime_ns: r.get(1)?,
+                    asset_id: r.get(2)?,
+                    version: r.get(3)?,
+                    error: r.get(4)?,
+                    metadata_stamp: r.get(5)?,
+                    metadata_operation_id: r.get(6)?,
+                })
+            })
+            .optional()?)
+    }
+
+    pub(crate) fn record_catalog_check(
+        db: &Connection,
+        library: &str,
+        path: &str,
+        state: &FileState,
+        identity: bool,
+    ) -> Result<()> {
+        db.execute(
+            "INSERT INTO catalog_file_checks(library_id,path,size,mtime_ns,verified_hash,error,metadata_stamp,metadata_operation_id,identity_status)
+             VALUES(?,?,?,?,?,?,?,?,CASE WHEN ?9 THEN 'ready' ELSE 'pending' END)
+             ON CONFLICT(library_id,path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
+              verified_hash=excluded.verified_hash,error=excluded.error,metadata_stamp=excluded.metadata_stamp,
+              metadata_operation_id=excluded.metadata_operation_id,
+              identity_status=CASE WHEN ?9 THEN 'ready' ELSE catalog_file_checks.identity_status END,
+              identity_error=CASE WHEN ?9 THEN NULL ELSE catalog_file_checks.identity_error END",
+            params![library,path,state.size,state.mtime_ns,state.version,state.error,state.metadata_stamp,state.metadata_operation_id,identity],
+        )?;
+        Ok(())
     }
     pub fn has_path_sync(&self) -> Result<bool> {
         Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE f.active=1 AND j.path_sync=1 AND j.status IN ('pending','running'))",[],|r|r.get(0))?)
     }
-    pub fn pending_identities(&self, limit: usize) -> Result<Vec<(Folder, String)>> {
-        let db = self.db.lock().unwrap();
-        Ok(db.prepare("SELECT f.id,f.library_id,f.path,f.active,p.path FROM files p JOIN folders f ON f.id=p.folder_id WHERE p.identity_status='pending' AND p.error IS NULL AND f.active=1 LIMIT ?")?.query_map([limit as i64], |r| Ok((folder(r)?,r.get(4)?)))?.collect::<rusqlite::Result<_>>()?)
-    }
-    pub fn identity_missing(&self, folder_id: &str, path: &str) -> Result<()> {
-        self.db.lock().unwrap().execute("UPDATE files SET identity_status='missing',identity_error=NULL WHERE folder_id=? AND path=?",params![folder_id,path])?;
-        Ok(())
-    }
-    pub fn identity_pending(&self, folder_id: &str, path: &str) -> Result<()> {
-        self.db.lock().unwrap().execute("UPDATE files SET identity_status='pending',identity_error=NULL WHERE folder_id=? AND path=?",params![folder_id,path])?;
-        Ok(())
-    }
+    #[cfg(test)]
     pub fn identity_result(&self, folder_id: &str, path: &str, error: Option<&str>) -> Result<()> {
         self.db.lock().unwrap().execute(
             "UPDATE files SET identity_status=?,identity_error=? WHERE folder_id=? AND path=?",
@@ -1099,6 +1261,32 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         Ok(())
     }
     pub fn identity_status(&self, library: &str) -> Result<serde_json::Value> {
+        if let Some(store) = &self.catalog {
+            let db = store.read()?;
+            let mut counts = serde_json::json!({"pending":0,"ready":0,"failed":0,"batchLimit":1});
+            let scope = "FROM catalog_file_checks p WHERE p.library_id=? AND EXISTS(
+              SELECT 1 FROM folders f WHERE f.library_id=p.library_id AND f.active=1
+              AND p.path>=rtrim(f.path,'/')||'/' AND p.path<rtrim(f.path,'/')||'0')";
+            let mut query = db.prepare(&format!(
+                "SELECT p.identity_status,count(*) {scope} GROUP BY p.identity_status"
+            ))?;
+            for row in query.query_map([library], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })? {
+                let (status, count) = row?;
+                counts[status] = serde_json::json!(count);
+            }
+            counts["errors"] = serde_json::json!(
+                db.prepare(&format!(
+                    "SELECT p.path,p.identity_error {scope} AND p.identity_status='failed' LIMIT 20"
+                ))?
+                .query_map([library], |r| Ok(
+                    serde_json::json!({"path":r.get::<_,String>(0)?,"error":r.get::<_,String>(1)?})
+                ))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            );
+            return Ok(counts);
+        }
         let db = self.db.lock().unwrap();
         let mut counts = serde_json::json!({"pending":0,"ready":0,"failed":0,"batchLimit":1});
         for row in db.prepare("SELECT identity_status,count(*) FROM files p JOIN folders f ON f.id=p.folder_id WHERE f.library_id=? AND f.active=1 GROUP BY identity_status")?.query_map([library], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))? {
@@ -1124,7 +1312,25 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         path: &str,
         state: &FileState,
     ) -> Result<()> {
-        self.db.lock().unwrap().execute(
+        if let Some(store) = &self.catalog {
+            let db = store.lock()?;
+            let library: String = db.query_row(
+                "SELECT library_id FROM folders WHERE id=?",
+                [folder_id],
+                |r| r.get(0),
+            )?;
+            return Self::record_catalog_check(&db, &library, path, state, false);
+        }
+        Self::record_metadata_result_in(&self.db.lock().unwrap(), folder_id, path, state)
+    }
+
+    pub(crate) fn record_metadata_result_in(
+        db: &Connection,
+        folder_id: &str,
+        path: &str,
+        state: &FileState,
+    ) -> Result<()> {
+        db.execute(
             "INSERT INTO files(folder_id,path,size,mtime_ns,asset_id,version,error,metadata_stamp,metadata_operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(folder_id,path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,asset_id=excluded.asset_id,version=excluded.version,error=excluded.error,metadata_stamp=excluded.metadata_stamp,metadata_operation_id=excluded.metadata_operation_id",
             params![folder_id,path,state.size,state.mtime_ns,state.asset_id,state.version,state.error,state.metadata_stamp,state.metadata_operation_id],
         )?;
@@ -1141,6 +1347,21 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         version: &str,
         error: Option<&str>,
     ) -> Result<()> {
+        if self.manages_catalog() {
+            return self.record_metadata_result(
+                folder_id,
+                path,
+                &FileState {
+                    size,
+                    mtime_ns,
+                    asset_id: asset_id.to_owned(),
+                    version: version.to_owned(),
+                    error: error.map(str::to_owned),
+                    metadata_stamp: String::new(),
+                    metadata_operation_id: None,
+                },
+            );
+        }
         self.db.lock().unwrap().execute("INSERT INTO files(folder_id,path,size,mtime_ns,asset_id,version,error) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(folder_id,path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,asset_id=excluded.asset_id,version=excluded.version,error=excluded.error,metadata_operation_id=NULL",params![folder_id,path,size,mtime_ns,asset_id,version,error])?;
         Ok(())
     }
@@ -1149,6 +1370,28 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retiring_legacy_scans_keeps_interrupted_file_processing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("photos");
+        std::fs::create_dir(&root)?;
+        let path = dir.path().join("jobs.sqlite");
+        let jobs = Jobs::open(&path, &root)?;
+        let folder = jobs.add_folder("lib", ".")?;
+        let legacy = jobs.enqueue_scan(&folder.id)?;
+        let file = jobs.enqueue_manual_file(&folder.id, &jobs.root().join("photo.jpg"))?;
+        assert_eq!(jobs.claim_photo_processing()?.unwrap().id, file.id);
+        drop(jobs);
+
+        let jobs = Jobs::open(&path, &root)?;
+        assert_eq!(jobs.retire_legacy_scan_tasks()?, 1);
+        assert_eq!(jobs.retire_legacy_scan_tasks()?, 0);
+        assert_eq!(jobs.job(&legacy.id)?.unwrap().status, "cancelled");
+        assert_eq!(jobs.claim_photo_processing()?.unwrap().id, file.id);
+        assert!(jobs.claim_photo_processing()?.is_none());
+        Ok(())
+    }
+
     #[test]
     fn migration_clears_implicit_file_override_and_preserves_explicit_metadata_refresh() {
         let (dir, jobs, folder) = setup();
@@ -1444,11 +1687,6 @@ mod tests {
             .enqueue_directory_change(&folder.id, jobs.root(), 0)
             .unwrap();
         assert_ne!(reconcile.id, manual.id);
-        assert!(
-            !jobs
-                .directory_scan_pending("other", &jobs.root().join("a.jpg"))
-                .unwrap()
-        );
         assert!(jobs.claim_class("invalid").is_err());
         assert_eq!(jobs.claim_class("manual").unwrap().unwrap().id, manual.id);
         jobs.yield_job(&manual.id).unwrap();
@@ -1495,11 +1733,6 @@ mod tests {
         assert_eq!(
             jobs.load_checkpoint(&reconcile.id).unwrap().as_deref(),
             Some("saved-frontier")
-        );
-        assert!(
-            !jobs
-                .directory_scan_pending("library", &jobs.root().join("child/a.jpg"))
-                .unwrap()
         );
         jobs.db
             .lock()
@@ -1635,87 +1868,6 @@ mod tests {
             jobs.load_checkpoint(&root.id).unwrap().as_deref(),
             Some("frontier")
         );
-    }
-    #[test]
-    fn cache_scan_gate_covers_same_photo_but_not_other_photos() {
-        let (_dir, jobs, folder) = setup();
-        let child = jobs.root().join("child");
-        std::fs::create_dir(&child).unwrap();
-        jobs.enqueue_file_change(&folder.id, &jobs.root().join("a.3fr"), 0)
-            .unwrap();
-        assert!(
-            jobs.directory_scan_pending("library", &jobs.root().join("a.heic"))
-                .unwrap()
-        );
-        assert!(
-            !jobs
-                .directory_scan_pending("library", &child.join("a.heic"))
-                .unwrap()
-        );
-        assert!(
-            !jobs
-                .directory_scan_pending("other", &jobs.root().join("a.heic"))
-                .unwrap()
-        );
-        jobs.claim_next().unwrap().unwrap();
-        assert!(
-            !jobs
-                .directory_scan_pending("library", &jobs.root().join("b.heic"))
-                .unwrap()
-        );
-        jobs.enqueue_scan(&folder.id).unwrap();
-        assert!(
-            !jobs
-                .directory_scan_pending("library", &child.join("a.heic"))
-                .unwrap()
-        );
-    }
-    #[test]
-    fn directory_scan_allows_indexed_photo_while_other_photos_wait() -> Result<()> {
-        let (_dir, jobs, folder) = setup();
-        let photo = jobs.root().join("a.3fr");
-        std::fs::write(&photo, b"raw")?;
-        std::fs::write(jobs.root().join("b.3fr"), b"pending other photo")?;
-        let record = |path: &Path| -> Result<()> {
-            let info = std::fs::metadata(path)?;
-            let text = path.to_str().unwrap();
-            jobs.record_file(
-                &folder.id,
-                text,
-                info.len() as i64,
-                info.modified()?
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_nanos() as i64,
-                "asset",
-                "hash",
-                None,
-            )?;
-            jobs.record_metadata_stamp(&folder.id, text, &crate::media::sidecar_stamp(path)?)
-        };
-        record(&photo)?;
-        jobs.enqueue_directory_change(&folder.id, jobs.root(), 0)?;
-        assert!(!jobs.directory_scan_pending("library", &photo)?);
-        assert!(jobs.directory_scan_pending("library", &jobs.root().join("b.3fr"))?);
-        let sibling = jobs.root().join("A.heic");
-        std::fs::write(&sibling, b"new version")?;
-        assert!(jobs.directory_scan_pending("library", &photo)?);
-        record(&sibling)?;
-        assert!(!jobs.directory_scan_pending("library", &photo)?);
-        std::fs::write(photo.with_extension("xmp"), b"updated rating")?;
-        assert!(jobs.directory_scan_pending("library", &photo)?);
-        record(&photo)?;
-        record(&sibling)?;
-        assert!(!jobs.directory_scan_pending("library", &photo)?);
-        std::fs::write(&photo, b"changed raw bytes")?;
-        assert!(jobs.directory_scan_pending("library", &photo)?);
-        Ok(())
-    }
-    #[test]
-    fn scan_gate_matches_both_sidecar_names_without_blocking_other_photos() {
-        let source = Path::new("/photos/a.b.3fr");
-        assert!(same_photo_stem(Path::new("/photos/a.b.xmp"), source));
-        assert!(same_photo_stem(Path::new("/photos/a.b.3fr.XMP"), source));
-        assert!(!same_photo_stem(Path::new("/photos/b.xmp"), source));
     }
     #[test]
     fn shallow_scope_never_absorbs_recursive_child_and_file_does_not_block_descendants() {

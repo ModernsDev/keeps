@@ -42,22 +42,25 @@ python3 deploy/spk/release.py fetch .build/keeps-nas-release
 3. 启动后核对 `/healthz`、鉴权、资产计数、缩略图下载及后台状态，再恢复维护进程。可用性与全库处理完成是两回事。
 4. 回退前另存最新数据库。使用与数据库 schema 匹配的套件和配置；恢复旧数据库会丢失备份之后的整理修改，不能直接覆盖最新状态。
 
-**schema 25 图库索引迁移**
+**schema 27 目录迁移**
 
-先排空导入及文件变更任务。停服并备份图库库和任务库后，在 NAS 按实际图库 ID 和原片根目录运行一次性核对。
+停服前完成已开始的原片发布、移动和回收。停服并备份两库后，为每个资料库盘点其追踪根（含停用的根，多个根重复传入 `--root`）。此示例适用于追踪整个原片根的单图库。
 
 ```sh
-python3 scripts/audit_photo_placement.py --catalog "$KEEPS_ROOT/db/control_plane.sqlite" --library "$KEEPS_LIBRARY_ID" --root "$ORIGINAL_ROOT" --verify-sha256
+python3 scripts/audit_photo_placement.py --catalog "$KEEPS_ROOT/db/control_plane.sqlite" --library "$KEEPS_LIBRARY_ID" --root "$ORIGINAL_ROOT" --directory-manifest > inventory.json
+target/bin/keeps-server migrate inventory.json
 ```
 
-报告冲突时先核对再继续。执行当前套件的 `keeps-server migrate` 后，仍在停服窗口，用同一命令加 `--register-xmp` 登记已核实的 XMP 路径。该步骤只补 SQLite 记录。启动后再以只读模式核对两边清单并保存报告。若需回退，先备份迁移后的两库及已发生的 API 操作。
+迁移需要套件账号的 `KEEPS_ROOT` 与 `ORIGINAL_ROOT`。先处理所有报告差异，再继续停服迁移。清单含空目录，媒体摘要与照片身份 XMP 均须匹配。多图库将各清单依次传给 `migrate`。迁移完成后，启用写入前可恢复同一时点的两库备份并恢复匹配版本的套件。启用写入后的回退须先核对迁移后已完成的文件操作。
 
-长期备份使用 Hyper Backup 的应用备份，选择 `Keeps Native Probe`。备份目标、计划和版本保留由 Hyper Backup 任务管理；套件通过 `scripts/backup` 导出双库、四个配置文件及存在时的 `maintenance` 状态，不包含原片或可重建预览。原片共享文件夹须单独纳入任务。备份期间需要停服以保证双库一致；停止时先通知主进程，在当前步骤完成并保存断点后退出，重启自动继续未完成扫描，导出会校验 SQLite 完整性并生成校验和；临时目录应位于数据卷，不能使用空间有限的 DSM 系统分区。
+长期备份使用 Hyper Backup 的应用备份，选择 `Keeps Native Probe`。备份目标、计划和版本保留由 Hyper Backup 任务管理；套件通过 `scripts/backup` 导出双库、四个配置文件及存在时的 `maintenance` 状态，不包含原片或可重建预览。原片共享文件夹须单独纳入任务。备份期间需要停服以保证双库一致；停止时先通知主进程，在当前步骤完成并保存断点后退出，重启自动继续未完成的精确照片任务，导出会校验 SQLite 完整性并生成校验和；临时目录应位于数据卷，不能使用空间有限的 DSM 系统分区。
 
 当前 NAS 使用独立的 `Keeps` Hyper Backup 任务，目标为 S3 `chuan.backup/keeps-native`，每天 NAS 时间（America/Los_Angeles）01:00 运行，智能保留最多 256 个版本。原片由原有 `Amazon S3` 任务备份；两者分开调度，避免应用状态备份排在大批照片传输之后。
+
+从 DSM 回收站把照片恢复到原历史路径后，保持 Keeps 停服并执行 `target/bin/keeps-server register-restored "$KEEPS_LIBRARY_ID" /volume2/photo/相对目录/原文件名.jpg`。可以一次传入多个明确的原片路径。已有版本摘要和相邻 XMP 的照片身份都匹配后才登记；已经清除历史记录的照片需通过 Keeps 导入。
 
 恢复只写 Keeps 状态和配置，保留当前 `KEEPS_ROOT`，恢复前状态保存在该目录的 `backups/restore-before-*`。恢复后须核对服务健康、资料库及整理数据。尚未完成 Hyper Backup 备份和恢复验证前，不删除旧数据库备份。
 
 `/volume2/docker/keeps/releases/` 是历史部署目录，不作为长期备份位置；其中还混有 RAW、照片和修复前副本，禁止整目录删除。旧 Docker 服务 `keeps-control-plane` 已退役并保持停止；它保存的是迁移时点的旧状态，不能启动、恢复或替代当前服务。NAS 服务只能通过本说明中的 SPK 流程部署。原片始终保留原位，不参与套件清理。
 
-接口线程保持正常 CPU/I/O 优先级，扫描、编码、导入发布、移动、回收及离线导出在线程级使用 `Nice=10` 和 best-effort I/O 优先级 7，避免整个套件降级拖慢元数据同步。
+接口线程保持正常 CPU/I/O 优先级，照片处理、编码、导入发布、移动、回收及离线导出在线程级使用 `Nice=10` 和 best-effort I/O 优先级 7，避免整个套件降级拖慢元数据同步。

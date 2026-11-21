@@ -266,18 +266,8 @@ fn claim_sync(s: &AppState, lib: &str, body: Value, enabled: Option<&str>) -> Re
         s.previews.free_bytes()? > 2 * 1024 * 1024 * 1024,
         "cache disk low"
     );
-    let mut deferred_count = 0;
-    let (id, asset, hash) = loop {
-        if deferred_count >= crate::cache_pipeline::BATCH {
-            return Ok(json!({"task":null}));
-        }
-        let Some(candidate) = claim_pending_scoped(&s.store, lib, worker, batch)? else {
-            return Ok(json!({"task":null}));
-        };
-        if !s.store.defer_cache_for_scan(&s.jobs, lib, &candidate.1)? {
-            break candidate;
-        }
-        deferred_count += 1;
+    let Some((id, asset, hash)) = claim_pending_scoped(&s.store, lib, worker, batch)? else {
+        return Ok(json!({"task":null}));
     };
     let _directory_guard = s.jobs.directory_mutation.read().unwrap();
     let prepared = (|| -> Result<Option<Task>> {
@@ -940,7 +930,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                26
+                27
             );
             let edited: (f64, Option<String>) = db.query_row(
                 "SELECT exposure_ev,recipe FROM photo_edits WHERE asset_id='asset'",
@@ -1093,86 +1083,6 @@ mod tests {
             .lock()?
             .execute("UPDATE catalog_assets SET trashed=1", [])?;
         assert!(claim_pending(&store, "lib", "worker")?.is_none());
-        Ok(())
-    }
-    #[test]
-    fn directory_scan_keeps_ready_photo_remote_lease_until_that_photo_changes() -> Result<()> {
-        let (root, store) = pending_setup()?;
-        let originals = root.path().join("photos");
-        fs::create_dir_all(&originals)?;
-        let jobs = crate::jobs::Jobs::open(&root.path().join("jobs.sqlite"), &originals)?;
-        let folder = jobs.add_folder("lib", ".")?;
-        let source = jobs.root().join("photo.3fr");
-        fs::write(&source, b"original")?;
-        fs::write(jobs.root().join("other.3fr"), b"waiting for index")?;
-        let info = fs::metadata(&source)?;
-        jobs.record_file(
-            &folder.id,
-            source.to_str().unwrap(),
-            info.len() as i64,
-            info.modified()?
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos() as i64,
-            "asset",
-            "hash",
-            None,
-        )?;
-        jobs.enqueue_directory_change(&folder.id, jobs.root(), 0)?;
-        store
-            .lock()?
-            .execute("DELETE FROM catalog_physical_files", [])?;
-        store.lock()?.execute(
-            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'asset','hash','raw_original')",
-            [source.to_str().unwrap()],
-        )?;
-        let (_, asset, _) = claim_pending(&store, "lib", "worker")?.unwrap();
-        assert!(!store.defer_cache_for_scan(&jobs, "lib", &asset)?);
-        let remaining: i64 = store.lock()?.query_row(
-            "SELECT count(*) FROM remote_cache_tasks WHERE completed=0",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(remaining, 1);
-        fs::write(source.with_extension("xmp"), b"new metadata")?;
-        assert!(store.defer_cache_for_scan(&jobs, "lib", &asset)?);
-        let remaining: i64 = store.lock()?.query_row(
-            "SELECT count(*) FROM remote_cache_tasks WHERE completed=0",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(remaining, 0);
-        Ok(())
-    }
-    #[test]
-    fn sibling_scan_revokes_remote_lease_before_encoding_existing_source() -> Result<()> {
-        let (root, store) = pending_setup()?;
-        let originals = root.path().join("photos");
-        fs::create_dir_all(&originals)?;
-        let source = originals.join("photo.3fr");
-        fs::write(&source, b"original")?;
-        let jobs = crate::jobs::Jobs::open(&root.path().join("jobs.sqlite"), &originals)?;
-        let folder = jobs.add_folder("lib", ".")?;
-        let originals = jobs.root().to_path_buf();
-        let source = originals.join("photo.3fr");
-        jobs.enqueue_file_change(&folder.id, &originals.join("photo.heic"), 0)?;
-        store.lock()?.execute(
-            "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,'asset','hash','raw_original')",
-            [source.to_str().unwrap()],
-        )?;
-        let (_, asset, _) = claim_pending(&store, "lib", "worker")?.unwrap();
-        assert!(store.defer_cache_for_scan(&jobs, "lib", &asset)?);
-        let remaining: i64 = store.lock()?.query_row(
-            "SELECT count(*) FROM remote_cache_tasks WHERE completed=0",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(remaining, 0);
-        let attempts: i64 = store.lock()?.query_row(
-            "SELECT attempts FROM media_cache WHERE asset_id='asset'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(attempts, 0);
         Ok(())
     }
     #[test]

@@ -5,7 +5,8 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 #[cfg(test)]
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -318,7 +319,6 @@ fn reconcile(jobs: &Jobs, store: &Store, library: &str, source: &Path) -> Result
             jobs.db.lock().unwrap().execute("UPDATE jobs SET status='cancelled',finished_at=unixepoch(),updated_at=unixepoch() WHERE folder_id IN (SELECT id FROM folders WHERE library_id=?1) AND (scope_path=?2 OR (scope_path>=?3 AND scope_path<?4)) AND status IN ('pending','running')", rusqlite::params![library, text, format!("{text}/"), format!("{text}0")])?;
         }
         store.reconcile_cache()?;
-        crate::sync_navigation::refresh(store, jobs, library)?;
         Ok(())
     })()?;
     Ok(())
@@ -367,6 +367,13 @@ pub(crate) fn initialize(db: &rusqlite::Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS directory_trash_active_library
         ON directory_trash_tasks(library_id) WHERE status IN ('pending','running');",
     )?;
+    if !db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('directory_trash_tasks') WHERE name='plan')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        db.execute("ALTER TABLE directory_trash_tasks ADD COLUMN plan TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -401,8 +408,48 @@ pub(crate) fn get(jobs: &Jobs, library: &str, id: &str) -> Result<TrashTask> {
         .ok_or_else(|| error(404, "Directory deletion task not found"))
 }
 
+fn catalog_plan(store: &Store, library: &str, directory: &Path) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let text = directory.to_str().context("directory path must be UTF-8")?;
+    let mut db = store.read()?;
+    let tx = db.transaction()?;
+    let mut entries = Vec::new();
+    let source = directory.symlink_metadata()?;
+    entries.push(json!([text, source.dev(), source.ino()]));
+    let mut statement = tx.prepare(
+        "SELECT path,content_hash FROM catalog_physical_files WHERE library_id=?1 AND path>=?2 AND path<?3 ORDER BY path",
+    )?;
+    let paths = statement
+        .query_map(
+            rusqlite::params![library, format!("{text}/"), format!("{text}0")],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (path, hash) in paths {
+        let info =
+            fs::symlink_metadata(&path).with_context(|| format!("inspect planned file {path}"))?;
+        ensure!(
+            info.is_file(),
+            "planned file is no longer a regular file: {path}"
+        );
+        entries.push(json!([
+            path,
+            hash,
+            info.dev(),
+            info.ino(),
+            info.len(),
+            info.mtime(),
+            info.mtime_nsec(),
+            info.ctime(),
+            info.ctime_nsec()
+        ]));
+    }
+    Ok(serde_json::to_string(&entries)?)
+}
+
 pub(crate) fn submit(
     jobs: &Jobs,
+    store: &Store,
     library: &str,
     path: &str,
     confirmation: &str,
@@ -440,14 +487,22 @@ pub(crate) fn submit(
             return get(jobs, library, &id);
         }
     }
+    let _guard = jobs.directory_mutation.read().unwrap();
     let source = validate(jobs, library, path, confirmation)?;
     // Require canonical absolute input so retries compare the same persisted request.
     ensure!(
         source.to_str() == Some(path),
         error(422, "Directory path must be canonical and absolute")
     );
+    if jobs.manages_catalog() {
+        ensure!(
+            crate::navigation::registered(&store.read()?, library, &source)?,
+            error(404, "Directory is not registered in this library")
+        );
+    }
+    let plan = catalog_plan(store, library, &source)?;
     let db = jobs.trash_db.lock().unwrap();
-    let inserted = db.execute("INSERT OR IGNORE INTO directory_trash_tasks(id,library_id,path,confirmation,status,phase) VALUES(?1,?2,?3,?4,'pending','waiting')",rusqlite::params![id,library,path,confirmation])?;
+    let inserted = db.execute("INSERT OR IGNORE INTO directory_trash_tasks(id,library_id,path,confirmation,status,phase,plan) VALUES(?1,?2,?3,?4,'pending','waiting',?5)",rusqlite::params![id,library,path,confirmation,plan])?;
     drop(db);
     if inserted == 0 {
         if let Ok(existing) = get(jobs, library, &id) {
@@ -515,7 +570,17 @@ fn process(
     match current.phase.as_str() {
         "waiting" => {
             let source = validate(jobs, library, &current.path, confirmation)?;
+            let stored: Option<String> = jobs.trash_db.lock().unwrap().query_row(
+                "SELECT plan FROM directory_trash_tasks WHERE id=?",
+                [&current.id],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                stored.as_deref() == Some(catalog_plan(store, library, &source)?.as_str()),
+                error(409, "目录或计划内文件已变化，请重新确认回收")
+            );
             let share = recycle_share(&config()?, &source)?;
+            store.note_revision_activity(library, &current.id, &current.path)?;
             transition(jobs, &current.id, "recycling", None)?;
             native_error = recycle(&share, &source).err().map(|e| {
                 format!("{e:#}. Check NAS recycle bin for any partially processed contents")
@@ -536,6 +601,7 @@ fn process(
     reconcile(jobs, store, library, source).context(
         "NAS recycling may have completed; catalog reconciliation failed. Inspect NAS recycle bin",
     )?;
+    store.finish_revision_batch(&current.id, false)?;
     transition(
         jobs,
         &current.id,
@@ -554,6 +620,7 @@ pub fn interrupt_pending(jobs: &Jobs, store: &Store) -> Result<()> {
         if phase != "waiting" {
             reconcile(jobs, store, &library, Path::new(&path))?;
         }
+        store.finish_revision_batch(&id, false)?;
         jobs.trash_db.lock().unwrap().execute("UPDATE directory_trash_tasks SET status='failed',phase=CASE WHEN phase='waiting' THEN 'waiting' ELSE 'failed' END,error=coalesce(error||char(10),'')||'服务已重启，回收任务已中断；请检查原目录与 NAS 回收站后手动重试。',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [&id])?;
     }
     Ok(())
@@ -638,23 +705,63 @@ mod tests {
     }
 
     #[test]
+    fn changed_registered_file_requires_new_folder_confirmation() -> Result<()> {
+        let (_tmp, jobs, store, config) = setup();
+        let source = jobs.root().join("folder");
+        fs::create_dir(&source)?;
+        let original = source.join("a.jpg");
+        fs::write(&original, b"original")?;
+        store.ingest_original("lib",original.to_str().unwrap(),
+            &json!({"contentHash":"fixture","sizeBytes":8,"role":"jpeg_original"}),
+            &json!({"originalFilename":"a.jpg","contentFingerprint":"fixture","metadataFingerprint":"fixture","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z","rating":0,"flagState":"unflagged","tags":[]}),
+        )?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let queued = submit(
+            &jobs,
+            &store,
+            "lib",
+            source.to_str().unwrap(),
+            "folder",
+            &id,
+        )?;
+        fs::rename(&original, source.join("kept.jpg"))?;
+        fs::write(&original, b"replacement")?;
+        let error = process(
+            &jobs,
+            &store,
+            "lib",
+            &queued,
+            "folder",
+            || Ok(config),
+            |_, _| panic!("changed plan must never call DSM"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("请重新确认"));
+        assert_eq!(fs::read(source.join("kept.jpg"))?, b"original");
+        assert_eq!(fs::read(original)?, b"replacement");
+        assert_eq!(store.counts("lib", false)?["all"], 1);
+        Ok(())
+    }
+
+    #[test]
     fn async_request_is_durable_idempotent_and_excludes_another_active_task() -> Result<()> {
         let (tmp, jobs, store, config) = setup();
         let source = jobs.root().join("folder");
         fs::create_dir(&source)?;
         let path = source.to_str().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let queued = submit(&jobs, "lib", path, "folder", &id)?;
+        let queued = submit(&jobs, &store, "lib", path, "folder", &id)?;
         assert_eq!(
             (queued.status.as_str(), queued.phase.as_str()),
             ("pending", "waiting")
         );
-        assert_eq!(submit(&jobs, "lib", path, "folder", &id)?.id, id);
-        assert!(submit(&jobs, "lib", path, "folder ", &id).is_err());
-        assert!(submit(&jobs, "other", path, "folder", &id).is_err());
+        assert_eq!(submit(&jobs, &store, "lib", path, "folder", &id)?.id, id);
+        assert!(submit(&jobs, &store, "lib", path, "folder ", &id).is_err());
+        assert!(submit(&jobs, &store, "other", path, "folder", &id).is_err());
         assert!(
             submit(
                 &jobs,
+                &store,
                 "lib",
                 path,
                 "folder",
@@ -683,7 +790,7 @@ mod tests {
         assert!(completed.finished_at.is_some());
         assert!(!source.exists());
         assert_eq!(
-            submit(&jobs, "lib", path, "folder", &id)?.status,
+            submit(&jobs, &store, "lib", path, "folder", &id)?.status,
             "completed"
         );
         Ok(())
@@ -696,7 +803,14 @@ mod tests {
             let source = jobs.root().join("folder");
             fs::create_dir(&source)?;
             let id = uuid::Uuid::new_v4().to_string();
-            submit(&jobs, "lib", source.to_str().unwrap(), "folder", &id)?;
+            submit(
+                &jobs,
+                &store,
+                "lib",
+                source.to_str().unwrap(),
+                "folder",
+                &id,
+            )?;
             transition(&jobs, &id, "recycling", None)?;
             if disappeared {
                 fs::rename(&source, jobs.root().join("#recycle/folder"))?;
@@ -731,7 +845,14 @@ mod tests {
         let source = jobs.root().join("folder");
         fs::create_dir(&source)?;
         let id = uuid::Uuid::new_v4().to_string();
-        submit(&jobs, "lib", source.to_str().unwrap(), "folder", &id)?;
+        submit(
+            &jobs,
+            &store,
+            "lib",
+            source.to_str().unwrap(),
+            "folder",
+            &id,
+        )?;
         transition(&jobs, &id, "reconciling", Some("partial native failure"))?;
         process(
             &jobs,
@@ -750,11 +871,18 @@ mod tests {
 
     #[test]
     fn status_does_not_wait_for_directory_lock_or_scan_database_transaction() -> Result<()> {
-        let (_tmp, jobs, _store, _) = setup();
+        let (_tmp, jobs, store, _) = setup();
         let source = jobs.root().join("folder");
         fs::create_dir(&source)?;
         let id = uuid::Uuid::new_v4().to_string();
-        submit(&jobs, "lib", source.to_str().unwrap(), "folder", &id)?;
+        submit(
+            &jobs,
+            &store,
+            "lib",
+            source.to_str().unwrap(),
+            "folder",
+            &id,
+        )?;
         let _guard = jobs.directory_mutation.write().unwrap();
         let db = jobs.db.lock().unwrap();
         db.execute_batch("BEGIN IMMEDIATE; UPDATE folders SET active=active")?;
@@ -1000,10 +1128,17 @@ mod tests {
         let (_tmp, jobs, store, config) = setup();
         let source = jobs.root().join("folder");
         fs::create_dir(&source)?;
-        crate::sync_navigation::refresh(&store, &jobs, "lib")?;
+        crate::navigation::fixture_directories(&store, &jobs, "lib")?;
         let id = uuid::Uuid::new_v4().to_string();
-        submit(&jobs, "lib", source.to_str().unwrap(), "folder", &id)?;
-        store.lock()?.execute_batch("CREATE TRIGGER fail_navigation BEFORE INSERT ON catalog_sync_navigation BEGIN SELECT RAISE(ABORT,'fixture projection failure'); END;")?;
+        submit(
+            &jobs,
+            &store,
+            "lib",
+            source.to_str().unwrap(),
+            "folder",
+            &id,
+        )?;
+        store.lock()?.execute_batch("CREATE TRIGGER fail_navigation BEFORE DELETE ON directories BEGIN SELECT RAISE(ABORT,'fixture projection failure'); END;")?;
         let failure = process(
             &jobs,
             &store,
@@ -1021,7 +1156,14 @@ mod tests {
         store
             .lock()?
             .execute_batch("DROP TRIGGER fail_navigation")?;
-        submit(&jobs, "lib", source.to_str().unwrap(), "folder", &id)?;
+        submit(
+            &jobs,
+            &store,
+            "lib",
+            source.to_str().unwrap(),
+            "folder",
+            &id,
+        )?;
         process(
             &jobs,
             &store,
@@ -1033,8 +1175,14 @@ mod tests {
         )?;
         ensure_reconciled(&jobs)?;
         assert!(
-            !crate::sync_navigation::pages(&store.read()?, "lib")?
-                .contains_key(source.to_str().unwrap())
+            !crate::navigation::pages(
+                &store.read()?,
+                "lib",
+                jobs.root(),
+                &crate::navigation::roots(&store.read()?, "lib")?,
+                &Default::default()
+            )?
+            .contains_key(source.to_str().unwrap())
         );
         assert!(
             get(&jobs, "lib", &id)?
