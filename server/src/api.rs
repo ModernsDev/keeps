@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{previews::PreviewStorage, store::Store};
+use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
@@ -261,7 +262,14 @@ where
 {
     blocking(move || crate::database::interactive(operation)).await
 }
-fn signed_asset(state: &AppState, mut asset: Value) -> anyhow::Result<Value> {
+fn signed_asset(state: &AppState, asset: Value) -> anyhow::Result<Value> {
+    let media = match asset["id"].as_str() {
+        Some(id) => state.store.media_snapshot(&state.library_id, id)?,
+        None => Value::Null,
+    };
+    sign_asset_media(state, asset, media)
+}
+fn sign_asset_media(state: &AppState, mut asset: Value, media: Value) -> anyhow::Result<Value> {
     let preview = asset
         .as_object_mut()
         .and_then(|a| a.remove("_preview"))
@@ -272,7 +280,6 @@ fn signed_asset(state: &AppState, mut asset: Value) -> anyhow::Result<Value> {
         json!({"downloadURL":state.previews.download_url(&preview["objectRef"])?,"width":preview["width"],"height":preview["height"],"version":preview["version"]})
     };
     if let Some(id) = asset["id"].as_str().map(str::to_owned) {
-        let media = state.store.media_snapshot(&state.library_id, &id)?;
         asset["negativeContentHash"] = media["negativeContentHash"].clone();
         if !media["thumbnail"].is_null() {
             let d = &media["thumbnail"];
@@ -304,9 +311,13 @@ async fn assets(
             if let Some(id) = &query.folder_id {
                 query.directory = Some(folder_for(&state, &library, id)?.path);
             }
-            let mut page = state.store.query_assets(&library, &query)?;
+            let mut page = state.store.query_assets_with_media(&library, &query)?;
             for asset in page["items"].as_array_mut().expect("catalog page") {
-                *asset = signed_asset(&state, asset.take())?;
+                let media = asset
+                    .as_object_mut()
+                    .and_then(|a| a.remove("_media"))
+                    .context("missing media snapshot in catalog page")?;
+                *asset = sign_asset_media(&state, asset.take(), media)?;
             }
             Ok(page)
         })
