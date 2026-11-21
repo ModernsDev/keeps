@@ -142,9 +142,6 @@ pub(crate) fn tracking(
             destination,
         )?;
     }
-    if legacy && (Path::new(source).is_file() || Path::new(destination).is_file()) {
-        db.execute("UPDATE files SET folder_id=(SELECT id FROM folders WHERE library_id=?1 AND active=1 AND (?2>=path || '/' AND ?2<path || '0') ORDER BY length(path) DESC LIMIT 1) WHERE path=?2 AND folder_id IN (SELECT id FROM folders WHERE library_id=?1)",params![library,destination])?;
-    }
     db.execute("UPDATE jobs SET checkpoint=NULL WHERE folder_id IN (SELECT id FROM folders WHERE library_id=?1) AND status IN ('pending','running')",[library])?;
     rewrite(
         db,
