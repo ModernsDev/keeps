@@ -20,10 +20,12 @@ fn state(root: &Path) -> Arc<AppState> {
     let keeps = root.join("keeps");
     let previews =
         PreviewStorage::new(&keeps, Some(&originals), "http://localhost", SIGNING_KEY).unwrap();
-    let store = Store::open(&keeps.join("db/control_plane.sqlite"), true).unwrap();
-    let jobs = Arc::new(Jobs::open(&keeps.join("db/jobs.sqlite"), &originals).unwrap());
+    let store = Arc::new(Store::open(&keeps.join("db/control_plane.sqlite"), true).unwrap());
+    let jobs = Arc::new(
+        Jobs::open_managed(&keeps.join("db/jobs.sqlite"), &originals, store.clone()).unwrap(),
+    );
     Arc::new(AppState {
-        store: Arc::new(store),
+        store,
         previews: Arc::new(previews),
         jobs,
         access_token: SIGNING_KEY.into(),
@@ -294,18 +296,27 @@ async fn folders_jobs_are_library_scoped_and_removal_keeps_originals() {
     let (_, folders) = call(app.clone(), "GET", "/libraries/photos/folders", Value::Null).await;
     assert_eq!(folders["folders"][0]["id"], id);
     assert!(folders["rootPath"].as_str().unwrap().ends_with("originals"));
-    let (status, scan) = call(
+    let (status, _) = call(
         app.clone(),
         "POST",
         &format!("/libraries/photos/folders/{id}/scan"),
         Value::Null,
     )
     .await;
-    assert!(status.is_success(), "{scan}");
-    assert_eq!(scan["folderID"], id);
-    assert_eq!(scan["libraryID"], "photos");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/libraries/photos/directories/refresh",
+            json!({"path":state.jobs.root()}),
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
     let (_, jobs) = call(app.clone(), "GET", "/libraries/photos/jobs", Value::Null).await;
-    assert_eq!(jobs["jobs"][0]["id"], scan["id"]);
+    assert_eq!(jobs["jobs"], json!([]));
     assert_eq!(
         call(app.clone(), "GET", "/libraries/other/jobs", Value::Null)
             .await
@@ -331,7 +342,6 @@ async fn folders_jobs_are_library_scoped_and_removal_keeps_originals() {
     )
     .await;
     assert!(status.is_success());
-    assert_eq!(state.jobs.jobs(1).unwrap()[0].status, "cancelled");
     assert_eq!(
         std::fs::read(dir.path().join("originals/photo.jpg")).unwrap(),
         b"original bytes"
@@ -407,6 +417,12 @@ async fn navigation_lists_empty_and_intermediate_directories_without_indexed_ass
     }
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("middle"), root.join("linked")).unwrap();
+    for name in ["empty", "middle/leaf"] {
+        state
+            .store
+            .initialize_original_root("photos", &root.join(name))
+            .unwrap();
+    }
     state
         .jobs
         .add_folder("photos", root.to_str().unwrap())
@@ -450,6 +466,12 @@ async fn navigation_enforces_active_library_roots_and_rejects_escape_and_symlink
     for name in ["a/nested", "b", "inactive"] {
         std::fs::create_dir_all(root.join(name)).unwrap();
     }
+    for name in ["a/nested", "inactive"] {
+        state
+            .store
+            .initialize_original_root("photos", &root.join(name))
+            .unwrap();
+    }
     state
         .jobs
         .add_folder("photos", root.join("a").to_str().unwrap())
@@ -457,6 +479,10 @@ async fn navigation_enforces_active_library_roots_and_rejects_escape_and_symlink
     state
         .jobs
         .add_folder("photos", root.join("a/nested").to_str().unwrap())
+        .unwrap();
+    state
+        .store
+        .initialize_original_root("other", &root.join("b"))
         .unwrap();
     state
         .jobs
@@ -496,7 +522,7 @@ async fn navigation_enforces_active_library_roots_and_rejects_escape_and_symlink
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(root.join("b"), root.join("a/link")).unwrap();
-        denied.push((root.join("a/link"), StatusCode::UNPROCESSABLE_ENTITY));
+        denied.push((root.join("a/link"), StatusCode::NOT_FOUND));
     }
     for (path, expected) in denied {
         let query = url::form_urlencoded::Serializer::new(String::new())
@@ -520,6 +546,12 @@ async fn navigation_photo_counts_are_distinct_recursive_live_catalog_counts() {
     let root = state.jobs.root();
     for name in ["foo/年份", "Foo", "foobar", "empty", "旅行_%"] {
         std::fs::create_dir_all(root.join(name)).unwrap();
+    }
+    for name in ["foo/年份", "Foo", "foobar", "empty", "旅行_%"] {
+        state
+            .store
+            .initialize_original_root("photos", &root.join(name))
+            .unwrap();
     }
     state
         .jobs
@@ -1346,7 +1378,15 @@ async fn imports_flatten_grouped_files_verify_and_publish_only_on_finish() {
     let state = state(dir.path());
     state.jobs.add_folder("photos", ".").unwrap();
     let root = state.jobs.root().to_path_buf();
-    std::fs::write(root.join("IMG.CR3"), b"existing").unwrap();
+    let existing = root.join("IMG.CR3");
+    std::fs::write(&existing, b"existing").unwrap();
+    let digest = format!("{:x}", Sha256::digest(b"existing"));
+    state.store.ingest_original(
+        "photos",
+        existing.to_str().unwrap(),
+        &json!({"contentHash":digest,"sizeBytes":8,"role":"raw_original"}),
+        &json!({"originalFilename":"IMG.CR3","contentFingerprint":digest,"metadataFingerprint":"fixture","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z","rating":0,"flagState":"unflagged","tags":[]}),
+    ).unwrap();
     let app = router(state.clone());
     let batch = uuid::Uuid::new_v4().to_string().to_uppercase();
     let paths = [
@@ -1472,7 +1512,12 @@ async fn imports_flatten_grouped_files_verify_and_publish_only_on_finish() {
             .0,
         StatusCode::CONFLICT
     );
-    let reopened = Jobs::open(&dir.path().join("keeps/db/jobs.sqlite"), &root).unwrap();
+    let reopened = Jobs::open_managed(
+        &dir.path().join("keeps/db/jobs.sqlite"),
+        &root,
+        state.store.clone(),
+    )
+    .unwrap();
     assert!(
         reopened
             .job(completed.1["job"]["id"].as_str().unwrap())
@@ -1641,6 +1686,14 @@ async fn create_directory_rejects_invalid_names_and_untracked_parents() {
     let root = state.jobs.root().to_path_buf();
     std::fs::create_dir(root.join("tracked")).unwrap();
     std::fs::create_dir(root.join("other")).unwrap();
+    state
+        .store
+        .initialize_original_root("photos", &root.join("tracked"))
+        .unwrap();
+    state
+        .store
+        .initialize_original_root("another-library", &root.join("other"))
+        .unwrap();
     state.jobs.add_folder("photos", "tracked").unwrap();
     state.jobs.add_folder("another-library", "other").unwrap();
     let app = router(state);
@@ -2212,7 +2265,7 @@ async fn task_summary_is_scoped_and_cache_rebuild_queues_manual_photo_work() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["requeued"], 1);
-    let job = state.jobs.claim_class("manual").unwrap().unwrap();
+    let job = state.jobs.claim_photo_processing().unwrap().unwrap();
     assert_eq!(job.folder_id, folder.id);
     assert!(!job.refresh_metadata);
     assert!(job.rebuild_media);
@@ -2271,6 +2324,10 @@ async fn directory_trash_returns_durable_task_and_status_without_running_native_
         .unwrap();
     let source = state.jobs.root().join("folder");
     std::fs::create_dir(&source).unwrap();
+    state
+        .store
+        .initialize_original_root("photos", &source)
+        .unwrap();
     let app = router(state);
     let id = uuid::Uuid::new_v4().to_string();
     let route = "/libraries/photos/directories/trash";
@@ -2323,6 +2380,10 @@ async fn directory_rename_accepts_name_and_rejects_reused_request_for_another_na
     let source = state.jobs.root().join("old");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("photo.raw"), b"original").unwrap();
+    state
+        .store
+        .initialize_original_root("photos", &source)
+        .unwrap();
     let app = router(state.clone());
     let id = uuid::Uuid::new_v4().to_string();
     let body = json!({"path":source,"parentPath":state.jobs.root(),"name":"new","requestID":id});
@@ -2384,6 +2445,14 @@ async fn directory_move_tasks_return_durable_progress_and_keep_sync_endpoint() {
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&parent).unwrap();
     let id = uuid::Uuid::new_v4().to_string();
+    state
+        .store
+        .initialize_original_root("photos", &source)
+        .unwrap();
+    state
+        .store
+        .initialize_original_root("photos", &parent)
+        .unwrap();
     let app = router(state.clone());
     let body = json!({"path":source,"parentPath":parent,"requestID":id});
     let (status, task) = call(
@@ -2420,6 +2489,10 @@ async fn directory_move_tasks_return_durable_progress_and_keep_sync_endpoint() {
     );
     let sync = state.jobs.root().join("legacy");
     std::fs::create_dir(&sync).unwrap();
+    state
+        .store
+        .initialize_original_root("photos", &sync)
+        .unwrap();
     let (status, result) = call(
         app,
         "POST",
@@ -2873,109 +2946,6 @@ async fn rejected_trash_requires_auth_frozen_inventory_and_matching_count() {
         StatusCode::CONFLICT
     );
     assert!(dir.path().join("originals/rejected.jpg").exists());
-}
-
-#[tokio::test]
-async fn directory_metadata_refresh_is_recursive_manual_durable_and_scoped() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = state(dir.path());
-    let root = state.jobs.root().to_path_buf();
-    std::fs::create_dir_all(root.join("tracked/sub/nested")).unwrap();
-    std::fs::create_dir(root.join("untracked")).unwrap();
-    let folder = state.jobs.add_folder("photos", "tracked").unwrap();
-    let app = router(state.clone());
-    let endpoint = "/libraries/photos/directories/refresh";
-    let path = root.join("tracked/sub");
-    let (status, job) = call(app.clone(), "POST", endpoint, json!({"path":path})).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
-    assert_eq!(job["folderID"], folder.id);
-    assert_eq!(job["path"], path.to_str().unwrap());
-    assert_eq!(job["scopeKind"], "recursive");
-    assert_eq!(job["workClass"], "manual");
-    assert_eq!(job["refreshMetadata"], false);
-    assert_eq!(job["rebuildMedia"], false);
-    assert_eq!(job["pathSync"], false);
-    assert_eq!(job["waitForQuiet"], false);
-    assert_eq!(job["status"], "pending");
-    let (_, repeated) = call(app.clone(), "POST", endpoint, json!({"path":path})).await;
-    assert_eq!(repeated["id"], job["id"]);
-    let (status, forced) = call(
-        app.clone(),
-        "POST",
-        endpoint,
-        json!({"path":path,"override":true}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(forced["id"], job["id"]);
-    assert_eq!(forced["refreshMetadata"], true);
-    assert_eq!(forced["rebuildMedia"], false);
-
-    let (_, summary) = call(
-        app.clone(),
-        "GET",
-        "/libraries/photos/task-status",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(summary["longTask"]["kind"], "manual");
-    assert_eq!(summary["longTask"]["path"], path.to_str().unwrap());
-    assert_eq!(summary["longTask"]["processed"], 0);
-    assert_eq!(summary["longTask"]["failed"], 0);
-    assert_eq!(
-        call(
-            app.clone(),
-            "POST",
-            endpoint,
-            json!({"path":root.join("untracked")})
-        )
-        .await
-        .0,
-        StatusCode::NOT_FOUND
-    );
-    for rejected in [
-        root.join("tracked/missing"),
-        root.join("tracked/../untracked"),
-        dir.path().to_path_buf(),
-    ] {
-        assert_eq!(
-            call(app.clone(), "POST", endpoint, json!({"path":rejected}))
-                .await
-                .0,
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-    }
-    let claimed = state.jobs.claim_class("manual").unwrap().unwrap();
-    let current = path.join("nested/photo.jpg");
-    state
-        .jobs
-        .update_progress(&claimed.id, 7, 0, 2, current.to_str())
-        .unwrap();
-    keeps_server::tasks::begin(&state.jobs, "photos", "manual", current.to_str()).unwrap();
-    let (_, running) = call(
-        app.clone(),
-        "GET",
-        "/libraries/photos/task-status",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(running["longTask"]["status"], "running");
-    assert_eq!(running["longTask"]["path"], path.to_str().unwrap());
-    assert_eq!(
-        running["longTask"]["currentPhoto"],
-        current.to_str().unwrap()
-    );
-    assert_eq!(running["longTask"]["processed"], 7);
-    assert_eq!(running["longTask"]["failed"], 2);
-    state.jobs.remove_folder(&folder.id).unwrap();
-    assert_eq!(
-        call(app, "POST", endpoint, json!({"path":path})).await.0,
-        StatusCode::NOT_FOUND
-    );
-    let reopened = Jobs::open(&dir.path().join("keeps/db/jobs.sqlite"), &root).unwrap();
-    let saved = reopened.job(job["id"].as_str().unwrap()).unwrap().unwrap();
-    assert!(saved.refresh_metadata);
-    assert_eq!(saved.path, path.to_str().unwrap());
 }
 
 #[tokio::test]

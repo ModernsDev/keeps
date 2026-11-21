@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use keeps_server::{
     api::{AppState, router},
     jobs::Jobs,
@@ -8,7 +8,7 @@ use keeps_server::{
 };
 use std::{
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,18 +24,47 @@ async fn main() -> Result<()> {
         )
         .init();
     let root = PathBuf::from(env::var("KEEPS_ROOT").context("KEEPS_ROOT is required")?);
-    let migrate = match env::args().nth(1).as_deref() {
-        None => false,
-        Some("migrate") => true,
-        Some(other) => bail!("unknown command {other}; use keeps-server [migrate]"),
-    };
+    let mut arguments = env::args_os().skip(1);
+    let command = arguments.next();
+    let command = command.as_deref().and_then(std::ffi::OsStr::to_str);
+    ensure!(
+        matches!(command, None | Some("migrate" | "register-restored")),
+        "unknown command {command:?}; use keeps-server [migrate|register-restored]"
+    );
+    let _state_lock = lock_state(&root)?;
     let database = root.join("db/control_plane.sqlite");
-    if migrate {
-        Store::open(&database, true)?;
+    if command == Some("migrate") {
+        let store = Store::open(&database, true)?;
+        let manifests = arguments.map(PathBuf::from).collect::<Vec<_>>();
+        if store.require_directory_inventory().is_err() {
+            let original = PathBuf::from(
+                env::var("ORIGINAL_ROOT")
+                    .context("ORIGINAL_ROOT is required for directory inventory")?,
+            );
+            let jobs = Jobs::open(&root.join("db/jobs.sqlite"), &original)?;
+            store.install_directory_inventory(&jobs, &manifests)?;
+            jobs.retire_legacy_scan_tasks()?;
+            drop(jobs);
+        }
+        store.require_directory_inventory()?;
+        let tasks = root.join("db/jobs.sqlite");
+        if tasks.try_exists()? {
+            Jobs::migrate_tracking(&tasks, &store)?;
+        }
         tracing::info!("database migration complete");
         return Ok(());
     }
     let original = PathBuf::from(env::var("ORIGINAL_ROOT").context("ORIGINAL_ROOT is required")?);
+    if command == Some("register-restored") {
+        let store = Arc::new(Store::open(&database, false)?);
+        store.require_directory_inventory()?;
+        let jobs = Jobs::open_managed(&root.join("db/jobs.sqlite"), &original, store.clone())?;
+        let library = arguments.next().context("provide the library ID")?;
+        let library = library.to_str().context("library ID must be UTF-8")?;
+        let paths = arguments.map(PathBuf::from).collect::<Vec<_>>();
+        keeps_server::restore::register(&jobs, &store, library, &paths)?;
+        return Ok(());
+    }
     let access_token = env::var("KEEPS_ACCESS_TOKEN").context("KEEPS_ACCESS_TOKEN is required")?;
     if access_token.len() < 32 {
         bail!("KEEPS_ACCESS_TOKEN must be at least 32 bytes");
@@ -54,14 +83,17 @@ async fn main() -> Result<()> {
         Ok(_) => bail!("CONTROL_PLANE_AUTO_CREATE_SCHEMA must be 0 or 1"),
     };
     let store = Arc::new(Store::open(&database, auto_create)?);
-    let jobs = Arc::new(Jobs::open(&root.join("db/jobs.sqlite"), &original)?);
-    let cancelled = jobs.cancel_automatic_scans()?;
+    store.require_directory_inventory()?;
+    let jobs = Arc::new(Jobs::open_managed(
+        &root.join("db/jobs.sqlite"),
+        &original,
+        store.clone(),
+    )?);
+    let cancelled = jobs.retire_legacy_scan_tasks()?;
     if cancelled > 0 {
-        tracing::info!(
-            cancelled,
-            "cancelled automatic scans; scans require an explicit request"
-        );
+        tracing::info!(cancelled, "retired legacy directory scan tasks");
     }
+    keeps_server::navigation::recover_creations(&store, &jobs)?;
     keeps_server::directory_move::recover(&jobs, &store)?;
     keeps_server::directory_move::interrupt_pending(&jobs)?;
     keeps_server::imports::interrupt_pending(&jobs)?;
@@ -83,15 +115,6 @@ async fn main() -> Result<()> {
         if jobs.folders()?.iter().all(|f| f.library_id != library) {
             jobs.add_folder(&library, ".")?;
         }
-    }
-    for library in jobs
-        .folders()?
-        .into_iter()
-        .map(|folder| folder.library_id)
-        .chain(std::iter::once(library_id.clone()))
-        .collect::<std::collections::BTreeSet<_>>()
-    {
-        keeps_server::sync_navigation::refresh(&store, &jobs, &library)?;
     }
     MediaProcessor::new().probe().context("NAS media runtime")?;
     let address = env::var("KEEPS_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:2283".into());
@@ -150,6 +173,23 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+fn lock_state(root: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let state = root.join("db");
+    std::fs::create_dir_all(&state)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("keeps.lock"))?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Keeps state is in use; stop the service before maintenance");
+    }
+    Ok(file)
+}
+
 async fn shutdown() {
     #[cfg(unix)]
     {

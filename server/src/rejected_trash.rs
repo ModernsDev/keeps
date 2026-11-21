@@ -142,6 +142,28 @@ fn validate_paths(jobs: &Jobs, library: &str, paths: &BTreeSet<PathBuf>) -> Resu
     }
     Ok(())
 }
+fn registered_sidecar(paths: &BTreeSet<PathBuf>, sidecar: &Path) -> Result<bool> {
+    if paths.contains(sidecar) {
+        return Ok(true);
+    }
+    let actual = sidecar.symlink_metadata()?;
+    for expected in paths {
+        let same_name = expected.parent() == sidecar.parent()
+            && expected
+                .file_name()
+                .and_then(|s| s.to_str())
+                .zip(sidecar.file_name().and_then(|s| s.to_str()))
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right));
+        if same_name {
+            let metadata = expected.symlink_metadata()?;
+            if actual.dev() == metadata.dev() && actual.ino() == metadata.ino() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 fn inventory(jobs: &Jobs, store: &Store, library: &str) -> Result<Plan> {
     inventory_scope(jobs, store, library, false, None)
@@ -158,12 +180,20 @@ fn inventory_scope(
         let assets=db.prepare("SELECT id FROM catalog_assets a WHERE library_id=?1 AND ((?2=0 AND flag='rejected' AND trashed=0) OR (?2=1 AND trashed=1 AND (?3 IS NULL OR EXISTS(SELECT 1 FROM catalog_trash_entries t WHERE t.library_id=a.library_id AND t.asset_id=a.id AND t.trashed_at<=?3)))) AND (?2=1 OR EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id)) ORDER BY id")?
             .query_map(params![library,keeps_trash,cutoff],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut originals = BTreeMap::new();
-        let mut query=db.prepare("SELECT path FROM catalog_physical_files WHERE library_id=?1 AND asset_id=?2 UNION SELECT path FROM catalog_version_path_history WHERE library_id=?1 AND asset_id=?2 AND ?3=1 AND NOT EXISTS(SELECT 1 FROM catalog_physical_files p WHERE p.library_id=?1 AND p.path=catalog_version_path_history.path)")?;
+        let mut query=db.prepare("SELECT path,role,1 FROM catalog_physical_files WHERE library_id=?1 AND asset_id=?2
+            UNION ALL SELECT h.path,'',0 FROM catalog_version_path_history h WHERE h.library_id=?1 AND h.asset_id=?2 AND ?3=1
+            AND NOT EXISTS(SELECT 1 FROM catalog_physical_files p WHERE p.library_id=?1 AND p.path=h.path)")?;
         for id in &assets {
             originals.insert(
                 id.clone(),
                 query
-                    .query_map(params![library, id, keeps_trash], |r| r.get::<_, String>(0))?
+                    .query_map(params![library, id, keeps_trash], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, bool>(2)?,
+                        ))
+                    })?
                     .collect::<rusqlite::Result<Vec<_>>>()?,
             );
         }
@@ -171,27 +201,40 @@ fn inventory_scope(
     };
     let mut paths = BTreeSet::new();
     let mut asset_files = BTreeMap::new();
-    for (id, originals) in originals {
-        let mut files = BTreeSet::new();
-        let mut associated = BTreeSet::new();
-        for original in originals {
-            let path = PathBuf::from(original);
-            associated.insert(path.clone());
-            if !keeps_trash || path.try_exists()? {
-                files.insert(path.clone());
+    for (id, entries) in originals {
+        let current = entries
+            .iter()
+            .filter(|(_, _, active)| *active)
+            .map(|(path, _, _)| PathBuf::from(path))
+            .collect::<BTreeSet<_>>();
+        for (path, role, active) in entries {
+            let path = PathBuf::from(path);
+            if !active {
+                ensure!(
+                    !path.try_exists()?,
+                    error(
+                        409,
+                        format!("发现未登记的恢复文件，请先停服核对：{}", path.display())
+                    )
+                );
+                continue;
             }
-            if crate::media::is_photo(&path) || crate::media::is_video(&path) {
+            if role != "sidecar" {
                 for sidecar in crate::media::sidecars(&path)? {
-                    files.insert(sidecar.canonicalize()?);
+                    ensure!(
+                        registered_sidecar(&current, &sidecar)?,
+                        error(
+                            409,
+                            format!("发现未登记的 XMP，请先核对：{}", sidecar.display())
+                        )
+                    );
                 }
             }
+            paths.insert(path);
         }
-        associated.extend(files.iter().cloned());
-        validate_paths(jobs, library, &associated)?;
-        paths.extend(files.iter().cloned());
         asset_files.insert(
             id,
-            associated
+            current
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
@@ -219,34 +262,17 @@ fn validate_ownership(
     assets: &[String],
     paths: &BTreeSet<PathBuf>,
 ) -> Result<()> {
-    // Stem-based sidecars can also belong to a retained or not-yet-indexed photo.
-    let sidecars: HashSet<_> = paths
+    let sidecars = paths
         .iter()
         .filter(|p| p.extension().is_some_and(|s| s.eq_ignore_ascii_case("xmp")))
+        .cloned()
         .collect();
-    for parent in paths
-        .iter()
-        .filter_map(|p| p.parent())
-        .collect::<BTreeSet<_>>()
-    {
-        for entry in fs::read_dir(parent)? {
-            let path = entry?.path();
-            if paths.contains(&path)
-                || !path.is_file()
-                || !(crate::media::is_photo(&path) || crate::media::is_video(&path))
-            {
-                continue;
-            }
-            ensure!(
-                !crate::media::sidecars(&path)?
-                    .iter()
-                    .any(|p| p.canonicalize().is_ok_and(|p| sidecars.contains(&p))),
-                error(409, "弃用照片与保留照片共用 XMP 文件，请先整理关联关系")
-            );
-        }
-    }
     let selected: HashSet<_> = assets.iter().collect();
     let db = store.lock()?;
+    ensure!(
+        !crate::physical_files::shared_sidecar(&db, library, paths, &sidecars)?,
+        error(409, "弃用照片与保留照片共用 XMP 文件，请先整理关联关系")
+    );
     let libraries = db
         .prepare("SELECT DISTINCT library_id FROM catalog_assets")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -334,11 +360,13 @@ fn reconcile(
             .get(..task.completed_files)
             .context("回收任务进度无效")?;
         versions::withdraw_recycled_paths(store, library, &plan.versions, recycled)?;
-        for file in recycled {
-            jobs.db.lock().unwrap().execute(
-                "DELETE FROM files WHERE path=?1 AND folder_id IN (SELECT id FROM folders WHERE library_id=?2)",
-                params![file.path, library],
-            )?;
+        if !jobs.manages_catalog() {
+            for file in recycled {
+                jobs.db.lock().unwrap().execute(
+                    "DELETE FROM files WHERE path=?1 AND folder_id IN (SELECT id FROM folders WHERE library_id=?2)",
+                    params![file.path, library],
+                )?;
+            }
         }
         store.reconcile_cache()?;
         return Ok(Vec::new());
@@ -351,7 +379,7 @@ fn reconcile(
     for path in paths {
         jobs.validate_scan_path(Path::new(&path), "file")?;
         store.mark_missing_scope_with_revision(library, &path, "file", None)?;
-        if !Path::new(&path).try_exists()? {
+        if !jobs.manages_catalog() && !Path::new(&path).try_exists()? {
             jobs.db.lock().unwrap().execute("DELETE FROM files WHERE path=?1 AND folder_id IN (SELECT id FROM folders WHERE library_id=?2)",params![path,library])?;
         }
     }
@@ -847,6 +875,19 @@ async fn status_api(
 mod tests {
     use super::*;
     use serde_json::json;
+    fn retained_with_shared_sidecar(store: &Store, path: &Path) -> Result<()> {
+        let independent = path.with_file_name("retained.CR3");
+        let shared = path.with_extension("CR3");
+        let id = photo(store, &independent, "retained", None)?;
+        store.patch_asset("lib", &id, &json!({"flagState":"picked"}))?;
+        fs::rename(&independent, &shared)?;
+        store.lock()?.execute(
+            "UPDATE catalog_physical_files SET path=? WHERE library_id='lib' AND path=?",
+            params![shared.to_str(), independent.to_str()],
+        )?;
+        Ok(())
+    }
+
     fn preview_storage(jobs: &Jobs) -> Result<crate::previews::PreviewStorage> {
         crate::previews::PreviewStorage::new(
             &jobs.root().parent().unwrap().join("keeps"),
@@ -866,6 +907,19 @@ mod tests {
             jobs.root().display()
         );
         Ok((tmp, jobs, store, config))
+    }
+    fn fixture_sidecar(store: &Store, asset: &str, path: &Path, bytes: &[u8]) -> Result<()> {
+        fs::write(path, bytes)?;
+        crate::physical_files::publish(
+            &*store.lock()?,
+            "lib",
+            asset,
+            path.to_str().unwrap(),
+            &crate::media::sha256_file(path)?,
+            "sidecar",
+            false,
+        )?;
+        Ok(())
     }
     fn photo(store: &Store, path: &Path, hash: &str, identity: Option<&str>) -> Result<String> {
         fs::create_dir_all(path.parent().unwrap())?;
@@ -1132,7 +1186,7 @@ mod tests {
         let (_tmp, jobs, store, config) = setup()?;
         let file = jobs.root().join("empty.jpg");
         let id = photo(&store, &file, "empty", None)?;
-        fs::write(file.with_extension("xmp"), b"sidecar")?;
+        fixture_sidecar(&store, &id, &file.with_extension("xmp"), b"sidecar")?;
         store.set_trashed("lib", &id, true)?;
         let task = trash_preview(&jobs, &store, "lib")?;
         assert_eq!(task.count, 1);
@@ -1465,7 +1519,7 @@ mod tests {
         let raw = jobs.root().join("a.jpg");
         let sidecar = raw.with_extension("xmp");
         let id = photo(&store, &raw, "a", None)?;
-        fs::write(&sidecar, b"metadata")?;
+        fixture_sidecar(&store, &id, &sidecar, b"metadata")?;
         store.set_trashed("lib", &id, true)?;
         let task = trash_preview(&jobs, &store, "lib")?;
         submit(&jobs, &store, "lib", &task.id, 1)?;
@@ -1545,7 +1599,7 @@ mod tests {
         let raw = jobs.root().join("hidden/a.raw");
         let id = photo(&store, &raw, "raw", None)?;
         photo(&store, &jobs.root().join("hidden/a.jpg"), "jpg", Some(&id))?;
-        fs::write(raw.with_extension("xmp"), b"sidecar")?;
+        fixture_sidecar(&store, &id, &raw.with_extension("xmp"), b"sidecar")?;
         store.set_hidden_directory("lib", raw.parent().unwrap().to_str().unwrap(), true)?;
         let kept = jobs.root().join("kept.jpg");
         let kept_id = photo(&store, &kept, "kept", None)?;
@@ -1620,7 +1674,7 @@ mod tests {
     fn disabled_recycle_and_shared_sidecars_are_rejected_before_file_operations() -> Result<()> {
         let (_tmp, jobs, store, config) = setup()?;
         let file = jobs.root().join("a.jpg");
-        photo(&store, &file, "a", None)?;
+        let id = photo(&store, &file, "a", None)?;
         let task = preview(&jobs, &store, "lib")?;
         submit(&jobs, &store, "lib", &task.id, 1)?;
         process(
@@ -1633,8 +1687,8 @@ mod tests {
             |_, _| panic!("disabled recycle"),
         )?;
         assert_eq!(load(&jobs, "lib", &task.id)?.0.status, "failed");
-        fs::write(file.with_extension("raw"), b"unindexed photo")?;
-        fs::write(file.with_extension("xmp"), b"shared sidecar")?;
+        retained_with_shared_sidecar(&store, &file)?;
+        fixture_sidecar(&store, &id, &file.with_extension("xmp"), b"shared sidecar")?;
         assert!(preview(&jobs, &store, "lib").is_err());
         assert!(file.exists());
         Ok(())
@@ -1727,13 +1781,13 @@ mod tests {
     fn resumed_task_preserves_sidecar_shared_with_new_retained_photo() -> Result<()> {
         let (_tmp, jobs, store, config) = setup()?;
         let file = jobs.root().join("a.jpg");
-        photo(&store, &file, "a", None)?;
-        fs::write(file.with_extension("xmp"), b"shared")?;
+        let id = photo(&store, &file, "a", None)?;
+        fixture_sidecar(&store, &id, &file.with_extension("xmp"), b"shared")?;
         let task = preview(&jobs, &store, "lib")?;
         submit(&jobs, &store, "lib", &task.id, 1)?;
         simulated_recycle(jobs.root(), &file)?;
         jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status='running',phase='recycling',inflight=0,completed_files=1 WHERE id=?",[&task.id])?;
-        fs::write(file.with_extension("raw"), b"new retained photo")?;
+        retained_with_shared_sidecar(&store, &file)?;
         process(
             &jobs,
             &store,

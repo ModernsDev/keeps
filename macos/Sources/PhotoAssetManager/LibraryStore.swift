@@ -358,26 +358,6 @@ final class LibraryStore: ObservableObject {
         assets = []; total = 0; nextCursor = nil; lastError = nil
     }
 
-    @Published private(set) var submittingMetadataRefreshPaths: Set<String> = []
-
-    func refreshDirectoryMetadata(path: String) async -> Bool {
-        guard let client, !submittingMetadataRefreshPaths.contains(path) else { return false }
-        let requestedConfiguration = configuration
-        submittingMetadataRefreshPaths.insert(path)
-        defer { submittingMetadataRefreshPaths.remove(path) }
-        do {
-            _ = try await client.refreshDirectoryMetadata(path: path)
-            guard configuration == requestedConfiguration else { return false }
-            refreshNavigation()
-            loadChildren(of: path, refresh: true)
-            refresh(force: true)
-            return true
-        } catch {
-            if configuration == requestedConfiguration { lastError = Self.describe(error) }
-            return false
-        }
-    }
-
     func refreshNavigation(force: Bool = true) {
         guard !isOperationBlocking else { return }
         guard let client else { return }

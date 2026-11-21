@@ -149,18 +149,6 @@ pub fn migrate_operation_state(db: &Connection) -> Result<()> {
 }
 
 impl Store {
-    pub fn record_directory(&self, library: &str, path: &Path) -> Result<()> {
-        let parent = path.parent().and_then(Path::to_str);
-        self.lock()?.execute(
-            "INSERT OR IGNORE INTO directories(library_id,path,parent_path) VALUES(?,?,?)",
-            params![
-                library,
-                path.to_str().context("directory path must be UTF-8")?,
-                parent
-            ],
-        )?;
-        Ok(())
-    }
     pub fn reconcile_cache(&self) -> Result<()> {
         let mut db = self.lock()?;
         let tx = db.transaction()?;
@@ -260,26 +248,6 @@ impl Store {
         crate::revisions::flush(&tx)?;
         tx.commit()?;
         Ok(row)
-    }
-    pub(crate) fn defer_cache_for_scan(&self, jobs: &Jobs, lib: &str, id: &str) -> Result<bool> {
-        let _source = self
-            .source_mutation
-            .read()
-            .map_err(|_| anyhow::anyhow!("source mutation lock poisoned"))?;
-        let paths = {
-            let db = self.lock()?;
-            let mut query = db.prepare("SELECT path FROM catalog_paths p WHERE p.library_id=? AND p.asset_id=? AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)")?;
-            query
-                .query_map(params![lib, id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for path in paths {
-            if jobs.directory_scan_pending(lib, Path::new(&path))? {
-                self.defer_cache_for_path_sync(lib, id)?;
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
     pub(crate) fn defer_cache_for_path_sync(&self, lib: &str, id: &str) -> Result<()> {
         let mut db = self.lock()?;
@@ -1003,44 +971,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn scan_gate_keeps_other_photos_in_same_directory_claimable() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let store = Store::open(&dir.path().join("db"), true)?;
-        let originals = dir.path().join("photos");
-        fs::create_dir_all(&originals)?;
-        let jobs = Jobs::open(&dir.path().join("jobs"), &originals)?;
-        let folder = jobs.add_folder("lib", ".")?;
-        let originals = jobs.root().to_path_buf();
-        seed(&store, 2)?;
-        for (index, path) in [originals.join("a.3fr"), originals.join("b.heic")]
-            .iter()
-            .enumerate()
-        {
-            store.lock()?.execute(
-                "INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib',?,?,?,'jpeg_original')",
-                params![
-                    path.to_str().unwrap(),
-                    format!("00000000-0000-0000-0000-{index:012}"),
-                    format!("hash{index}")
-                ],
-            )?;
-        }
-        jobs.enqueue_file_change(&folder.id, &originals.join("a.heic"), 0)?;
-        store.reconcile_cache()?;
-        let (lib, id, _) = store.claim_cache()?.unwrap();
-        assert!(store.defer_cache_for_scan(&jobs, &lib, &id)?);
-        let state: (String, i64, bool) = store.lock()?.query_row(
-            "SELECT status,attempts,available_at>unixepoch() FROM media_cache WHERE asset_id=?",
-            [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        assert_eq!(state, ("pending".into(), 0, true));
-        let (lib, other, _) = store.claim_cache()?.unwrap();
-        assert_ne!(id, other);
-        assert!(!store.defer_cache_for_scan(&jobs, &lib, &other)?);
-        Ok(())
-    }
     #[test]
     fn legacy_assets_without_versions_are_queued_and_identity_is_preserved() -> Result<()> {
         let dir = tempfile::tempdir()?;

@@ -104,7 +104,7 @@ struct NASTasksView: View {
     static func phaseLabel(_ phase: String) -> String {
         switch phase {
         case "waiting": "等待执行"
-        case "scanning": "扫描目录"
+        case "processing": "处理照片"
         case "indexing": "更新身份与索引"
         case "media": "生成展示图"
         case "cleanup": "清理旧缓存"
@@ -171,7 +171,7 @@ struct NASSourceSettingsView: View {
             }
             Text("服务器原片根目录：\(rootPath.isEmpty ? "等待连接" : rootPath)")
                 .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            Text("此处管理服务器目录，无需在本机挂载 NAS。输入相对于服务器原片根目录的路径；“.” 表示整个根目录。添加来源不会自动扫描；新增或修改文件后，请点击“扫描”。移除来源只修改索引配置，保留所有原片。")
+            Text("此处管理服务器目录，无需在本机挂载 NAS。输入相对于服务器原片根目录的路径；“.” 表示整个根目录。来源必须是已登记的服务器目录。使用 Keeps 导入新增照片。移除来源只修改索引配置，保留所有原片。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 TextField("例如：2026/旅行，或 .", text: $newPath).textFieldStyle(.roundedBorder)
@@ -197,10 +197,6 @@ struct NASSourceSettingsView: View {
                             Spacer()
                             Text(folder.active ? "已添加" : "已停用").foregroundStyle(.secondary)
                             if folder.active {
-                                Button("扫描") { perform {
-                                    _ = try await client.scanFolder(id: folder.id)
-                                    try await refresh()
-                                } }
                                 Button("移除来源") { perform {
                                     try await client.removeFolder(id: folder.id)
                                     try await refresh()

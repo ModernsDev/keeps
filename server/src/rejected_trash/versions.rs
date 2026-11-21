@@ -408,7 +408,6 @@ pub(super) fn finish(
         ensure!(canonical_xmp, error(409, "保留版本缺少带照片 ID 的 XMP"));
     }
     store.reconcile_cache()?;
-    crate::sync_navigation::refresh(store, jobs, library)?;
     Ok(())
 }
 

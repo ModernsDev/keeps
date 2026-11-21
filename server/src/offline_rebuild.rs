@@ -344,16 +344,29 @@ impl Manager {
         };
         let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         source.busy_timeout(Duration::from_secs(30))?;
-        let navigation_guard = self
-            .app
-            .jobs
-            .directory_mutation
-            .read()
-            .map_err(|_| anyhow::anyhow!("directory mutation lock poisoned"))?;
-        crate::directory_move::ensure_reconciled(&self.app.jobs)?;
-        crate::directory_trash::ensure_reconciled(&self.app.jobs)?;
-        let revision = pin_read_snapshot(&source, &self.app.library_id)?;
-        drop(navigation_guard);
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let revision = loop {
+            let guard = self
+                .app
+                .jobs
+                .directory_mutation
+                .read()
+                .map_err(|_| anyhow::anyhow!("directory mutation lock poisoned"))?;
+            crate::directory_move::ensure_reconciled(&self.app.jobs)?;
+            crate::directory_trash::ensure_reconciled(&self.app.jobs)?;
+            let revision = pin_read_snapshot(&source, &self.app.library_id)?;
+            let updating = crate::revisions::is_updating(&source, &self.app.library_id, None)?;
+            drop(guard);
+            if !updating {
+                break revision;
+            }
+            source.execute_batch("ROLLBACK")?;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "图库文件操作尚未完成，请稍后重试同步"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        };
         let generation = crate::replicas::state(&source, &self.app.library_id)?
             .context("sync state")?
             .0;
@@ -624,35 +637,18 @@ impl Manager {
             tx.execute("INSERT INTO hidden VALUES(?)", [path?])?;
         }
         self.progress(status, "navigation", 0, 1)?;
-        let mut pages = source.prepare(
-            "SELECT path,page_json FROM catalog_sync_navigation WHERE library_id=? ORDER BY path",
-        )?;
-        let mut root_seen = false;
-        for page in pages.query_map([lib], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })? {
-            let (path, page) = page?;
-            root_seen |= path.is_empty();
-            let mut navigation: Value = serde_json::from_str(&page)?;
-            for child in navigation["directories"]
-                .as_array_mut()
-                .context("navigation directories")?
-            {
-                let child_path = child["path"].as_str().context("directory path")?.to_owned();
-                if let Some(name) = self.app.original_root_names.get(FsPath::new(&child_path)) {
-                    child["name"] = json!(name);
-                }
-                let (direct, count) =
-                    crate::catalog::directory_photo_counts(source, lib, &child_path)?;
-                child["directPhotoCount"] = json!(direct);
-                child["photoCount"] = json!(count);
-            }
+        for (path, navigation) in crate::navigation::pages(
+            source,
+            lib,
+            self.app.jobs.root(),
+            &crate::navigation::roots(source, lib)?,
+            &self.app.original_root_names,
+        )? {
             tx.execute(
                 "INSERT INTO navigation VALUES(?,?)",
                 params![path, navigation.to_string()],
             )?;
         }
-        ensure!(root_seen, "mobile navigation projection is not initialized");
         tx.execute(
             "INSERT INTO metadata VALUES('revision',?)",
             [status.revision.context("snapshot revision")?.to_string()],
@@ -940,7 +936,7 @@ mod tests {
         app.store.ingest_original("photos",path.to_str().unwrap(),&json!({"contentHash":name,"sizeBytes":20,"role":"jpeg_original"}),&json!({"captureTime":"2024-01-01T00:00:00Z","cameraMake":"Canon","cameraModel":"R3","lensModel":"50mm","originalFilename":name,"contentFingerprint":name,"metadataFingerprint":name,"rating":2,"flagState":"picked","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})).unwrap()
     }
     fn manager(app: Arc<AppState>) -> Manager {
-        crate::sync_navigation::refresh(&app.store, &app.jobs, &app.library_id).unwrap();
+        crate::navigation::fixture_directories(&app.store, &app.jobs, &app.library_id).unwrap();
         Manager {
             root: app
                 .previews
@@ -1729,7 +1725,7 @@ mod tests {
         let mut state = fresh();
         manager.save(&state)?;
         manager.build(&mut state)?;
-        crate::sync_navigation::refresh(&app.store, &app.jobs, &app.library_id)?;
+        crate::navigation::fixture_directories(&app.store, &app.jobs, &app.library_id)?;
         let app = crate::api::router(app);
         let path = format!("/libraries/photos/offline-rebuild/{}/download", state.id);
         let response = app
@@ -1794,7 +1790,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let app = fixture(root.path());
         seed(&app, root.path(), "photo.jpg");
-        crate::sync_navigation::refresh(&app.store, &app.jobs, &app.library_id)?;
+        crate::navigation::fixture_directories(&app.store, &app.jobs, &app.library_id)?;
         let app = crate::api::router(app);
         let response = app
             .clone()

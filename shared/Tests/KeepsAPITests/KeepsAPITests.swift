@@ -59,22 +59,6 @@ struct KeepsAPITests {
         }
     }
 
-    @Test func directoryMetadataRefreshSubmitsServerPathAndReturnsPersistentJob() async throws {
-        let fixture = Fixture { request in
-            #expect(request.httpMethod == "POST")
-            #expect(request.url!.path == "/api/libraries/library/directories/refresh")
-            let body = try #require(JSONSerialization.jsonObject(with: request.bodyData) as? [String: Any])
-            #expect(body["path"] as? String == "/photos/旅行 & RAW")
-            #expect(body["override"] as? Bool == false)
-            return (202, """
-            {"id":"refresh-1","folderID":"folder-1","libraryID":"library","path":"/photos/旅行 & RAW","status":"pending","processed":0}
-            """)
-        }
-        let job = try await fixture.client.refreshDirectoryMetadata(path: "/photos/旅行 & RAW")
-        #expect(job.id == "refresh-1")
-        #expect(job.status == "pending")
-    }
-
     @Test func navigationCountsShowRecursiveThenDirectTotals() throws {
         let data = Data(#"{"path":"/photos","name":"photos","photoCount":85,"directPhotoCount":12,"hasChildren":true}"#.utf8)
         let directory = try JSONDecoder().decode(KeepsNavigationDirectory.self, from: data)
@@ -438,7 +422,7 @@ struct KeepsAPITests {
                 #expect(body == ["path":"2026/旅行"])
                 return (200, folder)
             case ("DELETE", "/api/libraries/library/folders/folder-1"): return (204, "")
-            case ("POST", "/api/libraries/library/folders/folder-1/scan"), ("POST", "/api/libraries/library/jobs/job-1/retry"): return (200, job)
+            case ("POST", "/api/libraries/library/jobs/job-1/retry"): return (200, job)
             case ("GET", "/api/libraries/library/jobs"): return (200, "{\"jobs\":[\(job)]}")
             case ("GET", "/api/libraries/library/directories"): return (200, "{\"directories\":[{\"path\":\"2026/旅行\",\"count\":2}]}")
             case ("GET", "/api/libraries/library/counts"): return (200, "{\"all\":2,\"trashed\":1,\"picked\":1}")
@@ -451,7 +435,6 @@ struct KeepsAPITests {
         #expect(try await fixture.client.folders().rootPath == "/photos")
         let added = try await fixture.client.addFolder(path: "2026/旅行")
         #expect(added.active)
-        _ = try await fixture.client.scanFolder(id: added.id)
         let jobs = try await fixture.client.jobs()
         #expect(jobs.jobs.first?.error == "decode failed")
         _ = try await fixture.client.retryJob(id: "job-1")

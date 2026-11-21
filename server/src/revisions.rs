@@ -485,7 +485,7 @@ impl Store {
 
 #[cfg(test)]
 pub(crate) fn remove_schema(db: &Connection) -> Result<()> {
-    let triggers = db.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND (name LIKE 'catalog_revision_%' OR name LIKE 'catalog_sync_%')")?
+    let triggers = db.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND (name LIKE 'catalog_revision_%' OR name LIKE 'catalog_sync_%' OR name IN ('directories_added','directories_removed','directories_moved'))")?
         .query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for trigger in triggers {
         db.execute_batch(&format!("DROP TRIGGER {trigger}"))?;
@@ -741,7 +741,8 @@ mod tests {
             )?;
             let updates=db.query_row("SELECT json_group_array(json_array(library_id,path,owner,last_changed_at)) FROM (SELECT * FROM catalog_revision_updates ORDER BY library_id,path,owner)",[],|r|r.get::<_,String>(0))?;
             crate::edits::remove_schema(&db)?;
-            db.execute_batch("DROP TRIGGER photos_insert; DROP TRIGGER photos_update; DROP TRIGGER directories_insert; DROP TABLE photos; DROP TABLE videos; DROP TABLE directories; DROP TABLE media_cache_gc; DROP TABLE media_cache; DROP TABLE cache_runtime; DROP INDEX derivative_object_ref; DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; PRAGMA user_version=5;")?;
+            db.pragma_update(None, "foreign_keys", false)?;
+            db.execute_batch("DROP TRIGGER photos_insert; DROP TRIGGER photos_update; DROP TRIGGER IF EXISTS directories_insert; DROP TABLE photos; DROP TABLE videos; DROP TABLE directories; DROP TABLE media_cache_gc; DROP TABLE media_cache; DROP TABLE cache_runtime; DROP INDEX derivative_object_ref; DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; PRAGMA user_version=5;")?;
             assert!(db.prepare("SELECT * FROM media_cache").is_err());
             (sequence, updates)
         };
@@ -754,7 +755,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                26
+                27
             );
             assert_eq!(
                 db.query_row(
@@ -889,6 +890,7 @@ mod tests {
         {
             let mut connection = store.lock()?;
             let db = connection.transaction()?;
+            crate::navigation::record(&db, "lib", std::path::Path::new("/photos/new"))?;
             db.execute("UPDATE catalog_asset_directories SET directory='/photos/new' WHERE library_id='lib' AND directory='/photos/old'", [])?;
             db.execute("UPDATE catalog_physical_files SET path='/photos/new/a.jpg' WHERE library_id='lib' AND path='/photos/old/a.jpg'", [])?;
             flush(&db)?;

@@ -31,6 +31,7 @@ SOFTWARE_IDS = tuple(
 @dataclass(frozen=True)
 class Catalog:
     schema: int
+    revision: int
     assets: set
     photo_ids: dict
     software_owners: dict
@@ -57,13 +58,15 @@ def root_path(value):
     return path
 
 
-def walk(roots, report):
+def walk(roots, report, directories=None):
     def raise_error(error):
         raise error
 
     for root in roots:
         for directory, dirs, names in os.walk(root, onerror=raise_error):
             parent = Path(directory)
+            if directories is not None:
+                directories.add(str(parent))
             dirs[:] = [name for name in dirs if not excluded(name) and not (parent / name).is_symlink()]
             for name in names:
                 path = parent / name
@@ -176,8 +179,9 @@ def catalog_snapshot(db, library, report):
 
     db.execute("BEGIN")
     schema = db.execute("PRAGMA user_version").fetchone()[0]
-    if schema not in (24, 25):
-        raise ValueError(f"不支持图库 schema {schema}，需要 24 或 25")
+    if schema not in (24, 25, 26, 27):
+        raise ValueError(f"不支持图库 schema {schema}，需要 24 至 27")
+    revision = get("SELECT coalesce(max(revision),0) FROM catalog_version_revision WHERE library_id=?").fetchone()[0]
     assets = {asset for asset, in get("SELECT id FROM catalog_assets WHERE library_id=?")}
     roots = dict(get("SELECT asset_id,root_id FROM catalog_identity_roots WHERE library_id=?"))
     software_owners = defaultdict(set)
@@ -191,7 +195,7 @@ def catalog_snapshot(db, library, report):
     locations = dict(get("SELECT asset_id,path FROM catalog_asset_locations WHERE library_id=?"))
     indexed, historical = indexed_files(db, library, report)
     directories, registered = {}, {}
-    if schema == 25:
+    if schema >= 25:
         directories = dict(get("SELECT asset_id,directory FROM catalog_asset_directories WHERE library_id=?"))
         for path, asset, digest, versioned in get(
             "SELECT path,asset_id,content_hash,versioned FROM catalog_physical_files WHERE library_id=? AND role='sidecar'"
@@ -202,7 +206,7 @@ def catalog_snapshot(db, library, report):
     for table, rowid, parent, number in db.execute("PRAGMA foreign_key_check"):
         report("foreign_key_violation", table=table, rowid=rowid, parentTable=parent, foreignKey=number)
     db.rollback()
-    return Catalog(schema, assets, roots, software_owners, deprecated, locations, directories,
+    return Catalog(schema, revision, assets, roots, software_owners, deprecated, locations, directories,
                    indexed, registered, historical)
 
 
@@ -226,7 +230,7 @@ def audit_media(catalog, roots, media_files, verify_sha256, report):
         if not in_scope(path, raw, roots):
             report("index_path_outside_scope", assets=[asset], paths=[raw])
             continue
-        if catalog.schema == 25 and str(path.parent) != catalog.directories.get(asset):
+        if catalog.schema >= 25 and str(path.parent) != catalog.directories.get(asset):
             report("directory_index_mismatch", assets=[asset], paths=[raw], expected=catalog.directories.get(asset))
         retained[asset].add(path)
         if path not in media_files:
@@ -293,7 +297,7 @@ def audit_sidecars(catalog, media_files, xmp_files, register_xmp, report):
                    expected=expected, actual=sorted(v for v in identities if v is not None))
             continue
         registered = catalog.registered_xmp.get(sidecar)
-        if catalog.schema == 25:
+        if catalog.schema >= 25:
             if str(sidecar.parent) != catalog.directories.get(asset):
                 report("xmp_directory_mismatch", assets=[asset], paths=[str(sidecar)], expected=catalog.directories.get(asset))
                 continue
@@ -372,7 +376,7 @@ def register_sidecars(db, library, before, candidates, stamps, report):
             db.rollback()
 
 
-def audit(db, library, roots, verify_sha256=False, register_xmp=False):
+def audit(db, library, roots, verify_sha256=False, register_xmp=False, directory_manifest=False):
     issues = []
 
     def report(reason, **details):
@@ -380,14 +384,19 @@ def audit(db, library, roots, verify_sha256=False, register_xmp=False):
 
     before = db.execute("PRAGMA data_version").fetchone()[0]
     catalog = catalog_snapshot(db, library, report)
-    if register_xmp and catalog.schema != 25:
-        raise ValueError("--register-xmp 只适用于 schema 25")
+    if register_xmp and catalog.schema < 25:
+        raise ValueError("--register-xmp 需要 schema 25 或更新版本")
+    if directory_manifest and catalog.schema < 26:
+        raise ValueError("--directory-manifest 需要 schema 26 或更新版本")
 
+    directories = set() if directory_manifest else None
     media_files, xmp_files = set(), set()
-    for path in walk(roots, report):
+    for path in walk(roots, report, directories):
         (xmp_files if media_extension(path) == "xmp" else media_files).add(path)
 
-    retained, photo_assets, digests_checked = audit_media(catalog, roots, media_files, verify_sha256, report)
+    retained, photo_assets, digests_checked = audit_media(
+        catalog, roots, media_files, verify_sha256 or directory_manifest, report
+    )
     covered, candidates, stamps = audit_sidecars(catalog, media_files, xmp_files, register_xmp, report)
     for asset in sorted(photo_assets - covered.keys()):
         report("photo_without_valid_xmp", assets=[asset], paths=sorted(map(str, retained[asset])))
@@ -399,6 +408,10 @@ def audit(db, library, roots, verify_sha256=False, register_xmp=False):
         "libraryId": library,
         "schemaVersion": catalog.schema,
         "roots": list(map(str, roots)),
+        **({"directoryManifest": {
+            "catalogRevision": catalog.revision,
+            "directories": sorted(directories),
+        }} if directory_manifest and not issues else {}),
         "summary": {
             "indexedPaths": len(catalog.indexed), "historicalVersionPaths": catalog.historical,
             "mediaOnDisk": len(media_files), "xmpOnDisk": len(xmp_files),
@@ -417,7 +430,9 @@ def main():
     parser.add_argument("--library", required=True)
     parser.add_argument("--root", type=root_path, action="append", required=True)
     parser.add_argument("--verify-sha256", action="store_true", help="对磁盘媒体逐个读取并校验 SHA-256")
-    parser.add_argument("--register-xmp", action="store_true", help="Keeps 停写及备份后，在 schema 25 补登记符合条件的遗留 XMP")
+    mode_flags = parser.add_mutually_exclusive_group()
+    mode_flags.add_argument("--register-xmp", action="store_true", help="Keeps 停写及备份后，补登记符合条件的遗留 XMP")
+    mode_flags.add_argument("--directory-manifest", action="store_true", help="Keeps 停写后，验证文件摘要并导出含空目录的迁移清单")
     args = parser.parse_args()
     roots = sorted(set(args.root))
     roots = [p for p in roots if not any(q in p.parents for q in roots)]
@@ -427,7 +442,7 @@ def main():
         db.execute("PRAGMA foreign_keys=ON")
         if not args.register_xmp:
             db.execute("PRAGMA query_only=ON")
-        report = audit(db, args.library, roots, args.verify_sha256, args.register_xmp)
+        report = audit(db, args.library, roots, args.verify_sha256, args.register_xmp, args.directory_manifest)
     print(json.dumps(report, indent=2))
     return bool(report["issues"])
 

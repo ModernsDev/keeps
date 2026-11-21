@@ -136,10 +136,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(directories).post(create_directory),
         )
         .route(
-            "/libraries/{library}/directories/refresh",
-            post(refresh_directory),
-        )
-        .route(
             "/libraries/{library}/assets/move-tasks",
             post(submit_asset_move),
         )
@@ -179,10 +175,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/libraries/{library}/folders/{folder}",
             delete(remove_folder),
-        )
-        .route(
-            "/libraries/{library}/folders/{folder}/scan",
-            post(scan_folder),
         )
         .route("/libraries/{library}/jobs", get(jobs))
         .route("/libraries/{library}/jobs/{job}/retry", post(retry_job))
@@ -457,45 +449,6 @@ struct CreateDirectoryRequest {
     parent_path: String,
     name: String,
 }
-#[derive(Deserialize)]
-struct RefreshDirectoryRequest {
-    path: String,
-    #[serde(default)]
-    r#override: bool,
-}
-async fn refresh_directory(
-    State(state): State<Arc<AppState>>,
-    Path(library): Path<String>,
-    Json(body): Json<RefreshDirectoryRequest>,
-) -> ApiResult {
-    let job = blocking(move || {
-        let _directory_guard = metadata_guard(&state.jobs)?;
-        crate::directory_move::ensure_reconciled(&state.jobs)?;
-        let path = state
-            .jobs
-            .validate_path(std::path::Path::new(&body.path))
-            .map_err(|error| resource_error(422, format!("{error:#}")))?;
-        let folder = state
-            .jobs
-            .folders()?
-            .into_iter()
-            .filter(|folder| {
-                folder.active && folder.library_id == library && path.starts_with(&folder.path)
-            })
-            .max_by_key(|folder| folder.path.len())
-            .ok_or_else(|| resource_error(404, "directory is not tracked in this library"))?;
-        let job = if body.r#override {
-            state
-                .jobs
-                .enqueue_manual_metadata_refresh(&folder.id, &path)?
-        } else {
-            state.jobs.enqueue_reconcile_scope(&folder.id, &path)?
-        };
-        Ok(serde_json::to_value(job)?)
-    })
-    .await?;
-    Ok((StatusCode::ACCEPTED, Json(job)).into_response())
-}
 async fn create_directory(
     State(state): State<Arc<AppState>>,
     Path(library): Path<String>,
@@ -531,14 +484,7 @@ async fn create_directory(
             ));
         }
         let path = parent.join(name);
-        std::fs::create_dir(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                resource_error(409, format!("create directory {}: {error}", path.display()))
-            } else {
-                anyhow::Error::from(error).context(format!("create directory {}", path.display()))
-            }
-        })?;
-        crate::sync_navigation::refresh(&state.store, &state.jobs, &library)?;
+        crate::navigation::create(&state.store, &library, &path)?;
         Ok(json!({"path":path}))
     })
     .await?;
@@ -560,6 +506,7 @@ async fn trash_directory(
     let result = blocking(move || {
         Ok(serde_json::to_value(crate::directory_trash::submit(
             &state.jobs,
+            &state.store,
             &library,
             &body.path,
             &body.confirmation_name,
@@ -594,30 +541,13 @@ async fn navigation(
 ) -> ApiResult {
     Ok(Json(
         blocking(move || {
-            let mut result = crate::navigation::navigation(
+            crate::navigation::navigation(
+                &state.store,
                 &state.jobs,
                 &library,
                 query.path.as_deref(),
                 &state.original_root_names,
-            )?;
-            let directories = result["directories"]
-                .as_array_mut()
-                .expect("navigation directories");
-            let paths: Vec<String> = directories
-                .iter()
-                .map(|directory| {
-                    directory["path"]
-                        .as_str()
-                        .expect("navigation path")
-                        .to_owned()
-                })
-                .collect();
-            let counts = state.store.directory_photo_counts(&library, &paths)?;
-            for (directory, (direct, recursive)) in directories.iter_mut().zip(counts) {
-                directory["directPhotoCount"] = json!(direct);
-                directory["photoCount"] = json!(recursive);
-            }
-            Ok(result)
+            )
         })
         .await?,
     )
@@ -662,7 +592,6 @@ async fn add_folder(
                     .validate_path(std::path::Path::new(&body.path))
                     .map_err(|e| resource_error(422, format!("{e:#}")))?;
                 let folder = state.jobs.add_folder(&library, &body.path)?;
-                crate::sync_navigation::refresh(&state.store, &state.jobs, &library)?;
                 Ok(serde_json::to_value(folder)?)
             })
             .await?,
@@ -678,30 +607,10 @@ async fn remove_folder(
         let _directory_guard = state.jobs.directory_mutation.write().unwrap();
         folder_for(&state, &library, &id)?;
         state.jobs.remove_folder(&id)?;
-        crate::sync_navigation::refresh(&state.store, &state.jobs, &library)?;
         Ok(Value::Null)
     })
     .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
-}
-async fn scan_folder(
-    State(state): State<Arc<AppState>>,
-    Path((library, id)): Path<(String, String)>,
-) -> ApiResult {
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(
-            blocking(move || {
-                let folder = folder_for(&state, &library, &id)?;
-                if !folder.active {
-                    return Err(resource_error(409, "folder is inactive"));
-                }
-                Ok(serde_json::to_value(state.jobs.enqueue_scan(&id)?)?)
-            })
-            .await?,
-        ),
-    )
-        .into_response())
 }
 async fn jobs(State(state): State<Arc<AppState>>, Path(library): Path<String>) -> ApiResult {
     Ok(Json(
@@ -718,7 +627,7 @@ async fn retry_job(
             let job = state
                 .jobs
                 .job(&id)?
-                .filter(|j| j.library_id == library)
+                .filter(|j| j.library_id == library && j.scope_kind == "file")
                 .ok_or_else(|| resource_error(404, "job not found"))?;
             if job.status != "failed" {
                 return Err(resource_error(409, "only failed jobs can be retried"));
@@ -939,7 +848,7 @@ fn open_version_source(
         if metadata.len() != record.size as u64 || modified != record.mtime_ns as u128 {
             return Err(resource_error(
                 409,
-                "version source changed; refresh inventory",
+                "源文件与已登记版本不符，请停服核对图库",
             ));
         }
         return Ok((file, video_mime(path)));
@@ -1225,7 +1134,7 @@ async fn standard_download(
             std::fs::metadata(&path)?.len() == standard["sizeBytes"].as_u64().unwrap_or(0)
                 && crate::cache_pipeline::file_mtime(&path)?
                     == standard["mtimeNs"].as_str().unwrap_or(""),
-            "standard source changed; waiting for inventory refresh"
+            "标准图与已登记版本不符，请停服核对图库"
         );
         let path = path.canonicalize()?;
         state.jobs.validate_path(

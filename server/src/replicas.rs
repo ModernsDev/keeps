@@ -7,7 +7,7 @@ use uuid::Uuid;
 pub(crate) const LEASE_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 pub(crate) fn migrate(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS catalog_sync_navigation(library_id TEXT NOT NULL,path TEXT NOT NULL,page_json TEXT NOT NULL,PRIMARY KEY(library_id,path));
+    db.execute_batch("
 CREATE TABLE IF NOT EXISTS catalog_sync_state(library_id TEXT PRIMARY KEY,generation TEXT NOT NULL,floor INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS catalog_sync_assets(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,revision INTEGER NOT NULL,deleted INTEGER NOT NULL,changed_at INTEGER NOT NULL,PRIMARY KEY(library_id,asset_id));
 CREATE INDEX IF NOT EXISTS catalog_sync_assets_revision ON catalog_sync_assets(library_id,revision);
@@ -286,7 +286,7 @@ mod tests {
         let store = Store::open(&path, true)?;
         {
             let db = store.lock()?;
-            db.execute_batch("INSERT INTO catalog_version_revision VALUES('lib',8); INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','hash','hash','','a.jpg',0,'none',NULL,0); INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib','/a.jpg','asset','hash','jpeg_original'); DELETE FROM catalog_revision_dirty; DROP TABLE catalog_sync_state; DROP TABLE catalog_sync_assets; DROP TABLE catalog_replicas; DROP TABLE catalog_sync_navigation; PRAGMA user_version=18;")?;
+            db.execute_batch("INSERT INTO catalog_version_revision VALUES('lib',8); INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','hash','hash','','a.jpg',0,'none',NULL,0); INSERT INTO catalog_physical_files(library_id,path,asset_id,content_hash,role) VALUES('lib','/a.jpg','asset','hash','jpeg_original'); DELETE FROM catalog_revision_dirty; DROP TABLE catalog_sync_state; DROP TABLE catalog_sync_assets; DROP TABLE catalog_replicas; DROP TABLE IF EXISTS catalog_sync_navigation; PRAGMA user_version=18;")?;
         }
         drop(store);
         assert!(Store::open(&path, false).is_err());

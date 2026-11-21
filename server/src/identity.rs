@@ -241,6 +241,30 @@ fn update_meta(
     Ok(true)
 }
 
+pub(crate) fn sidecar_packet(
+    path: &Path,
+    id: &str,
+    source: &crate::media::Metadata,
+) -> Result<Vec<u8>> {
+    let mut meta = read_sidecar(path)?.unwrap_or_default();
+    update_meta(&mut meta, id, Some(source))?;
+    Ok(meta.to_string().into_bytes())
+}
+
+pub(crate) fn install_sidecar_packet(path: &Path, data: &[u8], replace: bool) -> Result<()> {
+    let parent = path.parent().context("XMP has no parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(data)?;
+    temporary.as_file().sync_all()?;
+    if replace {
+        temporary.persist(path)?;
+    } else {
+        temporary.persist_noclobber(path)?;
+    }
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 fn write_sidecar_metadata(
     path: &Path,
     id: &str,

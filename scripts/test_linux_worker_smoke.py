@@ -62,9 +62,9 @@ def run_test(args):
 
     def request(path, method='GET', auth=True, body=None):
         headers = {'Authorization': 'Bearer ' + token} if auth else {}
-        data = None if body is None else json.dumps(body).encode()
+        data = None if body is None else body if isinstance(body, bytes) else json.dumps(body).encode()
         if body is not None:
-            headers['Content-Type'] = 'application/json'
+            headers['Content-Type'] = 'application/octet-stream' if isinstance(body, bytes) else 'application/json'
         req = urllib.request.Request(api + path, headers=headers, method=method, data=data)
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.load(response)
@@ -109,15 +109,20 @@ def run_test(args):
             assert error.code == 401
         check('health_and_auth')
         db_path = keeps / 'db/control_plane.sqlite'
-        for sample in samples.values():
-            target = Path(sample['fixture'])
-            target.parent.mkdir()
-            with Path(sample['source']).open('rb') as src, target.open('xb') as dst:
-                shutil.copyfileobj(src, dst)
-            assert sha(target) == sample['hash']
-            shutil.copy2(Path(sample['source']), keeps / ('identity-before' + target.suffix))
-        folders = request('/libraries/smoke/folders')['folders']
-        request('/libraries/smoke/folders/' + folders[0]['id'] + '/scan', method='POST')
+        batch = str(uuid.uuid4())
+        files = []
+        for kind, sample in samples.items():
+            source = Path(sample['source'])
+            files.append(dict(id=str(uuid.uuid4()), relativePath=f'{kind}/{source.name}',
+                              size=source.stat().st_size, sha256=sample['hash']))
+            shutil.copy2(source, keeps / ('identity-before' + source.suffix))
+        request('/libraries/smoke/imports', method='POST', body={
+            'id': batch, 'targetPath': '/originals', 'preserveStructure': True, 'files': files,
+        })
+        for sample, item in zip(samples.values(), files):
+            request(f"/libraries/smoke/imports/{batch}/files/{item['id']}",
+                    method='PUT', body=Path(sample['source']).read_bytes())
+        request(f'/libraries/smoke/imports/{batch}/finish?async=true', method='POST')
         wait(lambda: request('/libraries/smoke/cache-status')['totalAssets'] == 4)
         for sample in samples.values():
             sample['hash'] = sha(Path(sample['fixture']))
@@ -185,15 +190,12 @@ def run_test(args):
                 with urllib.request.urlopen(standard['downloadURL'], timeout=30) as response:
                     assert hashlib.sha256(response.read()).hexdigest() == standard['version']
         check('signed_download_hashes_jpeg_heif_reuse_3fr_thumbnail_only')
-        folders = request('/libraries/smoke/folders')['folders']
-        job = request('/libraries/smoke/folders/' + folders[0]['id'] + '/scan', method='POST')
-        def rescanned():
-            with readonly(keeps / 'db/jobs.sqlite') as db:
-                row = db.execute('SELECT status,error FROM jobs WHERE id=?', (job['id'],)).fetchone()
-                if row and row[0] == 'failed':
-                    raise AssertionError('Rescan failed: ' + str(row[1]))
-                return row and row[0] == 'completed'
-        wait(rescanned)
+        folder = request('/libraries/smoke/folders')['folders'][0]
+        try:
+            request(f"/libraries/smoke/folders/{folder['id']}/scan", method='POST')
+            raise AssertionError('Retired scan endpoint accepted')
+        except urllib.error.HTTPError as error:
+            assert error.code == 404
         with readonly(db_path) as db:
             assert db.execute('SELECT count(*) FROM catalog_assets').fetchone()[0] == 4
             for kind, sample in samples.items():
@@ -209,7 +211,7 @@ def run_test(args):
         assert worker_state['State']['Running'] and not worker_state['State']['OOMKilled']
         assert len(worker_state['Mounts']) == 1 and worker_state['Mounts'][0]['Source'] == str(work)
         report['containers'] = {'api': name, 'worker': worker_name}
-        check('rescan_stable_original_hashes_and_resource_limits')
+        check('scan_retired_original_hashes_and_resource_limits')
         with sqlite3.connect(keeps / 'db' / 'control_plane.sqlite') as db:
             db.execute("UPDATE catalog_files SET holder='legacy-mac' WHERE asset_id=? AND role='raw_original'", (asset_ids['raw'],))
         for kind, sample in samples.items():
